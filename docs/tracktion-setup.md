@@ -1,6 +1,6 @@
 # Tracktion Setup (Phase 1)
 
-Stand: 2026-02-20
+Stand: 2026-02-21
 
 ## Ziel
 
@@ -15,8 +15,13 @@ bash apps/native-engine/scripts/bootstrap-vendor.sh
 Optional eigene Versionen:
 
 ```bash
-JUCE_REF=develop TRACKTION_REF=develop bash apps/native-engine/scripts/bootstrap-vendor.sh
+JUCE_REF=<branch|tag|commit> TRACKTION_REF=<branch|tag|commit> bash apps/native-engine/scripts/bootstrap-vendor.sh
 ```
+
+Default-Refs (gepinnt):
+
+- `JUCE`: `75fee9639a855a1b0c8b2b3e2cb9265d9bcaaf4d`
+- `tracktion_engine`: `2877b621f2fbee564d0696a616b86bf8ba8c8ab0`
 
 ## 2. Native Engine mit Tracktion bauen
 
@@ -53,6 +58,6 @@ npx thestuu start --native-backend stub
 
 ## Hinweise
 
-- `tracktion_engine` `develop` erwartet JUCE `develop`; die Bootstrap-Defaults sind darauf abgestimmt.
+- Bootstrap ist jetzt auf feste, getestete Commits gepinnt (siehe oben) und damit reproduzierbarer.
 - Native IPC unterstuetzt jetzt zusaetzlich `vst:scan`, `vst:load` und `vst:param:set`.
 - `ultrasound` ist als internes Built-in Plugin verfuegbar (`internal:ultrasound`).

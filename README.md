@@ -64,4 +64,4 @@ npx thestuu start --native-backend stub
 - Die Architektur ist jetzt dreistufig: Dashboard -> CLI/Node-Orchestrator -> Native C++ Engine (IPC).
 - Der native Prozess liefert Transport plus grundlegende Plugin-IPC (`vst:scan`, `vst:load`, `vst:param:set`).
 - Das Tracktion-Backend startet mit einem Default-Edit (16 Audio-Tracks) und internem `ultrasound` Built-in.
-- JUCE/Tracktion Build-Setup ist vorhanden (siehe `docs/tracktion-setup.md`).
+- JUCE/Tracktion Build-Setup ist vorhanden (siehe `docs/tracktion-setup.md`, Defaults sind auf feste Vendor-Commits gepinnt).
