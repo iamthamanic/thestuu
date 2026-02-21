@@ -1,0 +1,9 @@
+[allowlist]
+description = "Ignore generated and vendored artifacts."
+paths = [
+  '''^apps/dashboard/\.next/''',
+  '''^node_modules/''',
+  '''^\.venv-semgrep/''',
+  '''^\.shimwrapper/checktools/node_modules/''',
+  '''^\.shim/'''
+]

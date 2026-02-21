@@ -1,0 +1,26 @@
+{
+  "name": "thestuu-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev": "concurrently -n native,engine,dash \"npm run dev -w @thestuu/native-engine\" \"npm run start -w @thestuu/engine\" \"npm run dev -w @thestuu/dashboard\"",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "check:mock-data": "echo 'check:mock-data skipped (no fixture set)'",
+    "test:run": "npm run test:run --workspaces --if-present",
+    "start": "npm run dev",
+    "start:dashboard-only": "npm run dev --workspace @thestuu/dashboard -- --hostname 127.0.0.1 --port 3000"
+  },
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "shimwrappercheck": "^0.4.11"
+  }
+}

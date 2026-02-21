@@ -1,0 +1,14 @@
+{
+  "name": "@thestuu/shared-json",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "build": "echo 'shared-json: no build step'",
+    "typecheck": "echo 'shared-json: no typecheck step'",
+    "test:run": "node --test \"test/**/*.test.js\""
+  }
+}

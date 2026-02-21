@@ -1,0 +1,17 @@
+node_modules
+.DS_Store
+.next
+dist
+coverage
+.nyc_output
+*.log
+.env*
+/.turbo
+/.cache
+/.codex-home
+/.shim
+/.shimwrapper
+/.semgrep-home
+/.venv-semgrep
+apps/native-engine/build
+apps/native-engine/vendor

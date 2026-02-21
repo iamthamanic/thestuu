@@ -1,0 +1,13 @@
+{
+  "name": "@thestuu/native-engine",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "bootstrap-vendor": "bash scripts/bootstrap-vendor.sh",
+    "build": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTUU_ENABLE_TRACKTION=${STUU_ENABLE_TRACKTION:-OFF} && cmake --build build --target thestuu-native --config Release",
+    "build:tracktion": "STUU_ENABLE_TRACKTION=ON npm run build",
+    "start": "./build/thestuu-native --socket ${STUU_NATIVE_SOCKET:-/tmp/thestuu-native.sock}",
+    "dev": "npm run build && npm run start",
+    "typecheck": "echo 'native-engine: no typecheck step yet'"
+  }
+}

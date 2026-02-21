@@ -1,0 +1,19 @@
+{
+  "name": "@thestuu/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "build": "echo 'engine: no build step yet'",
+    "typecheck": "echo 'engine: no typecheck step yet'"
+  },
+  "dependencies": {
+    "@thestuu/shared-json": "file:../../packages/shared-json",
+    "audio-decode": "^2.2.3",
+    "msgpackr": "^1.11.5",
+    "socket.io": "^4.8.1"
+  }
+}
