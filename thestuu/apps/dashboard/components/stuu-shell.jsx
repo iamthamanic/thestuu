@@ -4974,14 +4974,8 @@ export default function StuuShell() {
                 <div className="daw-menu-row daw-menu-row-1">
                   <div className="daw-menu-left">
                     <span className="daw-logo" aria-hidden="true">
-                    <span className="daw-logo-word">the</span>
-                    <span className="daw-logo-waveform" aria-hidden="true">
-                      <svg viewBox="0 0 32 12" fill="currentColor" className="daw-logo-waveform-svg">
-                        <path d="M0 6 Q 4 2 8 6 Q 12 10 16 6 Q 20 2 24 6 Q 28 10 32 6 L 32 12 L 0 12 Z" />
-                      </svg>
+                      <img src="/thestuulogo.png" alt="THE STUU" className="daw-logo-img" />
                     </span>
-                    <span className="daw-logo-word">stuu</span>
-                  </span>
                     {DAW_MENU_ITEMS.map((item) =>
                       item === 'SETTINGS' ? (
                         <button

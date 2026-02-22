@@ -335,41 +335,16 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 2px;
   padding: 2px 6px;
   margin-right: 2px;
   border-radius: 2px;
-  color: rgba(255, 255, 255, 0.95);
-  font-size: 0.6rem;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: lowercase;
 }
 
-.daw-logo-word {
-  display: inline-block;
-  line-height: 1;
-}
-
-.daw-logo-waveform {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: rgb(168, 85, 247);
-  flex-shrink: 0;
-}
-
-.daw-logo-waveform-svg {
+.daw-logo-img {
   display: block;
-  vertical-align: middle;
-  width: 14px;
-  height: 6px;
-}
-
-/* Weißer Rahmen + Abstände für Logo – höhere Spezifität als .daw-menu-left span */
-.daw-menu-left span.daw-logo {
-  border: 1px solid rgba(255, 255, 255, 0.9);
-  padding: 2px 6px;
+  height: 16px;
+  width: auto;
+  object-fit: contain;
 }
 
 .audio-output-select-wrap {
