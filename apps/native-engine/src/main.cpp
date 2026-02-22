@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -427,6 +428,22 @@ double asDouble(const MsgValue* value, double fallback = 0.0) {
   return fallback;
 }
 
+bool asBool(const MsgValue* value, bool fallback = false) {
+  if (value == nullptr) {
+    return fallback;
+  }
+  if (const auto* b = std::get_if<bool>(&value->value)) {
+    return *b;
+  }
+  if (const auto* integer = std::get_if<int64_t>(&value->value)) {
+    return *integer != 0;
+  }
+  if (const auto* decimal = std::get_if<double>(&value->value)) {
+    return *decimal != 0.0;
+  }
+  return fallback;
+}
+
 bool sendAll(int fd, const uint8_t* data, size_t size) {
   size_t sent = 0;
   while (sent < size) {
@@ -624,6 +641,9 @@ MsgValue toMsgValue(const thestuu::native::PluginInfo& plugin) {
     {"name", MsgValue(plugin.name)},
     {"uid", MsgValue(plugin.uid)},
     {"type", MsgValue(plugin.type)},
+    {"kind", MsgValue(plugin.kind)},
+    {"isInstrument", MsgValue(plugin.isInstrument)},
+    {"isNative", MsgValue(plugin.isNative)},
     {"parameters", MsgValue(std::move(parameters))},
   });
 }
@@ -639,6 +659,9 @@ MsgValue toMsgValue(const thestuu::native::LoadPluginResult& plugin) {
     {"name", MsgValue(plugin.name)},
     {"uid", MsgValue(plugin.uid)},
     {"type", MsgValue(plugin.type)},
+    {"kind", MsgValue(plugin.kind)},
+    {"isInstrument", MsgValue(plugin.isInstrument)},
+    {"isNative", MsgValue(plugin.isNative)},
     {"trackId", MsgValue(plugin.trackId)},
     {"pluginIndex", MsgValue(plugin.pluginIndex)},
     {"parameters", MsgValue(std::move(parameters))},
@@ -678,9 +701,22 @@ MsgValue::Object snapshotToMsgObject(const thestuu::native::TransportSnapshot& s
   };
 }
 
+namespace {
+int g_tickLogCounter = 0;
+}
+
 MsgValue makeTickEvent(const TransportCore& transport) {
   thestuu::native::TransportSnapshot backendSnap;
   if (g_useTracktionTransport && thestuu::native::getTransportSnapshot(backendSnap)) {
+    if (++g_tickLogCounter <= 12 || (g_tickLogCounter % 50 == 0)) {
+      std::fprintf(
+        stderr,
+        "[thestuu-native] tick playing=%d positionBeats=%.4f bpm=%.3f\n",
+        backendSnap.playing ? 1 : 0,
+        backendSnap.positionBeats,
+        backendSnap.bpm
+      );
+    }
     return MsgValue(MsgValue::Object{
       {"type", MsgValue("event")},
       {"event", MsgValue("transport.tick")},
@@ -711,11 +747,20 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     }
     return makeResponse(id, MsgValue::Object{{"transport", MsgValue(transport.snapshot())}});
   }
+  if (cmd == "transport.ensure-context" || cmd == "transport:ensure-context") {
+    if (g_useTracktionTransport) {
+      thestuu::native::transportEnsureContext();
+    }
+    return makeResponse(id, MsgValue::Object{});
+  }
   if (cmd == "transport.play") {
     if (g_useTracktionTransport) {
       thestuu::native::transportPlay();
       thestuu::native::TransportSnapshot backendSnap;
       if (thestuu::native::getTransportSnapshot(backendSnap)) {
+        std::fprintf(stderr, "[thestuu-native] after transportPlay: isPlaying=%d positionBeats=%.4f\n",
+                     backendSnap.playing ? 1 : 0, backendSnap.positionBeats);
+        backendSnap.playing = true;  // Tracktion may set isPlaying() async; ensure response reflects play request
         return makeResponse(id, MsgValue::Object{{"transport", MsgValue(snapshotToMsgObject(backendSnap))}});
       }
     } else {
@@ -802,8 +847,65 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       }
     );
   }
+  if (cmd == "edit:clear-audio-clips") {
+    if (!g_useTracktionTransport) {
+      return makeResponse(id, MsgValue::Object{});
+    }
+    std::string error;
+    if (!thestuu::native::clearAllAudioClipsOnMessageThread(error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{});
+  }
+  if (cmd == "backend.info") {
+    return makeResponse(id, MsgValue::Object{{"tracktion", MsgValue(g_useTracktionTransport)}});
+  }
   if (cmd == "health.ping") {
     return makeResponse(id, MsgValue::Object{{"pong", MsgValue(true)}});
+  }
+  if (cmd == "audio.get_outputs") {
+    std::vector<thestuu::native::AudioDeviceInfo> devices;
+    std::string error;
+    if (!thestuu::native::getAudioOutputDevices(devices, error)) {
+      return makeErrorResponse(id, error);
+    }
+    MsgValue::Array arr;
+    arr.reserve(devices.size());
+    for (const auto& d : devices) {
+      arr.push_back(MsgValue(MsgValue::Object{
+        {"id", MsgValue(d.id)},
+        {"name", MsgValue(d.name)},
+      }));
+    }
+    std::string currentId;
+    thestuu::native::getCurrentAudioOutputDeviceId(currentId, error);
+    MsgValue::Object payloadObj{
+      {"devices", MsgValue(std::move(arr))},
+      {"currentId", MsgValue(currentId)},
+    };
+    thestuu::native::AudioStatus status;
+    if (thestuu::native::getAudioStatus(status, error)) {
+      payloadObj["sampleRate"] = MsgValue(status.sampleRate);
+      payloadObj["blockSize"] = MsgValue(static_cast<int64_t>(status.blockSize));
+      payloadObj["outputLatencySeconds"] = MsgValue(status.outputLatencySeconds);
+      payloadObj["outputChannels"] = MsgValue(static_cast<int64_t>(status.outputChannels));
+    }
+    return makeResponse(id, MsgValue::Object(std::move(payloadObj)));
+  }
+  if (cmd == "audio.set_output") {
+    std::string deviceId;
+    if (payload) {
+      deviceId = asString(getField(*payload, "device_id"));
+      if (deviceId.empty()) deviceId = asString(getField(*payload, "deviceId"));
+    }
+    if (deviceId.empty()) {
+      return makeErrorResponse(id, "audio.set_output requires device_id");
+    }
+    std::string error;
+    if (!thestuu::native::setAudioOutputDevice(deviceId, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}});
   }
   if (cmd == "vst:scan") {
     std::vector<thestuu::native::PluginInfo> plugins;
@@ -850,6 +952,42 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     }
 
     return makeResponse(id, MsgValue::Object{{"plugin", toMsgValue(result)}});
+  }
+  if (cmd == "vst:editor:open") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "vst:editor:open requires payload");
+    }
+
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 1)
+      )
+    );
+    const int32_t pluginIndex = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "plugin_index"),
+        asInt(getField(*payload, "pluginIndex"), -1)
+      )
+    );
+
+    if (trackId <= 0 || pluginIndex < 0) {
+      return makeErrorResponse(id, "vst:editor:open requires track_id and plugin_index");
+    }
+
+    std::string error;
+    if (!thestuu::native::openPluginEditor(trackId, pluginIndex, error)) {
+      return makeErrorResponse(id, error);
+    }
+
+    return makeResponse(
+      id,
+      MsgValue::Object{
+        {"trackId", MsgValue(trackId)},
+        {"pluginIndex", MsgValue(pluginIndex)},
+        {"opened", MsgValue(true)},
+      }
+    );
   }
   if (cmd == "vst:param:set") {
     if (payload == nullptr) {
@@ -911,11 +1049,33 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     }
     request.startBars = asDouble(getField(*payload, "start"), 0.0);
     request.lengthBars = asDouble(getField(*payload, "length"), 0.0);
+    request.startSeconds = asDouble(getField(*payload, "start_seconds"), asDouble(getField(*payload, "startSeconds"), -1.0));
+    request.lengthSeconds = asDouble(getField(*payload, "length_seconds"), asDouble(getField(*payload, "lengthSeconds"), -1.0));
+    request.fadeInSeconds = asDouble(getField(*payload, "fade_in"), asDouble(getField(*payload, "fadeIn"), 0.0));
+    request.fadeOutSeconds = asDouble(getField(*payload, "fade_out"), asDouble(getField(*payload, "fadeOut"), 0.0));
+    auto fadeCurveFromString = [](const MsgValue* v) -> int {
+      if (!v) return 1;
+      std::string s = asString(v);
+      if (s == "convex") return 2;
+      if (s == "concave") return 3;
+      if (s == "sCurve" || s == "scurve") return 4;
+      return 1;
+    };
+    const MsgValue* fic = getField(*payload, "fade_in_curve");
+    if (!fic) fic = getField(*payload, "fadeInCurve");
+    request.fadeInCurve = fadeCurveFromString(fic);
+    const MsgValue* foc = getField(*payload, "fade_out_curve");
+    if (!foc) foc = getField(*payload, "fadeOutCurve");
+    request.fadeOutCurve = fadeCurveFromString(foc);
     request.type = asString(getField(*payload, "type"));
+    request.sourceOffsetSeconds = asDouble(getField(*payload, "source_offset_seconds"), asDouble(getField(*payload, "sourceOffsetSeconds"), -1.0));
 
     thestuu::native::ClipImportResult importResult;
     std::string error;
-    if (!thestuu::native::importClipFile(request, importResult, error)) {
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::importClipFileOnMessageThread(request, importResult, error)
+      : thestuu::native::importClipFile(request, importResult, error);
+    if (!ok) {
       return makeErrorResponse(id, error);
     }
 
@@ -928,6 +1088,149 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
         {"sourcePath", MsgValue(importResult.sourcePath)},
       }
     );
+  }
+
+  if (cmd == "track:set-mute") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track:set-mute requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 1)
+      )
+    );
+    const bool mute = asBool(getField(*payload, "mute"), false);
+    std::string error;
+    if (!thestuu::native::setTrackMute(trackId, mute, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(trackId)},
+      {"mute", MsgValue(mute)},
+    });
+  }
+
+  if (cmd == "track:set-solo") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track:set-solo requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 1)
+      )
+    );
+    const bool solo = asBool(getField(*payload, "solo"), false);
+    std::string error;
+    if (!thestuu::native::setTrackSolo(trackId, solo, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(trackId)},
+      {"solo", MsgValue(solo)},
+    });
+  }
+
+  if (cmd == "track:set-volume") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track:set-volume requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 1)
+      )
+    );
+    const double volume = asDouble(getField(*payload, "volume"), 0.85);
+    std::string error;
+    if (!thestuu::native::setTrackVolume(trackId, volume, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(trackId)},
+      {"volume", MsgValue(volume)},
+    });
+  }
+
+  if (cmd == "track:set-pan") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track:set-pan requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 1)
+      )
+    );
+    const double pan = asDouble(getField(*payload, "pan"), 0.0);
+    std::string error;
+    if (!thestuu::native::setTrackPan(trackId, pan, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(trackId)},
+      {"pan", MsgValue(pan)},
+    });
+  }
+
+  if (cmd == "track:set-record-arm") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track:set-record-arm requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 1)
+      )
+    );
+    const bool armed = asBool(getField(*payload, "record_armed"), asBool(getField(*payload, "recordArmed"), false));
+    std::string error;
+    if (!thestuu::native::setTrackRecordArm(trackId, armed, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(trackId)},
+      {"record_armed", MsgValue(armed)},
+    });
+  }
+
+  if (cmd == "audio.get_inputs") {
+    std::vector<thestuu::native::AudioDeviceInfo> devices;
+    std::string error;
+    if (!thestuu::native::getAudioInputDevices(devices, error)) {
+      return makeErrorResponse(id, error);
+    }
+    MsgValue::Array arr;
+    arr.reserve(devices.size());
+    for (const auto& d : devices) {
+      arr.push_back(MsgValue(MsgValue::Object{
+        {"id", MsgValue(d.id)},
+        {"name", MsgValue(d.name)},
+      }));
+    }
+    std::string currentId;
+    thestuu::native::getCurrentAudioInputDeviceId(currentId, error);
+    return makeResponse(id, MsgValue::Object{
+      {"devices", MsgValue(std::move(arr))},
+      {"currentId", MsgValue(currentId)},
+    });
+  }
+
+  if (cmd == "audio.set_input") {
+    std::string deviceId;
+    if (payload) {
+      deviceId = asString(getField(*payload, "device_id"));
+      if (deviceId.empty()) deviceId = asString(getField(*payload, "deviceId"));
+    }
+    if (deviceId.empty()) {
+      return makeErrorResponse(id, "audio.set_input requires device_id");
+    }
+    std::string error;
+    if (!thestuu::native::setAudioInputDevice(deviceId, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}});
   }
 
   return makeErrorResponse(id, "unknown cmd: " + cmd);
@@ -1092,12 +1395,12 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  g_useTracktionTransport = backendInfo.tracktion;
   std::cout << "[thestuu-native] backend: " << backendInfo.description << "\n";
 
   TransportCore transport;
 
   int serverFd = -1;
-
   try {
     serverFd = makeServerSocket(socketPath);
   } catch (const std::exception& error) {
@@ -1107,65 +1410,79 @@ int main(int argc, char** argv) {
 
   std::cout << "[thestuu-native] listening on " << socketPath << "\n";
 
-  while (g_running) {
-    const int clientFd = accept(serverFd, nullptr, nullptr);
-    if (clientFd < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      std::cerr << "[thestuu-native] accept failed: " << std::strerror(errno) << "\n";
-      break;
-    }
-
-    setNonBlocking(clientFd);
-    std::cout << "[thestuu-native] client connected\n";
-
-    std::vector<uint8_t> readBuffer;
-    readBuffer.reserve(8192);
-    auto nextTick = std::chrono::steady_clock::now();
-
+  // Socket I/O on a background thread so the main thread can run the JUCE message loop (required on macOS).
+  std::thread socketThread([&transport, serverFd]() {
     while (g_running) {
-      fd_set readSet;
-      FD_ZERO(&readSet);
-      FD_SET(clientFd, &readSet);
-
-      timeval timeout{};
-      timeout.tv_sec = 0;
-      timeout.tv_usec = 20000;
-
-      const int ready = select(clientFd + 1, &readSet, nullptr, nullptr, &timeout);
-      if (ready < 0) {
+      const int clientFd = accept(serverFd, nullptr, nullptr);
+      if (clientFd < 0) {
         if (errno == EINTR) {
           continue;
+        }
+        if (g_running) {
+          std::cerr << "[thestuu-native] accept failed: " << std::strerror(errno) << "\n";
         }
         break;
       }
 
-      if (ready > 0 && FD_ISSET(clientFd, &readSet)) {
-        std::array<uint8_t, 4096> chunk{};
-        const ssize_t bytes = recv(clientFd, chunk.data(), chunk.size(), 0);
-        if (bytes <= 0) {
+      setNonBlocking(clientFd);
+      std::cout << "[thestuu-native] client connected\n";
+
+      std::vector<uint8_t> readBuffer;
+      readBuffer.reserve(8192);
+      auto nextTick = std::chrono::steady_clock::now();
+
+      while (g_running) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(clientFd, &readSet);
+
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 20000;
+
+        const int ready = select(clientFd + 1, &readSet, nullptr, nullptr, &timeout);
+        if (ready < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
           break;
         }
-        readBuffer.insert(readBuffer.end(), chunk.begin(), chunk.begin() + bytes);
-        if (!processIncomingBuffer(readBuffer, clientFd, transport)) {
-          break;
+
+        if (ready > 0 && FD_ISSET(clientFd, &readSet)) {
+          std::array<uint8_t, 4096> chunk{};
+          const ssize_t bytes = recv(clientFd, chunk.data(), chunk.size(), 0);
+          if (bytes <= 0) {
+            break;
+          }
+          readBuffer.insert(readBuffer.end(), chunk.begin(), chunk.begin() + bytes);
+          if (!processIncomingBuffer(readBuffer, clientFd, transport)) {
+            break;
+          }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextTick) {
+          if (!sendFrame(clientFd, makeTickEvent(transport))) {
+            break;
+          }
+          nextTick = now + std::chrono::milliseconds(kTickMs);
         }
       }
 
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= nextTick) {
-        if (!sendFrame(clientFd, makeTickEvent(transport))) {
-          break;
-        }
-        nextTick = now + std::chrono::milliseconds(kTickMs);
-      }
+      close(clientFd);
+      std::cout << "[thestuu-native] client disconnected\n";
     }
+  });
 
-    close(clientFd);
-    std::cout << "[thestuu-native] client disconnected\n";
+  // Main thread runs the JUCE message loop so transport.play (callAsync) is processed on the message thread.
+  while (g_running) {
+    if (g_useTracktionTransport) {
+      thestuu::native::runMessageLoopFor(100);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 
+  socketThread.join();
   if (serverFd >= 0) {
     close(serverFd);
   }

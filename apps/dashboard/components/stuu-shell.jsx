@@ -5,11 +5,17 @@ import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import {
+  AudioWaveform,
+  ArrowUpDown,
   Check,
   ChevronRight,
   Circle,
+  Clock3,
+  Disc3,
   Download,
   ExternalLink,
+  Filter,
+  Gauge,
   LayoutGrid,
   MousePointer2,
   MoveHorizontal,
@@ -17,19 +23,24 @@ import {
   Pause,
   Pencil,
   Play,
-  Plug,
   Power,
+  RotateCw,
   Scissors,
+  SlidersHorizontal,
   Square,
   Trash2,
+  Undo2,
   VolumeX,
+  Waves,
+  X,
   ZoomIn,
+  Redo2,
 } from 'lucide-react';
 import 'reactflow/dist/style.css';
 import { createEngineSocket } from '../lib/socket';
 
 const TABS = ['Edit', 'Mix'];
-const DAW_MENU_ITEMS = ['FILE', 'EDIT', 'ADD', 'PATTERNS', 'VIEW', 'OPTIONS', 'TOOLS', 'HELP'];
+const DAW_MENU_ITEMS = ['FILE', 'VIEW', 'HELP', 'SETTINGS'];
 const DEFAULT_BAR_WIDTH = 92;
 const MIN_BAR_WIDTH = 36;
 const MAX_BAR_WIDTH = 220;
@@ -42,14 +53,16 @@ const PLAYHEAD_EXTEND_MARGIN_BARS = 4;
 const PLAYHEAD_SCRUB_EDGE_PX = 24;
 const PLAYHEAD_SCRUB_SCROLL_PX = 24;
 const GRID_STEP = 1 / 16;
+const SLICE_FREE_STEP = 1 / 256;
 const MIN_VOLUME_DB = -80;
 const MAX_VOLUME_DB = Number((20 * Math.log10(1.2)).toFixed(1));
 const MIN_VISIBLE_TRACKS = 1;
 const TRACK_NAME_LIMIT = 25;
 const TRACK_CHAIN_VISIBLE_SLOTS = 7;
-const TRACK_CHAIN_MODAL_MIN_SLOTS = 8;
+const TRACK_CHAIN_MODAL_MIN_SLOTS = TRACK_CHAIN_VISIBLE_SLOTS;
 const TRACK_CHAIN_PLUGIN_NAME_LIMIT = 14;
 const MIXER_INSPECTOR_SLOT_COUNT = 10;
+const DEFAULT_METRONOME_ENABLED = false;
 const DEFAULT_WAVEFORM_SAMPLE_COUNT = 1024;
 const MIN_WAVEFORM_SAMPLE_COUNT = 24;
 const MAX_WAVEFORM_SAMPLE_COUNT = 2048;
@@ -69,6 +82,7 @@ const TRACK_ADD_MENU_ITEMS = [
   { id: 'import', label: 'Import' },
   { id: 'pattern', label: 'Pattern' },
 ];
+// Must match engine SUPPORTED_AUDIO_EXTENSIONS (wav, flac, mp3, ogg, aac, aiff, aif) – same sync/playback for all.
 const IMPORTABLE_AUDIO_EXTENSIONS = new Set(['wav', 'flac', 'mp3', 'ogg', 'aac', 'aiff', 'aif']);
 const IMPORTABLE_MIDI_EXTENSIONS = new Set(['mid', 'midi']);
 const IMPORTABLE_EXTENSIONS = new Set([...IMPORTABLE_AUDIO_EXTENSIONS, ...IMPORTABLE_MIDI_EXTENSIONS]);
@@ -78,10 +92,11 @@ const TIME_MARKER_INTERVAL_SECONDS = 10;
 const TRACK_CONTEXT_MENU_ITEMS = [
   { id: 'rename', label: 'Umbenennen' },
   { id: 'duplicate', label: 'Duplizieren' },
-  { id: 'delete', label: 'Loeschen' },
+  { id: 'delete', label: 'Entfernen' },
 ];
-const DEFAULT_SNAP_MODE = 'auto';
+const DEFAULT_SNAP_MODE = 'free';
 const SNAP_MODE_OPTIONS = [
+  { id: 'free', label: 'Free' },
   { id: 'auto', label: 'Auto' },
   { id: 'line', label: 'Line' },
   { id: 'cell', label: 'Cell' },
@@ -92,16 +107,132 @@ const SNAP_MODE_OPTIONS = [
 const DEFAULT_TIME_SIGNATURE = { numerator: 4, denominator: 4 };
 const EDIT_TOOL_OPTIONS = [
   { id: 'select', label: 'Select', description: 'waehlt Clips und Bereiche aus' },
-  { id: 'draw', label: 'Draw', description: 'erstellt einen Clip an der Cursor-Position' },
-  { id: 'paint', label: 'Paint', description: 'malt mehrere Clips beim Ziehen' },
   { id: 'delete', label: 'Delete', description: 'loescht Clips per Klick oder Bereich' },
-  { id: 'mute', label: 'Mute', description: 'schaltet Clips stumm oder wieder laut' },
   { id: 'slice', label: 'Trim', description: 'schneidet Audio- und MIDI-Clips an der Position' },
-  { id: 'slip', label: 'Slip', description: 'verschiebt den Inhalt im Clip ohne die Laenge zu aendern' },
   { id: 'zoom', label: 'Zoom', description: 'zoomt in einen aufgezogenen Bereich' },
 ];
-const DEFAULT_EDIT_TOOL = 'draw';
+const DEFAULT_EDIT_TOOL = 'select';
 const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3987';
+
+const TRACKTION_PLUGIN_UI_META = {
+  '4bandeq': {
+    icon: SlidersHorizontal,
+    description: 'Equalizer: formt Bass, Mitten und Hoehen. Gut zum Aufraeumen und Feintuning.',
+  },
+  compressor: {
+    icon: Gauge,
+    description: 'Compressor/Limiter: macht Lautstaerke gleichmaessiger und bremst Spitzen.',
+  },
+  reverb: {
+    icon: Waves,
+    description: 'Reverb: gibt dem Sound Raum und Tiefe.',
+  },
+  delay: {
+    icon: Clock3,
+    description: 'Delay: erzeugt Echos und rhythmische Wiederholungen.',
+  },
+  chorus: {
+    icon: RotateCw,
+    description: 'Chorus: macht den Klang breiter und weicher.',
+  },
+  phaser: {
+    icon: RotateCw,
+    description: 'Phaser: bewegter Filtereffekt fuer mehr Bewegung im Sound.',
+  },
+  pitchshifter: {
+    icon: ArrowUpDown,
+    description: 'Pitch Shifter: veraendert die Tonhoehe des Signals.',
+  },
+  lowpass: {
+    icon: Filter,
+    description: 'Low Pass: nimmt hohe Frequenzen raus und macht den Klang dunkler.',
+  },
+  '4osc': {
+    icon: AudioWaveform,
+    description: 'Four Osc: Synthesizer mit vier Oszillatoren fuer eigene Sounds.',
+  },
+  sampler: {
+    icon: Disc3,
+    description: 'Sampler: spielt Samples auf Noten und macht sie musikalisch nutzbar.',
+  },
+};
+
+const TRACKTION_GENERIC_PLUGIN_UI_META = {
+  icon: LayoutGrid,
+  description: 'Tracktion Plugin: Klang bearbeiten, formen oder kreativ verfeinern.',
+};
+
+const TRACKTION_PLUGIN_TOKEN_ALIASES = {
+  eq4band: '4bandeq',
+  fourbandeq: '4bandeq',
+  foureq: '4bandeq',
+  compressorlimiter: 'compressor',
+  comp: 'compressor',
+  echo: 'delay',
+  pitchshift: 'pitchshifter',
+  lowpassfilter: 'lowpass',
+  lowpassfx: 'lowpass',
+  lpf: 'lowpass',
+  fourosc: '4osc',
+  oscillator: '4osc',
+};
+
+function normalizePluginLookupToken(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizeTracktionPluginToken(token) {
+  if (!token) {
+    return '';
+  }
+  if (TRACKTION_PLUGIN_UI_META[token]) {
+    return token;
+  }
+  if (TRACKTION_PLUGIN_TOKEN_ALIASES[token]) {
+    return TRACKTION_PLUGIN_TOKEN_ALIASES[token];
+  }
+  const directKey = Object.keys(TRACKTION_PLUGIN_UI_META).find((candidate) => token.includes(candidate));
+  if (directKey) {
+    return directKey;
+  }
+  const aliasKey = Object.keys(TRACKTION_PLUGIN_TOKEN_ALIASES).find((candidate) => token.includes(candidate));
+  if (aliasKey) {
+    return TRACKTION_PLUGIN_TOKEN_ALIASES[aliasKey];
+  }
+  return '';
+}
+
+function resolveTracktionPluginToken(pluginUid, pluginName) {
+  const uid = typeof pluginUid === 'string' ? pluginUid.trim().toLowerCase() : '';
+  if (uid.startsWith('internal:tracktion:')) {
+    const token = normalizePluginLookupToken(uid.slice('internal:tracktion:'.length));
+    return normalizeTracktionPluginToken(token) || token;
+  }
+  const name = typeof pluginName === 'string' ? pluginName.trim().toLowerCase() : '';
+  if (name.startsWith('tracktion ')) {
+    const token = normalizePluginLookupToken(name.slice('tracktion '.length));
+    return normalizeTracktionPluginToken(token) || token;
+  }
+  return '';
+}
+
+function resolveTracktionPluginUiMeta(pluginUid, pluginName) {
+  const token = resolveTracktionPluginToken(pluginUid, pluginName);
+  if (!token) {
+    return null;
+  }
+  return TRACKTION_PLUGIN_UI_META[token] || TRACKTION_GENERIC_PLUGIN_UI_META;
+}
+
+function buildPluginHelpTooltip(pluginName, pluginUiMeta) {
+  const resolvedName = typeof pluginName === 'string' && pluginName.trim() ? pluginName.trim() : 'Plugin';
+  if (!pluginUiMeta?.description) {
+    return resolvedName;
+  }
+  return `${resolvedName}: ${pluginUiMeta.description}`;
+}
 
 function getEditToolTooltip(tool) {
   if (!tool) {
@@ -149,6 +280,7 @@ const FALLBACK_STATE = {
   project: {
     project_name: 'Welcome to TheStuu',
     bpm: 128,
+    metronome_enabled: DEFAULT_METRONOME_ENABLED,
     time_signature: DEFAULT_TIME_SIGNATURE,
     playlist_view_bars: DEFAULT_VIEW_BARS,
     playlist_bar_width: DEFAULT_BAR_WIDTH,
@@ -159,7 +291,58 @@ const FALLBACK_STATE = {
     mixer: [],
   },
   selectedProjectFile: 'welcome.stu',
+  history: {
+    canUndo: false,
+    canRedo: false,
+  },
 };
+
+function normalizeMetronomeEnabled(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') {
+      return true;
+    }
+    if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') {
+      return false;
+    }
+  }
+  return DEFAULT_METRONOME_ENABLED;
+}
+
+function getMetronomeStepBeats() {
+  // BPM is defined in quarter-notes per minute, so the metronome steps in quarter-notes.
+  return 1;
+}
+
+function getMetronomeAccent(stepIndex, timeSignature = DEFAULT_TIME_SIGNATURE) {
+  const numerator = Number(timeSignature?.numerator);
+  const denominator = Number(timeSignature?.denominator);
+  const safeNumerator = Number.isFinite(numerator) && numerator > 0 ? Math.round(numerator) : 4;
+  const safeDenominator = Number.isFinite(denominator) && denominator > 0 ? Math.round(denominator) : 4;
+  const quarterNotesPerBarRaw = (safeNumerator * 4) / safeDenominator;
+  const quarterNotesPerBar = Number.isFinite(quarterNotesPerBarRaw) && quarterNotesPerBarRaw > 0 ? quarterNotesPerBarRaw : 4;
+  const stepsPerBar = Math.max(1, Math.round(quarterNotesPerBar));
+  const stepInBar = ((stepIndex % stepsPerBar) + stepsPerBar) % stepsPerBar;
+  if (stepInBar === 0) {
+    return 'strong';
+  }
+  if (
+    safeNumerator === 6
+    && safeDenominator === 8
+    && stepsPerBar >= 3
+    && stepInBar === Math.floor(stepsPerBar / 2)
+  ) {
+    return 'medium';
+  }
+  return 'weak';
+}
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -313,6 +496,46 @@ function resolveImportedFile(file) {
       ? Math.round(Number(file.size))
       : null,
   };
+}
+
+function getSourceNameBase(sourceName) {
+  if (!isNonEmptyString(sourceName)) {
+    return '';
+  }
+  const normalized = sourceName.trim();
+  if (!normalized) {
+    return '';
+  }
+  const dotIndex = normalized.lastIndexOf('.');
+  if (dotIndex <= 0) {
+    return normalized;
+  }
+  const base = normalized.slice(0, dotIndex).trim();
+  return base || normalized;
+}
+
+function buildTrackRenameChoicesForImports(supportedImports) {
+  if (!Array.isArray(supportedImports)) {
+    return [];
+  }
+  const choices = [];
+  for (let index = 0; index < supportedImports.length; index += 1) {
+    const imported = supportedImports[index]?.imported;
+    const sourceName = isNonEmptyString(imported?.sourceName) ? imported.sourceName.trim() : '';
+    if (!sourceName) {
+      continue;
+    }
+    const trackName = getSourceNameBase(sourceName);
+    if (!trackName) {
+      continue;
+    }
+    choices.push({
+      id: `import_track_rename_${index}`,
+      sourceName,
+      trackName,
+    });
+  }
+  return choices;
 }
 
 function readFileAsArrayBuffer(file) {
@@ -666,6 +889,41 @@ function normalizePluginParameters(parameters) {
   return normalized;
 }
 
+function parseOptionalBool(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') {
+      return true;
+    }
+    if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') {
+      return false;
+    }
+  }
+  return null;
+}
+
+function normalizePluginKind(kindValue, fallbackIsInstrument = null) {
+  if (typeof kindValue === 'string') {
+    const normalized = kindValue.trim().toLowerCase();
+    if (normalized === 'instrument' || normalized === 'inst' || normalized === 'synth' || normalized === 'generator') {
+      return 'instrument';
+    }
+    if (normalized === 'effect' || normalized === 'fx' || normalized === 'audio_fx' || normalized === 'audio-effect') {
+      return 'effect';
+    }
+  }
+  if (typeof fallbackIsInstrument === 'boolean') {
+    return fallbackIsInstrument ? 'instrument' : 'effect';
+  }
+  return 'effect';
+}
+
 function normalizePluginCatalog(plugins) {
   if (!Array.isArray(plugins)) {
     return [];
@@ -684,10 +942,17 @@ function normalizePluginCatalog(plugins) {
       continue;
     }
 
+    const isInstrumentFlag = parseOptionalBool(rawPlugin.isInstrument ?? rawPlugin.is_instrument);
+    const kind = normalizePluginKind(rawPlugin.kind ?? rawPlugin.plugin_kind, isInstrumentFlag);
+    const isNativeFlag = parseOptionalBool(rawPlugin.isNative ?? rawPlugin.is_native);
+
     deduped.set(uid, {
       uid,
       name: typeof rawPlugin.name === 'string' && rawPlugin.name.trim() ? rawPlugin.name.trim() : uid,
       type: typeof rawPlugin.type === 'string' && rawPlugin.type.trim() ? rawPlugin.type.trim() : 'unknown',
+      kind,
+      isInstrument: kind === 'instrument',
+      isNative: typeof isNativeFlag === 'boolean' ? isNativeFlag : uid.startsWith('internal:'),
       parameters: normalizePluginParameters(rawPlugin.parameters),
     });
   }
@@ -830,6 +1095,9 @@ function resolveGridLineDensity(barWidth) {
 
 function resolveSnapStep(snapMode, barWidth, gridLineDensity) {
   const mode = normalizeSnapMode(snapMode);
+  if (mode === 'free') {
+    return SLICE_FREE_STEP;
+  }
   if (mode === 'line') {
     const microDivisions = Number(gridLineDensity?.microDivisions);
     const microAlpha = Number(gridLineDensity?.microAlpha);
@@ -911,10 +1179,6 @@ function TrackChainArrowIcon() {
 
 function TrackChainBypassIcon({ active = false }) {
   return <Power size={14} strokeWidth={2} opacity={active ? 0.5 : 1} aria-hidden="true" />;
-}
-
-function TrackChainPlugIcon() {
-  return <Plug size={14} strokeWidth={2} aria-hidden="true" />;
 }
 
 const EDIT_TOOL_LUCIDE_ICONS = {
@@ -1036,15 +1300,37 @@ function formatTrackChainPluginName(name) {
   return `${normalized.slice(0, TRACK_CHAIN_PLUGIN_NAME_LIMIT - 1)}…`;
 }
 
+function resolveNodePluginDisplayName(node, pluginNameByUid) {
+  if (!node || typeof node !== 'object') {
+    return 'Plugin';
+  }
+  const uid = typeof node.plugin_uid === 'string' ? node.plugin_uid.trim() : '';
+  const mappedName = uid ? pluginNameByUid.get(uid) : '';
+  if (typeof mappedName === 'string' && mappedName.trim()) {
+    return mappedName.trim();
+  }
+  const pluginName = typeof node.plugin === 'string' ? node.plugin.trim() : '';
+  if (pluginName) {
+    return pluginName;
+  }
+  if (uid) {
+    return uid;
+  }
+  const id = typeof node.id === 'string' ? node.id.trim() : '';
+  return id || 'Plugin';
+}
+
 export default function StuuShell() {
   const socketRef = useRef(null);
   const clipDraftsRef = useRef({});
   const importFileInputRef = useRef(null);
   const importTargetTrackIdRef = useRef(null);
+  const importTrackRenamePromptResolverRef = useRef(null);
   const trackNameInputRef = useRef(null);
   const cancelTrackNameEditRef = useRef(false);
   const arrangementScrollRef = useRef(null);
   const arrangementGridRef = useRef(null);
+  const arrangementTrackRowsRef = useRef(null);
   const arrangementBodyRef = useRef(null);
   const barWidthRef = useRef(DEFAULT_BAR_WIDTH);
   const timelineBarsRef = useRef(DEFAULT_VIEW_BARS);
@@ -1057,6 +1343,16 @@ export default function StuuShell() {
   const playheadPointerHandlersRef = useRef(null);
   const toolPointerHandlersRef = useRef(null);
   const toolDragRef = useRef(null);
+  const metronomeAudioContextRef = useRef(null);
+  const metronomeFrameRef = useRef(null);
+  const metronomeLastStepRef = useRef(null);
+  const metronomeNeedleRef = useRef(null);
+  const metronomeClockRef = useRef({
+    anchorMs: 0,
+    anchorBeats: 0,
+    bpm: FALLBACK_STATE.project.bpm,
+  });
+  const trackRowDragBlockedRef = useRef(false);
   const playheadDragBarsRef = useRef(null);
   const previewStopTimeoutRef = useRef(null);
   const latestTransportRef = useRef(FALLBACK_STATE.transport);
@@ -1069,6 +1365,16 @@ export default function StuuShell() {
     positionBeats: FALLBACK_STATE.transport.positionBeats,
     timestamp: Date.now(),
   });
+  const metronomeDebugRef = useRef({
+    tickCount: 0,
+    lastTickMs: 0,
+    lastLogMs: 0,
+  });
+  const transportDebugRef = useRef({
+    lastPositionBeats: null,
+    lastTimestamp: null,
+    lastLogMs: 0,
+  });
   const loadedProjectFileRef = useRef(null);
   const chatHistoryLoadedRef = useRef(false);
   const lastSyncedViewRef = useRef({
@@ -1079,6 +1385,16 @@ export default function StuuShell() {
   });
 
   const [connection, setConnection] = useState('connecting');
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [settingsTab, setSettingsTab] = useState('AUDIO');
+  const [settingsVstPluginTab, setSettingsVstPluginTab] = useState('effects');
+  const [settingsVstSearch, setSettingsVstSearch] = useState('');
+  const [settingsVstSourceFilter, setSettingsVstSourceFilter] = useState('all');
+  const [audioOutputDevices, setAudioOutputDevices] = useState([]);
+  const [audioOutputCurrentId, setAudioOutputCurrentId] = useState('');
+  const [audioInputDevices, setAudioInputDevices] = useState([]);
+  const [audioInputCurrentId, setAudioInputCurrentId] = useState('');
+  const [audioStatus, setAudioStatus] = useState(/** @type {{ sampleRate: number | null; blockSize: number | null; outputLatencySeconds: number | null; outputChannels: number | null } | null} */ (null));
   const [enginePort, setEnginePort] = useState(() => {
     try {
       const u = new URL(ENGINE_BASE_URL);
@@ -1092,6 +1408,8 @@ export default function StuuShell() {
   const [clipMuteOverrides, setClipMuteOverrides] = useState({});
   const [clipSlipPreviewBars, setClipSlipPreviewBars] = useState({});
   const [toolDragOverlay, setToolDragOverlay] = useState(null);
+  const [bpmInputValue, setBpmInputValue] = useState(String(FALLBACK_STATE.project.bpm));
+  const [isBpmInputFocused, setIsBpmInputFocused] = useState(false);
   const [activeTab, setActiveTab] = useState('Edit');
   const [state, setState] = useState(FALLBACK_STATE);
   const [transport, setTransport] = useState(FALLBACK_STATE.transport);
@@ -1102,6 +1420,10 @@ export default function StuuShell() {
   const [activePatternId, setActivePatternId] = useState(null);
   const [clipDrafts, setClipDrafts] = useState({});
   const [clipInteraction, setClipInteraction] = useState(null);
+  const [fadeHandleInteraction, setFadeHandleInteraction] = useState(/** @type {{ which: 'in'|'out'; trackId: number; clipId: string; originX: number; originY: number; fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; clipLengthBars: number; clipLengthSeconds: number } | null} */ (null));
+  const fadeHandleDraftRef = useRef(/** @type {{ fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } | null} */ (null));
+  const fadeHandleStartRef = useRef(/** @type {{ originX: number; originY: number; lastCurveCycleY: number } | null} */ (null));
+  const [fadeDraftByKey, setFadeDraftByKey] = useState(/** @type {{ [clipKey: string]: { fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } } } */ ({}));
   const [openTrackMenuId, setOpenTrackMenuId] = useState(null);
   const [trackAddMenuAnchor, setTrackAddMenuAnchor] = useState(/** @type {{ top: number; right: number; height: number } | null} */ (null));
   const [editingTrackId, setEditingTrackId] = useState(null);
@@ -1113,10 +1435,54 @@ export default function StuuShell() {
   const [showTrackNodes, setShowTrackNodes] = useState(true);
   const [arrangementViewportWidth, setArrangementViewportWidth] = useState(0);
   const [availablePlugins, setAvailablePlugins] = useState([]);
+  const availableEffectPlugins = useMemo(
+    () => availablePlugins.filter((plugin) => isObject(plugin) && plugin.kind !== 'instrument'),
+    [availablePlugins],
+  );
+  const availableGeneratorPlugins = useMemo(
+    () => availablePlugins.filter((plugin) => isObject(plugin) && plugin.kind === 'instrument'),
+    [availablePlugins],
+  );
+  const settingsVstPlugins = useMemo(
+    () => (settingsVstPluginTab === 'generators' ? availableGeneratorPlugins : availableEffectPlugins),
+    [settingsVstPluginTab, availableGeneratorPlugins, availableEffectPlugins],
+  );
+  const settingsVstSourceCounts = useMemo(() => {
+    const nativeCount = settingsVstPlugins.filter((plugin) => plugin.isNative).length;
+    const externalCount = settingsVstPlugins.filter((plugin) => !plugin.isNative).length;
+    return {
+      all: settingsVstPlugins.length,
+      native: nativeCount,
+      external: externalCount,
+    };
+  }, [settingsVstPlugins]);
+  const settingsFilteredVstPlugins = useMemo(() => {
+    const search = settingsVstSearch.trim().toLowerCase();
+    return settingsVstPlugins.filter((plugin) => {
+      if (!isObject(plugin)) {
+        return false;
+      }
+      if (settingsVstSourceFilter === 'native' && !plugin.isNative) {
+        return false;
+      }
+      if (settingsVstSourceFilter === 'external' && plugin.isNative) {
+        return false;
+      }
+      if (!search) {
+        return true;
+      }
+      const name = typeof plugin.name === 'string' ? plugin.name.toLowerCase() : '';
+      const uid = typeof plugin.uid === 'string' ? plugin.uid.toLowerCase() : '';
+      const type = typeof plugin.type === 'string' ? plugin.type.toLowerCase() : '';
+      const source = plugin.isNative ? 'native' : 'external';
+      return name.includes(search) || uid.includes(search) || type.includes(search) || source.includes(search);
+    });
+  }, [settingsVstPlugins, settingsVstSearch, settingsVstSourceFilter]);
   const [selectedPluginUid, setSelectedPluginUid] = useState(FALLBACK_VST_UID);
   const [selectedPluginTrackId, setSelectedPluginTrackId] = useState(1);
   const [pluginScanPending, setPluginScanPending] = useState(false);
   const [pluginLoadPending, setPluginLoadPending] = useState(false);
+  const [historyMutationPending, setHistoryMutationPending] = useState(false);
   const [hoveredTrackId, setHoveredTrackId] = useState(null);
   const [dropTargetTrackId, setDropTargetTrackId] = useState(null);
   const [trackReorderDragId, setTrackReorderDragId] = useState(null);
@@ -1130,6 +1496,22 @@ export default function StuuShell() {
   const [trackChainModalTrackId, setTrackChainModalTrackId] = useState(null);
   const [slicePreviewBars, setSlicePreviewBars] = useState(null);
   const [sliceCursorPosition, setSliceCursorPosition] = useState(null);
+  const [importTrackRenamePrompt, setImportTrackRenamePrompt] = useState(null);
+  const pluginNameByUid = useMemo(() => {
+    const map = new Map();
+    for (const plugin of availablePlugins) {
+      if (!isObject(plugin)) {
+        continue;
+      }
+      const uid = typeof plugin.uid === 'string' ? plugin.uid.trim() : '';
+      const name = typeof plugin.name === 'string' ? plugin.name.trim() : '';
+      if (!uid || !name || map.has(uid)) {
+        continue;
+      }
+      map.set(uid, name);
+    }
+    return map;
+  }, [availablePlugins]);
 
   const applyEngineTransportPayload = useCallback((payload = {}) => {
     const previous = latestTransportRef.current;
@@ -1137,8 +1519,18 @@ export default function StuuShell() {
     latestTransportRef.current = merged;
 
     const snapshot = transportSnapshotRef.current;
-    const beatsPerBar = Number(snapshot?.beatsPerBar);
+    const payloadBeatsPerBar = Number(merged.beatsPerBar);
+    const beatsPerBar = Number.isFinite(payloadBeatsPerBar) && payloadBeatsPerBar > 0
+      ? payloadBeatsPerBar
+      : Number(snapshot?.beatsPerBar);
     const safeBeatsPerBar = Number.isFinite(beatsPerBar) && beatsPerBar > 0 ? beatsPerBar : 4;
+    const payloadBpm = Number(merged.bpm);
+    const snapshotBpm = Number(snapshot?.bpm);
+    const safeBpm = Number.isFinite(payloadBpm) && payloadBpm > 0
+      ? payloadBpm
+      : Number.isFinite(snapshotBpm) && snapshotBpm > 0
+        ? snapshotBpm
+        : FALLBACK_STATE.project.bpm;
     const transportBars = Number(merged.positionBars);
     const transportBeats = Number(merged.positionBeats);
     const positionBeats = Number.isFinite(transportBeats)
@@ -1150,22 +1542,57 @@ export default function StuuShell() {
       ? Math.max(0, transportBars)
       : Number((positionBeats / safeBeatsPerBar).toFixed(6));
     const timestampRaw = Number(merged.timestamp);
+    const timestamp = Number.isFinite(timestampRaw) ? timestampRaw : Date.now();
     const playing = Boolean(merged.playing ?? snapshot?.playing);
 
     transportSnapshotRef.current = {
       ...snapshot,
+      bpm: safeBpm,
+      beatsPerBar: safeBeatsPerBar,
       playing,
       positionBars,
       positionBeats,
-      timestamp: Number.isFinite(timestampRaw) ? timestampRaw : Date.now(),
+      timestamp,
     };
 
     const nowMs = Date.now();
+    const debug = transportDebugRef.current;
+    if (playing) {
+      let estimatedBpm = null;
+      const lastBeats = typeof debug.lastPositionBeats === 'number' ? debug.lastPositionBeats : null;
+      const lastTimestamp = typeof debug.lastTimestamp === 'number' ? debug.lastTimestamp : null;
+      if (lastBeats != null && lastTimestamp != null) {
+        const deltaBeats = positionBeats - lastBeats;
+        const deltaMs = timestamp - lastTimestamp;
+        if (deltaMs > 0 && deltaBeats >= 0) {
+          const estimate = (deltaBeats / deltaMs) * 60000;
+          if (Number.isFinite(estimate) && estimate > 0 && estimate < 400) {
+            estimatedBpm = estimate;
+          }
+        }
+      }
+      debug.lastPositionBeats = positionBeats;
+      debug.lastTimestamp = timestamp;
+      if (nowMs - debug.lastLogMs >= 2000) {
+        const estimatedText = Number.isFinite(estimatedBpm) ? estimatedBpm.toFixed(3) : 'n/a';
+        console.log(
+          `[thestuu-ui] transport payload bpm=${safeBpm.toFixed(3)} estBpm=${estimatedText} `
+          + `positionBeats=${positionBeats.toFixed(6)} ts=${timestamp}`,
+        );
+        debug.lastLogMs = nowMs;
+      }
+    } else {
+      debug.lastPositionBeats = null;
+      debug.lastTimestamp = null;
+      debug.lastLogMs = 0;
+    }
+
     const lastUiCommit = transportUiCommitRef.current;
+    const commitIntervalMs = playing ? 40 : 120;
     const shouldCommit =
       !playing
       || !lastUiCommit.playing
-      || nowMs - lastUiCommit.lastMs >= 120;
+      || nowMs - lastUiCommit.lastMs >= commitIntervalMs;
     if (shouldCommit) {
       transportUiCommitRef.current = { lastMs: nowMs, playing };
       setTransport((current) => ({
@@ -1178,6 +1605,15 @@ export default function StuuShell() {
   useEffect(() => {
     clipDraftsRef.current = clipDrafts;
   }, [clipDrafts]);
+
+  useEffect(() => {
+    return () => {
+      if (importTrackRenamePromptResolverRef.current) {
+        importTrackRenamePromptResolverRef.current({ apply: false, trackName: '' });
+        importTrackRenamePromptResolverRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -1267,6 +1703,62 @@ export default function StuuShell() {
   }, [applyEngineTransportPayload]);
 
   useEffect(() => {
+    if (connection !== 'online' || !state?.nativeTransport || !socketRef.current) {
+      return;
+    }
+    socketRef.current.emit('audio:get-outputs', {}, (res) => {
+      if (res?.ok && Array.isArray(res.devices)) {
+        setAudioOutputDevices(res.devices);
+        if (typeof res.currentId === 'string') setAudioOutputCurrentId(res.currentId);
+      }
+      if (res?.ok && (res.sampleRate != null || res.blockSize != null || res.outputChannels != null)) {
+        setAudioStatus({
+          sampleRate: typeof res.sampleRate === 'number' ? res.sampleRate : null,
+          blockSize: typeof res.blockSize === 'number' ? res.blockSize : null,
+          outputLatencySeconds: typeof res.outputLatencySeconds === 'number' ? res.outputLatencySeconds : null,
+          outputChannels: typeof res.outputChannels === 'number' ? res.outputChannels : null,
+        });
+      } else {
+        setAudioStatus(null);
+      }
+    });
+    socketRef.current.emit('audio:get-inputs', {}, (res) => {
+      if (res?.ok && Array.isArray(res.devices)) {
+        setAudioInputDevices(res.devices);
+        if (typeof res.currentId === 'string') setAudioInputCurrentId(res.currentId);
+      }
+    });
+  }, [connection, state?.nativeTransport]);
+
+  useEffect(() => {
+    if (!showSettingsModal || !socketRef.current || connection !== 'online' || !state?.nativeTransport) {
+      return;
+    }
+    socketRef.current.emit('audio:get-outputs', {}, (res) => {
+      if (res?.ok && Array.isArray(res.devices)) {
+        setAudioOutputDevices(res.devices);
+        if (typeof res.currentId === 'string') setAudioOutputCurrentId(res.currentId);
+      }
+      if (res?.ok && (res.sampleRate != null || res.blockSize != null || res.outputChannels != null)) {
+        setAudioStatus({
+          sampleRate: typeof res.sampleRate === 'number' ? res.sampleRate : null,
+          blockSize: typeof res.blockSize === 'number' ? res.blockSize : null,
+          outputLatencySeconds: typeof res.outputLatencySeconds === 'number' ? res.outputLatencySeconds : null,
+          outputChannels: typeof res.outputChannels === 'number' ? res.outputChannels : null,
+        });
+      } else {
+        setAudioStatus(null);
+      }
+    });
+    socketRef.current.emit('audio:get-inputs', {}, (res) => {
+      if (res?.ok && Array.isArray(res.devices)) {
+        setAudioInputDevices(res.devices);
+        if (typeof res.currentId === 'string') setAudioInputCurrentId(res.currentId);
+      }
+    });
+  }, [showSettingsModal, connection, state?.nativeTransport]);
+
+  useEffect(() => {
     if (editingTrackId === null || !trackNameInputRef.current) {
       return;
     }
@@ -1352,6 +1844,30 @@ export default function StuuShell() {
     window.addEventListener('resize', updateViewportWidth);
     return () => {
       window.removeEventListener('resize', updateViewportWidth);
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'Edit') {
+      return;
+    }
+    const scrollElement = arrangementScrollRef.current;
+    const trackRowsElement = arrangementTrackRowsRef.current;
+    if (!scrollElement || !trackRowsElement) {
+      return;
+    }
+    const syncTrackRowsToGrid = () => {
+      const nextTop = scrollElement.scrollTop;
+      if (Math.abs(trackRowsElement.scrollTop - nextTop) > 0.25) {
+        trackRowsElement.scrollTop = nextTop;
+      }
+    };
+
+    scrollElement.addEventListener('scroll', syncTrackRowsToGrid, { passive: true });
+    syncTrackRowsToGrid();
+
+    return () => {
+      scrollElement.removeEventListener('scroll', syncTrackRowsToGrid);
     };
   }, [activeTab]);
 
@@ -1524,6 +2040,13 @@ export default function StuuShell() {
     }),
     [state?.project?.time_signature],
   );
+  const metronomeEnabled = normalizeMetronomeEnabled(state?.project?.metronome_enabled);
+  const isMetronomeRunning = metronomeEnabled && Boolean(state?.playing);
+  const projectBpmForInput = useMemo(() => {
+    const bpm = Number(state?.project?.bpm);
+    const normalized = Number.isFinite(bpm) && bpm > 0 ? Math.round(bpm) : FALLBACK_STATE.project.bpm;
+    return Math.min(300, Math.max(20, normalized));
+  }, [state?.project?.bpm]);
   const timeMarkers = useMemo(() => {
     const bpm = Number(state?.project?.bpm) || 128;
     const timelineEndSeconds = barsToSeconds(timelineBars, bpm, timeSignature);
@@ -1541,10 +2064,71 @@ export default function StuuShell() {
     () => resolveSnapStep(snapMode, barWidth, gridLineDensity),
     [snapMode, barWidth, gridLineDensity],
   );
-  const sliceSnapStep = useMemo(() => {
-    const micro = Number(gridLineDensity?.microDivisions);
-    return Number.isFinite(micro) && micro > 0 ? 1 / micro : 1 / 4;
-  }, [gridLineDensity]);
+
+  useEffect(() => {
+    if (!isBpmInputFocused) {
+      setBpmInputValue(String(projectBpmForInput));
+    }
+  }, [projectBpmForInput, isBpmInputFocused]);
+
+  const commitBpmInput = useCallback(() => {
+    const normalizedRaw = String(bpmInputValue || '').trim().replace(',', '.');
+    if (!normalizedRaw) {
+      setBpmInputValue(String(projectBpmForInput));
+      return;
+    }
+    const parsed = Number(normalizedRaw);
+    if (!Number.isFinite(parsed)) {
+      setBpmInputValue(String(projectBpmForInput));
+      return;
+    }
+    const nextBpm = Math.round(clamp(parsed, 20, 300));
+    setBpmInputValue(String(nextBpm));
+    if (nextBpm !== projectBpmForInput) {
+      socketRef.current?.emit('transport:set-bpm', { bpm: nextBpm }, (result) => {
+        if (!result?.ok) {
+          setChatMessages((previous) => [
+            ...previous,
+            { role: 'system', text: `Fehler (transport:set-bpm): ${result?.error || 'Unbekannter Fehler'}` },
+          ]);
+        }
+      });
+    }
+  }, [bpmInputValue, projectBpmForInput]);
+
+  const handleBpmInputChange = useCallback((event) => {
+    const raw = String(event?.target?.value ?? '');
+    if (raw === '') {
+      setBpmInputValue('');
+      return;
+    }
+    if (/^\d{0,3}$/.test(raw)) {
+      setBpmInputValue(raw);
+    }
+  }, []);
+
+  const handleBpmInputFocus = useCallback(() => {
+    setIsBpmInputFocused(true);
+  }, []);
+
+  const handleBpmInputBlur = useCallback(() => {
+    setIsBpmInputFocused(false);
+    commitBpmInput();
+  }, [commitBpmInput]);
+
+  const handleBpmInputKeyDown = useCallback((event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      event.currentTarget.blur();
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setBpmInputValue(String(projectBpmForInput));
+      setIsBpmInputFocused(false);
+      event.currentTarget.blur();
+    }
+  }, [projectBpmForInput]);
 
   useEffect(() => {
     timelineBarsRef.current = timelineBars;
@@ -1555,12 +2139,15 @@ export default function StuuShell() {
     const beatsPerBar = Number.isFinite(beatsPerBarRaw) && beatsPerBarRaw > 0 ? beatsPerBarRaw : 4;
     const bpm = Number(state?.project?.bpm);
     const normalizedBpm = Number.isFinite(bpm) && bpm > 0 ? bpm : 128;
+    const snapshot = transportSnapshotRef.current;
+    const snapshotBpm = Number(snapshot?.bpm);
+    const keepSnapshotBpmWhilePlaying = Boolean(snapshot?.playing) && Number.isFinite(snapshotBpm) && snapshotBpm > 0;
 
     transportSnapshotRef.current = {
-      ...transportSnapshotRef.current,
-      bpm: normalizedBpm,
+      ...snapshot,
+      bpm: keepSnapshotBpmWhilePlaying ? snapshotBpm : normalizedBpm,
       beatsPerBar,
-      playing: Boolean(state?.playing ?? transportSnapshotRef.current.playing),
+      playing: Boolean(state?.playing ?? snapshot.playing),
     };
   }, [state?.project?.bpm, state?.playing, timeSignature.numerator, timeSignature.denominator]);
 
@@ -1579,12 +2166,215 @@ export default function StuuShell() {
   }, []);
 
   const getCurrentTransportBars = useCallback(() => {
-    const draggedBars = Number(playheadDragBarsRef.current);
-    if (Number.isFinite(draggedBars)) {
-      return Math.max(0, draggedBars);
+    const raw = playheadDragBarsRef.current;
+    if (raw != null && Number.isFinite(Number(raw))) {
+      return Math.max(0, Number(raw));
     }
     return Math.max(0, computeInterpolatedPlayheadBars(Date.now()));
   }, [computeInterpolatedPlayheadBars]);
+  const metronomeNumerator = Number(timeSignature.numerator) || 4;
+  const metronomeDenominator = Number(timeSignature.denominator) || 4;
+  const ensureMetronomeAudioContext = useCallback(() => {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      return null;
+    }
+    if (!metronomeAudioContextRef.current) {
+      try {
+        metronomeAudioContextRef.current = new AudioContextClass();
+      } catch {
+        metronomeAudioContextRef.current = null;
+      }
+    }
+    return metronomeAudioContextRef.current;
+  }, []);
+
+  const primeMetronomeAudio = useCallback(() => {
+    const context = ensureMetronomeAudioContext();
+    if (!context) {
+      return;
+    }
+    if (context.state === 'suspended') {
+      context.resume().catch(() => {});
+    }
+  }, [ensureMetronomeAudioContext]);
+
+  const triggerMetronomeTick = useCallback((accent = 'weak') => {
+    const debug = metronomeDebugRef.current;
+    const nowPerfMs = typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+    const targetBpm = Number(transportSnapshotRef.current?.bpm);
+    const safeTargetBpm = Number.isFinite(targetBpm) && targetBpm > 0 ? targetBpm : FALLBACK_STATE.project.bpm;
+    let measuredBpm = null;
+    if (debug.lastTickMs > 0) {
+      const deltaMs = nowPerfMs - debug.lastTickMs;
+      if (deltaMs > 0) {
+        const estimate = 60000 / deltaMs;
+        if (Number.isFinite(estimate) && estimate > 0 && estimate < 400) {
+          measuredBpm = estimate;
+        }
+      }
+    }
+    debug.tickCount += 1;
+    if (debug.tickCount <= 8 || nowPerfMs - debug.lastLogMs >= 2000) {
+      console.log(
+        `[thestuu-ui] metronome tick #${debug.tickCount} accent=${accent} targetBpm=${safeTargetBpm.toFixed(3)} `
+        + `measuredBpm=${Number.isFinite(measuredBpm) ? measuredBpm.toFixed(3) : 'n/a'}`,
+      );
+      debug.lastLogMs = nowPerfMs;
+    }
+    debug.lastTickMs = nowPerfMs;
+
+    const context = ensureMetronomeAudioContext();
+    if (!context) {
+      return;
+    }
+    if (context.state === 'suspended') {
+      context.resume().catch(() => {});
+      return;
+    }
+
+    const now = context.currentTime;
+    const masterGain = context.createGain();
+    const oscillator = context.createOscillator();
+    const envelope = context.createGain();
+    const transientOscillator = context.createOscillator();
+    const transientEnvelope = context.createGain();
+    const tone = accent === 'strong' ? 1980 : accent === 'medium' ? 1620 : 1340;
+    const level = accent === 'strong' ? 0.24 : accent === 'medium' ? 0.19 : 0.15;
+    const transientTone = accent === 'strong' ? 3900 : accent === 'medium' ? 3400 : 3000;
+    const transientLevel = accent === 'strong' ? 0.12 : accent === 'medium' ? 0.095 : 0.08;
+
+    oscillator.type = 'square';
+    oscillator.frequency.setValueAtTime(tone, now);
+    transientOscillator.type = 'triangle';
+    transientOscillator.frequency.setValueAtTime(transientTone, now);
+    envelope.gain.setValueAtTime(0.0001, now);
+    envelope.gain.exponentialRampToValueAtTime(level, now + 0.0007);
+    envelope.gain.exponentialRampToValueAtTime(0.0001, now + 0.036);
+    transientEnvelope.gain.setValueAtTime(0.0001, now);
+    transientEnvelope.gain.exponentialRampToValueAtTime(transientLevel, now + 0.0004);
+    transientEnvelope.gain.exponentialRampToValueAtTime(0.0001, now + 0.012);
+    masterGain.gain.setValueAtTime(1, now);
+
+    oscillator.connect(envelope);
+    envelope.connect(masterGain);
+    transientOscillator.connect(transientEnvelope);
+    transientEnvelope.connect(masterGain);
+    masterGain.connect(context.destination);
+
+    oscillator.start(now);
+    transientOscillator.start(now);
+    transientOscillator.stop(now + 0.014);
+    oscillator.stop(now + 0.045);
+  }, [ensureMetronomeAudioContext]);
+
+  useEffect(() => {
+    if (!isMetronomeRunning) {
+      metronomeLastStepRef.current = null;
+      metronomeClockRef.current = {
+        anchorMs: 0,
+        anchorBeats: 0,
+        bpm: FALLBACK_STATE.project.bpm,
+      };
+      if (metronomeFrameRef.current != null) {
+        window.cancelAnimationFrame(metronomeFrameRef.current);
+        metronomeFrameRef.current = null;
+      }
+      if (metronomeNeedleRef.current) {
+        metronomeNeedleRef.current.setAttribute('transform', 'rotate(0 32 45)');
+      }
+      metronomeDebugRef.current = {
+        tickCount: 0,
+        lastTickMs: 0,
+        lastLogMs: 0,
+      };
+      return undefined;
+    }
+
+    const signature = { numerator: metronomeNumerator, denominator: metronomeDenominator };
+    const stepBeatsRaw = getMetronomeStepBeats(signature);
+    const stepBeats = Number.isFinite(stepBeatsRaw) && stepBeatsRaw > 0 ? stepBeatsRaw : 1;
+    const epsilon = stepBeats * 0.03;
+
+    const renderFrame = () => {
+      const nowMs = Date.now();
+      const clock = metronomeClockRef.current;
+      const snapshot = transportSnapshotRef.current;
+      const snapshotBpm = Number(snapshot?.bpm);
+      const stateBpm = Number(state?.project?.bpm);
+      const bpmRaw = Number.isFinite(snapshotBpm) && snapshotBpm > 0 ? snapshotBpm : stateBpm;
+      const safeBpm = Number.isFinite(bpmRaw) && bpmRaw > 0 ? Math.min(300, Math.max(20, bpmRaw)) : FALLBACK_STATE.project.bpm;
+      const snapshotBeats = Number(snapshot?.positionBeats);
+
+      if (clock.anchorMs <= 0) {
+        clock.anchorMs = nowMs;
+        clock.anchorBeats = Number.isFinite(snapshotBeats) ? Math.max(0, snapshotBeats) : 0;
+        clock.bpm = safeBpm;
+      }
+
+      if (Math.abs(clock.bpm - safeBpm) > 0.0001) {
+        const elapsedMsBeforeBpmChange = Math.max(0, nowMs - clock.anchorMs);
+        clock.anchorBeats = Math.max(0, clock.anchorBeats + (elapsedMsBeforeBpmChange * clock.bpm) / 60000);
+        clock.anchorMs = nowMs;
+        clock.bpm = safeBpm;
+      }
+
+      let positionBeats = Math.max(0, clock.anchorBeats + (Math.max(0, nowMs - clock.anchorMs) * clock.bpm) / 60000);
+      if (Number.isFinite(snapshotBeats) && Math.abs(snapshotBeats - positionBeats) > 8) {
+        // Follow explicit seeks/stops from transport state, but otherwise keep BPM-true local clock.
+        clock.anchorBeats = Math.max(0, snapshotBeats);
+        clock.anchorMs = nowMs;
+        positionBeats = clock.anchorBeats;
+      }
+      const currentStep = Math.floor((positionBeats + epsilon) / stepBeats);
+
+      if (!Number.isInteger(metronomeLastStepRef.current)) {
+        const nearestStepBeat = currentStep * stepBeats;
+        const nearStepBoundary = Math.abs(positionBeats - nearestStepBeat) <= epsilon;
+        metronomeLastStepRef.current = nearStepBoundary ? (currentStep - 1) : currentStep;
+      }
+
+      while (metronomeLastStepRef.current < currentStep) {
+        metronomeLastStepRef.current += 1;
+        const accent = getMetronomeAccent(metronomeLastStepRef.current, signature);
+        triggerMetronomeTick(accent);
+      }
+
+      if (metronomeNeedleRef.current) {
+        const swingPhase = positionBeats * Math.PI;
+        const angleDeg = Math.sin(swingPhase) * 20;
+        metronomeNeedleRef.current.setAttribute('transform', `rotate(${angleDeg.toFixed(2)} 32 45)`);
+      }
+
+      metronomeFrameRef.current = window.requestAnimationFrame(renderFrame);
+    };
+
+    metronomeFrameRef.current = window.requestAnimationFrame(renderFrame);
+    return () => {
+      if (metronomeFrameRef.current != null) {
+        window.cancelAnimationFrame(metronomeFrameRef.current);
+        metronomeFrameRef.current = null;
+      }
+    };
+  }, [isMetronomeRunning, metronomeNumerator, metronomeDenominator, triggerMetronomeTick, state?.project?.bpm]);
+
+  useEffect(() => () => {
+    if (metronomeFrameRef.current != null) {
+      window.cancelAnimationFrame(metronomeFrameRef.current);
+      metronomeFrameRef.current = null;
+    }
+    const context = metronomeAudioContextRef.current;
+    metronomeAudioContextRef.current = null;
+    if (context && typeof context.close === 'function') {
+      context.close().catch(() => {});
+    }
+  }, []);
+
   const timeDisplay = useMemo(() => {
     const bpm = Number(state?.project?.bpm) || 128;
     const beats = Number(transport?.positionBeats) || 0;
@@ -1799,6 +2589,68 @@ export default function StuuShell() {
     });
   }, [appendSystemMessage]);
 
+  const resolveImportTrackRenamePrompt = useCallback((payload = { apply: false, trackName: '' }) => {
+    const resolver = importTrackRenamePromptResolverRef.current;
+    importTrackRenamePromptResolverRef.current = null;
+    setImportTrackRenamePrompt(null);
+    if (resolver) {
+      resolver({
+        apply: Boolean(payload?.apply),
+        trackName: isNonEmptyString(payload?.trackName) ? payload.trackName.trim() : '',
+      });
+    }
+  }, []);
+
+  const requestImportTrackRenameDecision = useCallback((trackId, supportedImports) => {
+    const choices = buildTrackRenameChoicesForImports(supportedImports);
+    if (choices.length === 0) {
+      return Promise.resolve({ apply: false, trackName: '' });
+    }
+
+    return new Promise((resolve) => {
+      if (importTrackRenamePromptResolverRef.current) {
+        importTrackRenamePromptResolverRef.current({ apply: false, trackName: '' });
+      }
+      importTrackRenamePromptResolverRef.current = resolve;
+      setImportTrackRenamePrompt({
+        trackId,
+        choices,
+        selectedChoiceId: choices[0].id,
+      });
+    });
+  }, []);
+
+  const triggerProjectHistory = useCallback((direction) => {
+    const socket = socketRef.current;
+    if (!socket || historyMutationPending) {
+      return;
+    }
+
+    const wantsUndo = direction === 'undo';
+    const canUndo = Boolean(state?.history?.canUndo);
+    const canRedo = Boolean(state?.history?.canRedo);
+    if ((wantsUndo && !canUndo) || (!wantsUndo && !canRedo)) {
+      return;
+    }
+
+    const eventName = wantsUndo ? 'project:undo' : 'project:redo';
+    setHistoryMutationPending(true);
+    socket.emit(eventName, {}, (result) => {
+      setHistoryMutationPending(false);
+      if (!result?.ok) {
+        appendSystemMessage(`Fehler (${eventName}): ${result?.error || 'Unbekannter Fehler'}`);
+      }
+    });
+  }, [appendSystemMessage, historyMutationPending, state?.history?.canRedo, state?.history?.canUndo]);
+
+  const triggerProjectUndo = useCallback(() => {
+    triggerProjectHistory('undo');
+  }, [triggerProjectHistory]);
+
+  const triggerProjectRedo = useCallback(() => {
+    triggerProjectHistory('redo');
+  }, [triggerProjectHistory]);
+
   useEffect(() => {
     function handlePointerDown(event) {
       const target = event.target;
@@ -1827,6 +2679,39 @@ export default function StuuShell() {
       if (event.repeat) {
         return;
       }
+      if (importTrackRenamePrompt) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
+          return;
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          const selectedChoice = importTrackRenamePrompt.choices.find((choice) => (
+            choice.id === importTrackRenamePrompt.selectedChoiceId
+          )) || importTrackRenamePrompt.choices[0];
+          resolveImportTrackRenamePrompt({
+            apply: true,
+            trackName: selectedChoice?.trackName || '',
+          });
+          return;
+        }
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && !isEditableTarget(event.target)) {
+        const key = event.key.toLowerCase();
+        const wantsUndo = key === 'z' && !event.shiftKey;
+        const wantsRedo = (key === 'z' && event.shiftKey) || (!event.metaKey && event.ctrlKey && key === 'y');
+        if (wantsUndo || wantsRedo) {
+          event.preventDefault();
+          if (wantsUndo) {
+            triggerProjectUndo();
+          } else {
+            triggerProjectRedo();
+          }
+          return;
+        }
+      }
       if (event.key === 'Escape') {
         setOpenTrackMenuId(null);
         setTrackContextMenu(null);
@@ -1839,18 +2724,6 @@ export default function StuuShell() {
       }
       if (activeTab === 'Edit' && !isEditableTarget(event.target)) {
         const key = event.key.toLowerCase();
-        if (key === 'b') {
-          activateToolFromShortcut('paint');
-          return;
-        }
-        if (key === 'd' || key === 'p') {
-          activateToolFromShortcut('draw');
-          return;
-        }
-        if (key === 'm') {
-          activateToolFromShortcut('mute');
-          return;
-        }
         if (key === 'x') {
           activateToolFromShortcut('slice');
           return;
@@ -1894,7 +2767,7 @@ export default function StuuShell() {
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [activeTab, state?.playing, selectedClipKeys, emitMutation]);
+  }, [activeTab, state?.playing, selectedClipKeys, emitMutation, triggerProjectRedo, triggerProjectUndo, importTrackRenamePrompt, resolveImportTrackRenamePrompt]);
 
   useEffect(() => {
     return () => {
@@ -2039,7 +2912,7 @@ export default function StuuShell() {
         playheadAnimationFrameRef.current = null;
       }
     };
-  }, [activeTab, ensureViewBars, getCurrentTransportBars]);
+  }, [activeTab, state?.playing, ensureViewBars, getCurrentTransportBars]);
 
   useEffect(() => {
     const selectedProjectFile = typeof state?.selectedProjectFile === 'string'
@@ -2651,10 +3524,101 @@ export default function StuuShell() {
     beginPlayheadScrub(event);
   }
 
+  function setMetronomeEnabled(enabled) {
+    const nextEnabled = Boolean(enabled);
+    if (nextEnabled) {
+      primeMetronomeAudio();
+    } else {
+      metronomeLastStepRef.current = null;
+      metronomeClockRef.current = {
+        anchorMs: 0,
+        anchorBeats: 0,
+        bpm: FALLBACK_STATE.project.bpm,
+      };
+      metronomeDebugRef.current = {
+        tickCount: 0,
+        lastTickMs: 0,
+        lastLogMs: 0,
+      };
+      if (metronomeNeedleRef.current) {
+        metronomeNeedleRef.current.setAttribute('transform', 'rotate(0 32 45)');
+      }
+    }
+    setState((previousState) => {
+      const baseState = isObject(previousState) ? previousState : FALLBACK_STATE;
+      const baseProject = isObject(baseState.project) ? baseState.project : FALLBACK_STATE.project;
+      return {
+        ...baseState,
+        project: {
+          ...baseProject,
+          metronome_enabled: nextEnabled,
+        },
+      };
+    });
+    emitMutation('project:update-view', { metronomeEnabled: nextEnabled });
+  }
+
+  function toggleMetronome() {
+    setMetronomeEnabled(!metronomeEnabled);
+  }
+
   function transportPlay() {
     clearPreviewStopTimer();
-    applyEngineTransportPayload({ playing: true, timestamp: Date.now() });
-    emitMutation('transport:play', {});
+    const typedRaw = Number(String(bpmInputValue || '').trim().replace(',', '.'));
+    const desiredBpm = Number.isFinite(typedRaw)
+      ? Math.round(clamp(typedRaw, 20, 300))
+      : projectBpmForInput;
+
+    setBpmInputValue(String(desiredBpm));
+    setState((previousState) => {
+      const baseState = isObject(previousState) ? previousState : FALLBACK_STATE;
+      const baseProject = isObject(baseState.project) ? baseState.project : FALLBACK_STATE.project;
+      return {
+        ...baseState,
+        project: {
+          ...baseProject,
+          bpm: desiredBpm,
+        },
+      };
+    });
+    transportSnapshotRef.current = {
+      ...transportSnapshotRef.current,
+      bpm: desiredBpm,
+    };
+
+    console.log(
+      `[thestuu-ui] transportPlay desiredBpm=${desiredBpm} projectBpm=${projectBpmForInput} `
+      + `input="${String(bpmInputValue || '').trim()}"`,
+    );
+
+    const beginPlay = () => {
+      if (metronomeEnabled) {
+        primeMetronomeAudio();
+      }
+      applyEngineTransportPayload({
+        playing: true,
+        bpm: desiredBpm,
+        timestamp: Date.now(),
+      });
+      emitMutation('transport:play', { bpm: desiredBpm });
+    };
+
+    const socket = socketRef.current;
+    if (desiredBpm !== projectBpmForInput && socket) {
+      socket.emit('transport:set-bpm', { bpm: desiredBpm }, (result) => {
+        if (!result?.ok) {
+          appendSystemMessage(`Fehler (transport:set-bpm): ${result?.error || 'Unbekannter Fehler'}`);
+        }
+        beginPlay();
+      });
+      return;
+    }
+
+    if (desiredBpm !== projectBpmForInput && !socket) {
+      appendSystemMessage('Fehler (transport:set-bpm): Keine Engine-Verbindung.');
+    }
+
+    beginPlay();
   }
 
   function transportPause() {
@@ -2683,10 +3647,6 @@ export default function StuuShell() {
     setToolDragOverlay(null);
     toolDragRef.current = null;
     clearToolPointerSession();
-  }
-
-  function setBpm(value) {
-    emitMutation('transport:set-bpm', { bpm: Number(value) });
   }
 
   function applyLocalTrackMix(trackId, patch) {
@@ -3015,12 +3975,12 @@ export default function StuuShell() {
 
       const plugins = normalizePluginCatalog(result.plugins);
       setAvailablePlugins(plugins);
+      const effectPlugins = plugins.filter((plugin) => plugin.kind !== 'instrument');
       setSelectedPluginUid((previousUid) => {
-        if (previousUid && plugins.some((plugin) => plugin.uid === previousUid)) {
+        if (previousUid && effectPlugins.some((plugin) => plugin.uid === previousUid)) {
           return previousUid;
         }
-        const fallbackPlugin = plugins.find((plugin) => plugin.uid === FALLBACK_VST_UID);
-        return fallbackPlugin?.uid || plugins[0]?.uid || FALLBACK_VST_UID;
+        return effectPlugins[0]?.uid || FALLBACK_VST_UID;
       });
 
       if (!silent) {
@@ -3030,9 +3990,18 @@ export default function StuuShell() {
   }, [appendSystemMessage]);
 
   function addVst(options = {}) {
+    const requestedSlotKind = normalizePluginKind(options.slotKind ?? options.slot_kind, null);
+    const defaultEffectPluginUid = availableEffectPlugins[0]?.uid;
+    const fallbackPluginUid = requestedSlotKind === 'effect'
+      ? (defaultEffectPluginUid || '')
+      : FALLBACK_VST_UID;
     const pluginUid = typeof options.pluginUid === 'string' && options.pluginUid.trim()
       ? options.pluginUid.trim()
-      : (typeof selectedPluginUid === 'string' && selectedPluginUid.trim() ? selectedPluginUid.trim() : FALLBACK_VST_UID);
+      : (typeof selectedPluginUid === 'string' && selectedPluginUid.trim() ? selectedPluginUid.trim() : fallbackPluginUid);
+    if (!pluginUid) {
+      appendSystemMessage('Kein Effekt-Plugin verfuegbar. Bitte zuerst Plugins scannen.');
+      return;
+    }
     const requestedTrackId = Number(options.trackId ?? selectedPluginTrackId ?? selectedTrackId ?? 1);
     const trackId = Number.isInteger(requestedTrackId) && requestedTrackId > 0 ? requestedTrackId : 1;
     const insertIndexRaw = Number(options.insertIndex);
@@ -3043,6 +4012,7 @@ export default function StuuShell() {
       socketRef.current?.emit('vst:add', {
         plugin_uid: pluginUid,
         track_id: trackId,
+        ...(requestedSlotKind ? { slot_kind: requestedSlotKind } : {}),
         ...(insertIndex !== null ? { insert_index: insertIndex } : {}),
       }, (result) => {
         setPluginLoadPending(false);
@@ -3099,6 +4069,29 @@ export default function StuuShell() {
     });
   }
 
+  function openVstNodeEditor(node) {
+    if (!node || node.type !== 'vst_instrument') {
+      return;
+    }
+
+    const trackId = resolveNodeTrackId(node);
+    const pluginIndex = resolveNodePluginIndex(node, -1);
+    if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
+      appendSystemMessage('Plugin-Fenster konnte nicht geoeffnet werden (ungueltige Node-Metadaten).');
+      return;
+    }
+
+    socketRef.current?.emit('vst:editor:open', {
+      node_id: node.id,
+      track_id: trackId,
+      plugin_index: pluginIndex,
+    }, (result) => {
+      if (!result?.ok) {
+        appendSystemMessage(`Fehler (vst:editor:open): ${result?.error || 'Unbekannter Fehler'}`);
+      }
+    });
+  }
+
   function setTrackChainEnabled(trackId, enabled) {
     if (!Number.isInteger(trackId) || trackId <= 0) return;
     setTrackChainEnabledOverrides((prev) => ({ ...prev, [trackId]: enabled }));
@@ -3109,7 +4102,7 @@ export default function StuuShell() {
     if (!node || node.type !== 'vst_instrument') {
       return;
     }
-    const pluginLabel = formatTrackChainPluginName(node.plugin || node.plugin_uid || node.id || 'Plugin');
+    const pluginLabel = resolveNodePluginDisplayName(node, pluginNameByUid);
     const confirmed = window.confirm(`Plugin "${pluginLabel}" wirklich entfernen?`);
     if (!confirmed) {
       return;
@@ -3152,7 +4145,7 @@ export default function StuuShell() {
       slotIndex: resolvedSlotIndex,
       scope,
     });
-    if (availablePlugins.length === 0 && !pluginScanPending) {
+    if (availableEffectPlugins.length === 0 && !pluginScanPending) {
       scanVstPlugins({ silent: true });
     }
   }
@@ -3163,6 +4156,13 @@ export default function StuuShell() {
     }
     scanVstPlugins({ silent: true });
   }, [activeTab, pluginScanPending, availablePlugins.length, scanVstPlugins]);
+
+  useEffect(() => {
+    if (!showSettingsModal || settingsTab !== 'VST PLUGINS' || pluginScanPending || availablePlugins.length > 0) {
+      return;
+    }
+    scanVstPlugins({ silent: true });
+  }, [showSettingsModal, settingsTab, pluginScanPending, availablePlugins.length, scanVstPlugins]);
 
   function saveProject() {
     const projectWithViewState = {
@@ -3324,6 +4324,10 @@ export default function StuuShell() {
       : snapToGrid(Math.max(0, getCurrentTransportBars()), snapStep);
 
     async function finalizeImport() {
+      const renameDecision = await requestImportTrackRenameDecision(resolvedTrackId, supported);
+      if (renameDecision.apply && isNonEmptyString(renameDecision.trackName)) {
+        renameTrack(resolvedTrackId, renameDecision.trackName);
+      }
       let nextStart = baseStart;
       try {
         const bpm = Number(state?.project?.bpm) || 128;
@@ -3355,19 +4359,27 @@ export default function StuuShell() {
               }
             }
           }
-          emitMutation('clip:import-file', {
-            trackId: resolvedTrackId,
-            type: imported.type,
-            source_name: imported.sourceName,
-            source_format: imported.sourceFormat,
-            ...(uploadResult?.path ? { source_path: uploadResult.path } : {}),
-            start: nextStart,
-            length: lengthBars,
-            ...(imported.sourceMime ? { source_mime: imported.sourceMime } : {}),
-            ...(Number.isInteger(imported.sourceSizeBytes) ? { source_size_bytes: imported.sourceSizeBytes } : {}),
-            ...(sourceDurationSeconds !== null ? { source_duration_seconds: sourceDurationSeconds } : {}),
-            ...(waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
-          });
+          emitMutation(
+            'clip:import-file',
+            {
+              trackId: resolvedTrackId,
+              type: imported.type,
+              source_name: imported.sourceName,
+              source_format: imported.sourceFormat,
+              ...(uploadResult?.path ? { source_path: uploadResult.path } : {}),
+              start: nextStart,
+              length: lengthBars,
+              ...(imported.sourceMime ? { source_mime: imported.sourceMime } : {}),
+              ...(Number.isInteger(imported.sourceSizeBytes) ? { source_size_bytes: imported.sourceSizeBytes } : {}),
+              ...(sourceDurationSeconds !== null ? { source_duration_seconds: sourceDurationSeconds } : {}),
+              ...(waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
+            },
+            (result) => {
+              if (result?.nativeImportError) {
+                appendSystemMessage(`Clip angelegt, aber Audio-Engine-Import fehlgeschlagen: ${result.nativeImportError}. Playback moeglicherweise ohne Ton.`);
+              }
+            },
+          );
           nextStart = snapToGrid(nextStart + lengthBars, snapStep);
         }
         setInspector({ type: 'track', trackId: resolvedTrackId });
@@ -3422,7 +4434,30 @@ export default function StuuShell() {
 
   const TRACK_REORDER_MIME = 'application/x-thestuu-track';
 
+  function shouldBlockTrackRowDragFromTarget(target) {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+    if (target.closest('[data-track-reorder-handle="true"]')) {
+      return false;
+    }
+    return Boolean(
+      target.closest(
+        '[data-track-drag-ignore="true"], input, button, select, textarea, label, a, [contenteditable="true"]',
+      ),
+    );
+  }
+
+  function handleTrackRowPointerDownCapture(event) {
+    trackRowDragBlockedRef.current = shouldBlockTrackRowDragFromTarget(event.target);
+  }
+
   function handleTrackRowDragStart(event, trackId) {
+    if (trackRowDragBlockedRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     event.dataTransfer.setData(TRACK_REORDER_MIME, String(trackId));
     event.dataTransfer.effectAllowed = 'move';
     event.dataTransfer.setData('text/plain', String(trackId));
@@ -3430,6 +4465,7 @@ export default function StuuShell() {
   }
 
   function handleTrackRowDragEnd() {
+    trackRowDragBlockedRef.current = false;
     setTrackReorderDragId(null);
     setTrackReorderDropIndex(null);
   }
@@ -3456,6 +4492,7 @@ export default function StuuShell() {
     event.preventDefault();
     event.stopPropagation();
     const draggedId = Number(event.dataTransfer.getData(TRACK_REORDER_MIME));
+    trackRowDragBlockedRef.current = false;
     setTrackReorderDragId(null);
     setTrackReorderDropIndex(null);
     setDropTargetTrackId(null);
@@ -3585,6 +4622,11 @@ export default function StuuShell() {
     if (event.button !== 0) {
       return;
     }
+    if (event.target.closest('.clip-fade-in-handle, .clip-fade-out-handle')) {
+      const which = event.target.closest('.clip-fade-in-handle') ? 'in' : 'out';
+      beginFadeHandleInteraction(which, event, trackId, clip);
+      return;
+    }
 
     if (editTool === 'delete') {
       event.preventDefault();
@@ -3603,8 +4645,8 @@ export default function StuuShell() {
       if (!context) {
         return;
       }
-      const splitBars = snapToGrid(context.bars, sliceSnapStep);
-      splitClipAtBar(trackId, clip, splitBars, sliceSnapStep);
+      const splitBars = snapToGrid(context.bars, snapStep);
+      splitClipAtBar(trackId, clip, splitBars, snapStep);
       return;
     }
     if (editTool === 'slip') {
@@ -3619,7 +4661,7 @@ export default function StuuShell() {
         additive: event.shiftKey || event.metaKey || event.ctrlKey,
         toggle: event.metaKey || event.ctrlKey,
       });
-      return;
+      // Fall through so drag moves the clip (selector = select + move on drag).
     }
 
     beginClipInteraction(event, 'move', trackId, clip);
@@ -3633,6 +4675,120 @@ export default function StuuShell() {
     event.preventDefault();
     event.stopPropagation();
   }
+
+  const FADE_CURVE_ORDER = ['linear', 'convex', 'concave', 'sCurve'];
+  function beginFadeHandleInteraction(which, event, trackId, clip) {
+    event.preventDefault();
+    event.stopPropagation();
+    const bpm = Number(transportSnapshotRef.current?.bpm) || 120;
+    const clipLengthBars = Number(clip.length) || 1;
+    const clipLengthSeconds = barsToSeconds(clipLengthBars, bpm, timeSignature);
+    const fadeIn = Number(clip.fade_in) || 0;
+    const fadeOut = Number(clip.fade_out) || 0;
+    const fadeInCurve = FADE_CURVE_ORDER.includes(clip.fade_in_curve) ? clip.fade_in_curve : 'linear';
+    const fadeOutCurve = FADE_CURVE_ORDER.includes(clip.fade_out_curve) ? clip.fade_out_curve : 'linear';
+    const clipKey = getClipSelectionKey(trackId, clip.id);
+    fadeHandleDraftRef.current = { fadeIn, fadeOut, fadeInCurve, fadeOutCurve };
+    fadeHandleStartRef.current = { originX: event.clientX, originY: event.clientY, lastCurveCycleY: event.clientY };
+    setFadeHandleInteraction({
+      which,
+      trackId,
+      clipId: clip.id,
+      originX: event.clientX,
+      originY: event.clientY,
+      fadeIn,
+      fadeOut,
+      fadeInCurve,
+      fadeOutCurve,
+      clipLengthBars,
+      clipLengthSeconds,
+    });
+    setFadeDraftByKey((prev) => ({ ...prev, [clipKey]: { fadeIn, fadeOut, fadeInCurve, fadeOutCurve } }));
+  }
+
+  useEffect(() => {
+    if (!fadeHandleInteraction) {
+      return;
+    }
+    const bpm = Number(transportSnapshotRef.current?.bpm) || 120;
+    const maxFadeSeconds = fadeHandleInteraction.clipLengthSeconds / 2;
+    const clipKey = getClipSelectionKey(fadeHandleInteraction.trackId, fadeHandleInteraction.clipId);
+
+    function handlePointerMove(moveEvent) {
+      const start = fadeHandleStartRef.current;
+      const draft = fadeHandleDraftRef.current;
+      if (!start || !draft) return;
+      const deltaXBars = (moveEvent.clientX - start.originX) / barWidthRef.current;
+      const deltaYBars = (moveEvent.clientY - start.originY) / barWidthRef.current;
+      const snappedDeltaXBars = snapToGrid(deltaXBars, snapStep);
+      let nextFadeIn = draft.fadeIn;
+      let nextFadeOut = draft.fadeOut;
+      let nextFadeInCurve = draft.fadeInCurve;
+      let nextFadeOutCurve = draft.fadeOutCurve;
+
+      const curveThresholdPx = 12;
+      const deltaYFromLastCycle = moveEvent.clientY - start.lastCurveCycleY;
+
+      if (fadeHandleInteraction.which === 'in') {
+        const newFadeInBars = Math.max(0, secondsToBars(draft.fadeIn, bpm, timeSignature) + snappedDeltaXBars);
+        const newFadeInSeconds = Math.min(barsToSeconds(newFadeInBars, bpm, timeSignature), maxFadeSeconds);
+        nextFadeIn = Math.max(0, newFadeInSeconds);
+        if (Math.abs(deltaYFromLastCycle) >= curveThresholdPx) {
+          const idx = FADE_CURVE_ORDER.indexOf(draft.fadeInCurve);
+          const nextIdx = deltaYFromLastCycle < 0 ? (idx + 1) % FADE_CURVE_ORDER.length : (idx - 1 + FADE_CURVE_ORDER.length) % FADE_CURVE_ORDER.length;
+          nextFadeInCurve = FADE_CURVE_ORDER[nextIdx];
+          start.lastCurveCycleY = moveEvent.clientY;
+        }
+      } else {
+        const newFadeOutBars = Math.max(0, secondsToBars(draft.fadeOut, bpm, timeSignature) - snappedDeltaXBars);
+        const newFadeOutSeconds = Math.min(barsToSeconds(newFadeOutBars, bpm, timeSignature), maxFadeSeconds);
+        nextFadeOut = Math.max(0, newFadeOutSeconds);
+        if (Math.abs(deltaYFromLastCycle) >= curveThresholdPx) {
+          const idx = FADE_CURVE_ORDER.indexOf(draft.fadeOutCurve);
+          const nextIdx = deltaYFromLastCycle < 0 ? (idx + 1) % FADE_CURVE_ORDER.length : (idx - 1 + FADE_CURVE_ORDER.length) % FADE_CURVE_ORDER.length;
+          nextFadeOutCurve = FADE_CURVE_ORDER[nextIdx];
+          start.lastCurveCycleY = moveEvent.clientY;
+        }
+      }
+
+      fadeHandleDraftRef.current = { fadeIn: nextFadeIn, fadeOut: nextFadeOut, fadeInCurve: nextFadeInCurve, fadeOutCurve: nextFadeOutCurve };
+      setFadeDraftByKey((prev) => ({ ...prev, [clipKey]: { fadeIn: nextFadeIn, fadeOut: nextFadeOut, fadeInCurve: nextFadeInCurve, fadeOutCurve: nextFadeOutCurve } }));
+    }
+
+    function handlePointerUp() {
+      const draft = fadeHandleDraftRef.current;
+      if (draft) {
+        emitMutation('clip:set-fade', {
+          trackId: fadeHandleInteraction.trackId,
+          clipId: fadeHandleInteraction.clipId,
+          fade_in: draft.fadeIn,
+          fade_out: draft.fadeOut,
+          fade_in_curve: draft.fadeInCurve,
+          fade_out_curve: draft.fadeOutCurve,
+        });
+      }
+      fadeHandleDraftRef.current = null;
+      fadeHandleStartRef.current = null;
+      setFadeHandleInteraction(null);
+      setFadeDraftByKey((prev) => {
+        const next = { ...prev };
+        delete next[clipKey];
+        return next;
+      });
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+    }
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+    };
+  }, [fadeHandleInteraction, emitMutation, snapStep, timeSignature]);
 
   useEffect(() => {
     if (!clipInteraction) {
@@ -3708,12 +4864,19 @@ export default function StuuShell() {
     return vstNodesByTrack.get(trackChainModalTrack.track_id) || [];
   }, [trackChainModalTrack, vstNodesByTrack]);
   const trackChainModalSlots = useMemo(() => {
-    const slotCount = Math.max(TRACK_CHAIN_MODAL_MIN_SLOTS, trackChainModalNodes.length);
+    // Keep one additional empty slot so plugins can always be appended without a dedicated button.
+    const slotCount = Math.max(TRACK_CHAIN_MODAL_MIN_SLOTS, trackChainModalNodes.length + 1);
     return Array.from({ length: slotCount }, (_, slotIndex) => ({
       slotIndex,
       node: trackChainModalNodes[slotIndex] || null,
     }));
   }, [trackChainModalNodes]);
+  const trackChainModalPluginPickerOpen = Boolean(
+    trackChainModalTrack
+      && openTrackPluginPicker
+      && openTrackPluginPicker.scope === 'modal'
+      && openTrackPluginPicker.trackId === trackChainModalTrack.track_id,
+  );
   const mixTracks = useMemo(() => {
     const existingTracks = arrangementTracks.filter((track) => track.exists);
     if (existingTracks.length > 0) {
@@ -3768,6 +4931,8 @@ export default function StuuShell() {
       && openTrackPluginPicker.trackId === mixSelectedTrack.track_id,
   );
   const showDawTopShell = activeTab === 'Edit' || activeTab === 'Mix';
+  const canUndoProject = Boolean(state?.history?.canUndo);
+  const canRedoProject = Boolean(state?.history?.canRedo);
 
   return (
     <>
@@ -3808,22 +4973,34 @@ export default function StuuShell() {
               <div className="daw-menu-bar">
                 <div className="daw-menu-row daw-menu-row-1">
                   <div className="daw-menu-left">
-                    {DAW_MENU_ITEMS.map((item) => (
-                      <span key={item}>{item}</span>
-                    ))}
+                    {DAW_MENU_ITEMS.map((item) =>
+                      item === 'SETTINGS' ? (
+                        <button
+                          key={item}
+                          type="button"
+                          className="daw-menu-item-button"
+                          onClick={() => setShowSettingsModal(true)}
+                          aria-label="Einstellungen öffnen"
+                        >
+                          {item}
+                        </button>
+                      ) : (
+                        <span key={item}>{item}</span>
+                      )
+                    )}
                   </div>
                   <div className="daw-menu-right">
                     <span
-                      className={`status status-badge ${connection === 'online' && state?.nativeTransport !== false ? 'online' : connection === 'online' ? 'no-audio' : connection}`}
+                      className={`status status-badge ${connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no-audio' : connection}`}
                       title={
                         connection === 'offline' || connection === 'connecting'
                           ? `Engine nicht erreichbar (${enginePort}). Starte alle Dienste mit: npm run start (im Projektroot). Prüfe ob Port ${enginePort} frei ist.`
-                          : connection === 'online' && state?.nativeTransport === false
+                          : connection === 'online' && state?.nativeTransport !== true
                             ? 'Native-Engine nicht verbunden – kein Ton. Starte mit: npm run start (Projektroot).'
                             : undefined
                       }
                     >
-                      {connection === 'online' && state?.nativeTransport !== false ? 'online' : connection === 'online' ? 'no audio' : connection}
+                      {connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no audio' : connection}
                       <span className="status-port" title={`Engine: ${enginePort}`}>:{enginePort}</span>
                       <a
                         href={`http://127.0.0.1:${enginePort}`}
@@ -3849,9 +5026,39 @@ export default function StuuShell() {
                       {tab}
                     </button>
                   ))}
+                  <div className="daw-history-controls" role="group" aria-label="Undo und Redo">
+                    <button
+                      type="button"
+                      className="daw-history-btn"
+                      onClick={triggerProjectUndo}
+                      disabled={!canUndoProject || historyMutationPending}
+                      title="Zurueck (Cmd/Ctrl+Z)"
+                      aria-label="Zurueck"
+                    >
+                      <Undo2 size={14} aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      className="daw-history-btn"
+                      onClick={triggerProjectRedo}
+                      disabled={!canRedoProject || historyMutationPending}
+                      title="Vor (Cmd+Shift+Z / Ctrl+Y)"
+                      aria-label="Vor"
+                    >
+                      <Redo2 size={14} aria-hidden="true" />
+                    </button>
+                  </div>
                 </div>
               </div>
 
+              {state?.nativeClipSyncSummary?.failed > 0 ? (
+                <div className="alert alert-warning native-clip-sync-warning" role="alert">
+                  <span>
+                    {state.nativeClipSyncSummary.failed} Audio-Clip(s) konnten nicht an die Engine gesendet werden
+                    (z.&nbsp;B. Datei nicht gefunden). Playback dieser Clips ohne Ton. Terminal/Engine-Log prüfen.
+                  </span>
+                </div>
+              ) : null}
               <header className="main-header compact">
                 <div className="daw-control-strip">
                   <div className="daw-btn-group">
@@ -3871,17 +5078,49 @@ export default function StuuShell() {
                     >
                       <Square size={12} aria-hidden="true" />
                     </button>
+                    <button
+                      className={`transport-btn metronome-btn ${metronomeEnabled ? 'active' : ''} ${isMetronomeRunning ? 'running' : ''}`}
+                      onClick={toggleMetronome}
+                      title={metronomeEnabled ? 'Metronom aus' : 'Metronom an'}
+                      aria-label={metronomeEnabled ? 'Metronom ausschalten' : 'Metronom einschalten'}
+                      aria-pressed={metronomeEnabled}
+                    >
+                      <span className="metronome-btn-glyph" aria-hidden="true">
+                        <svg className="metronome-btn-icon" viewBox="0 0 64 64">
+                          <g className="metronome-btn-static">
+                            <path className="metronome-btn-stroke" d="M24 10C24 7 26.3 5 29.2 5H34.8C37.7 5 40 7 40 10" />
+                            <line className="metronome-btn-stroke" x1="23" y1="12" x2="41" y2="12" />
+                            <path className="metronome-btn-stroke" d="M23 12L16 44H48L41 12" />
+                            <line className="metronome-btn-stroke" x1="30.2" y1="17" x2="33.8" y2="17" />
+                            <line className="metronome-btn-stroke" x1="29.4" y1="22" x2="34.6" y2="22" />
+                            <line className="metronome-btn-stroke" x1="29" y1="27" x2="35" y2="27" />
+                            <line className="metronome-btn-stroke" x1="29.4" y1="32" x2="34.6" y2="32" />
+                            <line className="metronome-btn-stroke" x1="30.2" y1="37" x2="33.8" y2="37" />
+                            <line className="metronome-btn-stroke" x1="16" y1="45" x2="49" y2="45" />
+                            <line className="metronome-btn-stroke" x1="16" y1="45" x2="27" y2="45" />
+                            <path className="metronome-btn-stroke" d="M16 45L11 62H49L46 50" />
+                            <circle className="metronome-btn-fill" cx="49" cy="45" r="2.4" />
+                          </g>
+                          <g ref={metronomeNeedleRef} className="metronome-btn-needle" transform="rotate(0 32 45)">
+                            <line className="metronome-btn-stroke" x1="32" y1="45" x2="32" y2="11" />
+                          </g>
+                        </svg>
+                      </span>
+                    </button>
                   </div>
 
                   <div className="daw-btn-group">
                     <label className="bpm-field compact">
                       BPM
                       <input
-                        type="number"
-                        min={20}
-                        max={300}
-                        value={state?.project?.bpm || 128}
-                        onChange={(event) => setBpm(event.target.value)}
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        value={bpmInputValue}
+                        onChange={handleBpmInputChange}
+                        onFocus={handleBpmInputFocus}
+                        onBlur={handleBpmInputBlur}
+                        onKeyDown={handleBpmInputKeyDown}
                       />
                     </label>
                   </div>
@@ -3935,16 +5174,16 @@ export default function StuuShell() {
                 <p>
                   Connection:{' '}
                   <span
-                    className={`status status-badge ${connection === 'online' && state?.nativeTransport !== false ? 'online' : connection === 'online' ? 'no-audio' : connection}`}
+                    className={`status status-badge ${connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no-audio' : connection}`}
                     title={
                       connection === 'offline' || connection === 'connecting'
                         ? `Engine nicht erreichbar (${enginePort}). Starte alle Dienste mit: npm run start (im Projektroot). Prüfe ob Port ${enginePort} frei ist.`
-                        : connection === 'online' && state?.nativeTransport === false
+                        : connection === 'online' && state?.nativeTransport !== true
                           ? 'Native-Engine nicht verbunden – kein Ton. Starte mit: npm run start (Projektroot).'
                           : undefined
                     }
                   >
-                    {connection === 'online' && state?.nativeTransport !== false ? 'online' : connection === 'online' ? 'no audio' : connection}
+                    {connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no audio' : connection}
                     <span className="status-port" title={`Engine: ${enginePort}`}>:{enginePort}</span>
                     <a href={`http://127.0.0.1:${enginePort}`} target="_blank" rel="noopener noreferrer" className="status-open-icon" title="Engine in neuem Tab öffnen" aria-label="Engine in neuem Tab öffnen">
                       <ExternalLink size={12} aria-hidden="true" />
@@ -3970,15 +5209,47 @@ export default function StuuShell() {
                 >
                   <Square size={12} aria-hidden="true" />
                 </button>
+                <button
+                  className={`transport-btn metronome-btn ${metronomeEnabled ? 'active' : ''} ${isMetronomeRunning ? 'running' : ''}`}
+                  onClick={toggleMetronome}
+                  title={metronomeEnabled ? 'Metronom aus' : 'Metronom an'}
+                  aria-label={metronomeEnabled ? 'Metronom ausschalten' : 'Metronom einschalten'}
+                  aria-pressed={metronomeEnabled}
+                >
+                  <span className="metronome-btn-glyph" aria-hidden="true">
+                    <svg className="metronome-btn-icon" viewBox="0 0 64 64">
+                      <g className="metronome-btn-static">
+                        <path className="metronome-btn-stroke" d="M24 10C24 7 26.3 5 29.2 5H34.8C37.7 5 40 7 40 10" />
+                        <line className="metronome-btn-stroke" x1="23" y1="12" x2="41" y2="12" />
+                        <path className="metronome-btn-stroke" d="M23 12L16 44H48L41 12" />
+                        <line className="metronome-btn-stroke" x1="30.2" y1="17" x2="33.8" y2="17" />
+                        <line className="metronome-btn-stroke" x1="29.4" y1="22" x2="34.6" y2="22" />
+                        <line className="metronome-btn-stroke" x1="29" y1="27" x2="35" y2="27" />
+                        <line className="metronome-btn-stroke" x1="29.4" y1="32" x2="34.6" y2="32" />
+                        <line className="metronome-btn-stroke" x1="30.2" y1="37" x2="33.8" y2="37" />
+                        <line className="metronome-btn-stroke" x1="16" y1="45" x2="49" y2="45" />
+                        <line className="metronome-btn-stroke" x1="16" y1="45" x2="27" y2="45" />
+                        <path className="metronome-btn-stroke" d="M16 45L11 62H49L46 50" />
+                        <circle className="metronome-btn-fill" cx="49" cy="45" r="2.4" />
+                      </g>
+                      <g ref={metronomeNeedleRef} className="metronome-btn-needle" transform="rotate(0 32 45)">
+                        <line className="metronome-btn-stroke" x1="32" y1="45" x2="32" y2="11" />
+                      </g>
+                    </svg>
+                  </span>
+                </button>
                 <button onClick={saveProject}>Save</button>
                 <label className="bpm-field">
                   BPM
                   <input
-                    type="number"
-                    min={20}
-                    max={300}
-                    value={state?.project?.bpm || 128}
-                    onChange={(event) => setBpm(event.target.value)}
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={bpmInputValue}
+                    onChange={handleBpmInputChange}
+                    onFocus={handleBpmInputFocus}
+                    onBlur={handleBpmInputBlur}
+                    onKeyDown={handleBpmInputKeyDown}
                   />
                 </label>
               </div>
@@ -4042,6 +5313,7 @@ export default function StuuShell() {
                     className={`arrangement-layout edit-tool-${editTool}`}
                     style={{
                       '--bar-width': `${barWidth}px`,
+                      '--track-row-height': `${showTrackNodes ? 150 : 104}px`,
                       '--grid-micro-divisions': String(gridLineDensity.microDivisions),
                       '--grid-micro-alpha': String(gridLineDensity.microAlpha),
                       '--grid-beat-alpha': String(gridLineDensity.beatAlpha),
@@ -4079,6 +5351,18 @@ export default function StuuShell() {
                               <EditToolIcon toolId={tool.id} />
                             </button>
                           ))}
+                          <button
+                            type="button"
+                            className="edit-tool-btn sync-btn"
+                            title="Sync (synchronisiert Audio-Spuren; Konzept unter docs/sync button.md)"
+                            aria-label="Sync"
+                          >
+                            <span className="sync-btn-glyph" aria-hidden="true">
+                              <span className="sync-btn-line" />
+                              <span className="sync-btn-label">SYNC</span>
+                              <span className="sync-btn-line" />
+                            </span>
+                          </button>
                         </div>
                         <div className="arrangement-track-header-actions">
                           {multiSelectMode && selectedTrackIds.length > 0 ? (
@@ -4086,18 +5370,36 @@ export default function StuuShell() {
                               type="button"
                               className="arrangement-track-bulk-delete"
                               onClick={deleteSelectedTracks}
-                              title={`Loeschen (${selectedTrackIds.length} markierte Tracks entfernen)`}
+                              title={`${selectedTrackIds.length} markierte Tracks entfernen`}
+                              aria-label={`${selectedTrackIds.length} markierte Tracks entfernen`}
                             >
-                              Loeschen ({selectedTrackIds.length})
+                              <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
+                              <span className="arrangement-track-bulk-delete-count" aria-hidden="true">{selectedTrackIds.length}</span>
                             </button>
                           ) : null}
                         </div>
                       </div>
-                      <div className="arrangement-track-rows">
+                      <div
+                        ref={arrangementTrackRowsRef}
+                        className="arrangement-track-rows"
+                        onWheel={(event) => {
+                          const scrollElement = arrangementScrollRef.current;
+                          if (!scrollElement) {
+                            return;
+                          }
+                          event.preventDefault();
+                          if (event.shiftKey || Math.abs(event.deltaX) > 0) {
+                            scrollElement.scrollLeft += event.deltaX || event.deltaY;
+                            return;
+                          }
+                          scrollElement.scrollTop += event.deltaY;
+                        }}
+                      >
                         {arrangementTracks.map((track, trackIndex) => {
                           const meter = meters[track.track_id];
                           const hasClips = Array.isArray(track.clips) && track.clips.length > 0;
                           const isHot = hasClips && (meter?.peak || 0) > 0.12;
+                          const isChainEnabled = track.chain_enabled !== false;
                           const isSelected = multiSelectMode
                             ? selectedTrackIdSet.has(track.track_id)
                             : selectedTrackId === track.track_id;
@@ -4113,10 +5415,11 @@ export default function StuuShell() {
                           return (
                             <div
                               key={`track_${track.track_id}`}
-                              className={`arrangement-track-row ${isSelected ? 'active' : ''} ${isHovered ? 'hovered' : ''} ${track.exists ? '' : 'placeholder'} ${openTrackMenuId === track.track_id ? 'menu-open' : ''} ${openTrackPluginPicker && openTrackPluginPicker.scope === 'track' && openTrackPluginPicker.trackId === track.track_id ? 'picker-open' : ''} ${showTrackNodes ? 'track-chain-expanded' : 'track-chain-collapsed'} ${dropTargetTrackId === track.track_id ? 'drop-target' : ''} ${isReorderDropTarget ? 'track-reorder-drop-target' : ''} ${isReorderDragging ? 'track-reorder-dragging' : ''}`}
+                              className={`arrangement-track-row ${isSelected ? 'active' : ''} ${isHovered ? 'hovered' : ''} ${track.exists ? '' : 'placeholder'} ${track.mix?.mute ? 'track-muted' : ''} ${track.mix?.solo ? 'track-soloed' : ''} ${openTrackMenuId === track.track_id ? 'menu-open' : ''} ${openTrackPluginPicker && openTrackPluginPicker.scope === 'track' && openTrackPluginPicker.trackId === track.track_id ? 'picker-open' : ''} ${showTrackNodes ? 'track-chain-expanded' : 'track-chain-collapsed'} ${dropTargetTrackId === track.track_id ? 'drop-target' : ''} ${isReorderDropTarget ? 'track-reorder-drop-target' : ''} ${isReorderDragging ? 'track-reorder-dragging' : ''}`}
                               role="button"
                               tabIndex={0}
                               draggable
+                              onPointerDownCapture={handleTrackRowPointerDownCapture}
                               onMouseEnter={() => setHoveredTrackId(track.track_id)}
                               onMouseLeave={() => setHoveredTrackId((current) => (current === track.track_id ? null : current))}
                               onDragStart={(event) => handleTrackRowDragStart(event, track.track_id)}
@@ -4270,13 +5573,14 @@ export default function StuuShell() {
                               </div>
                               <div
                                 className="arrangement-track-mix"
+                                data-track-drag-ignore="true"
                                 onClick={(event) => event.stopPropagation()}
                                 onPointerDown={(event) => event.stopPropagation()}
                               >
                                 <div className="arrangement-track-toggle-group">
                                   <button
                                     type="button"
-                                    className={`arrangement-track-toggle ${track.mix.mute ? 'active' : ''}`}
+                                    className={`arrangement-track-toggle mute-toggle ${track.mix.mute ? 'active' : ''}`}
                                     title="Mute"
                                     aria-label="Mute"
                                     onClick={(event) => {
@@ -4288,7 +5592,7 @@ export default function StuuShell() {
                                   </button>
                                   <button
                                     type="button"
-                                    className={`arrangement-track-toggle ${track.mix.solo ? 'active' : ''}`}
+                                    className={`arrangement-track-toggle solo-toggle ${track.mix.solo ? 'active' : ''}`}
                                     title="Solo"
                                     aria-label="Solo"
                                     onClick={(event) => {
@@ -4377,7 +5681,7 @@ export default function StuuShell() {
                               </div>
                               {showTrackNodes ? (
                                 <div
-                                  className={`arrangement-track-chain ${track.chain_enabled !== false ? '' : 'chain-disabled'}`}
+                                  className={`arrangement-track-chain ${isChainEnabled ? '' : 'chain-disabled'}`}
                                   onClick={(event) => event.stopPropagation()}
                                   onPointerDown={(event) => event.stopPropagation()}
                                 >
@@ -4386,8 +5690,15 @@ export default function StuuShell() {
                                     {chainSlots.map(({ slotIndex, node }) => {
                                       const hasNode = Boolean(node);
                                       const isBypassed = Boolean(node?.bypassed);
+                                      const pluginDisplayName = hasNode
+                                        ? resolveNodePluginDisplayName(node, pluginNameByUid)
+                                        : '';
+                                      const pluginUiMeta = hasNode
+                                        ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
+                                        : null;
+                                      const SlotPluginIcon = pluginUiMeta?.icon || null;
                                       const slotLabel = hasNode
-                                        ? `${slotIndex + 1} ${formatTrackChainPluginName(node.plugin || node.plugin_uid || node.id)}`
+                                        ? `${slotIndex + 1} ${formatTrackChainPluginName(pluginDisplayName)}`
                                         : `${slotIndex + 1}`;
                                       const isPickerOpen = Boolean(
                                         openTrackPluginPicker
@@ -4395,6 +5706,9 @@ export default function StuuShell() {
                                         && openTrackPluginPicker.trackId === track.track_id
                                         && openTrackPluginPicker.slotIndex === slotIndex,
                                       );
+                                      const slotTooltip = hasNode
+                                        ? buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)
+                                        : `Slot ${slotIndex + 1}: Plugin hinzufuegen`;
                                       return (
                                         <div
                                           key={`track_chain_${track.track_id}_${slotIndex}`}
@@ -4423,7 +5737,7 @@ export default function StuuShell() {
                                               type="button"
                                               className="arrangement-track-chain-slot-main compact"
                                               draggable={hasNode}
-                                              title={hasNode ? `${slotIndex + 1}. ${node.plugin || node.plugin_uid || node.id}` : `Slot ${slotIndex + 1}: Plugin hinzufuegen`}
+                                              title={slotTooltip}
                                               onDragStart={(event) => {
                                                 if (!hasNode) {
                                                   return;
@@ -4438,15 +5752,15 @@ export default function StuuShell() {
                                                   return;
                                                 }
                                                 setInspector({ type: 'node', nodeId: node.id });
+                                                openVstNodeEditor(node);
                                               }}
                                             >
-                                              <span className="arrangement-track-chain-slot-label compact">{slotLabel}</span>
-                                              {hasNode ? (
-                                                <span
-                                                  className={`arrangement-track-chain-slot-status-dot ${isBypassed ? 'bypassed' : 'active'}`}
-                                                  aria-hidden="true"
-                                                />
-                                              ) : null}
+                                              <span className="arrangement-track-chain-slot-label compact">
+                                                {hasNode && SlotPluginIcon ? (
+                                                  <SlotPluginIcon size={10} strokeWidth={2} aria-hidden="true" />
+                                                ) : null}
+                                                <span>{slotLabel}</span>
+                                              </span>
                                             </button>
                                             {hasNode ? (
                                               <div className="arrangement-track-chain-slot-tools">
@@ -4472,7 +5786,7 @@ export default function StuuShell() {
                                                     removeVstNode(node);
                                                   }}
                                                 >
-                                                  x
+                                                  <Trash2 size={9} strokeWidth={2} aria-hidden="true" />
                                                 </button>
                                               </div>
                                             ) : null}
@@ -4484,7 +5798,7 @@ export default function StuuShell() {
                                                 aria-label={`Track ${track.track_id} Plugin-Auswahl`}
                                                 data-track-plugin-picker-root="true"
                                               >
-                                                {availablePlugins.length === 0 ? (
+                                                {availableEffectPlugins.length === 0 ? (
                                                   <button
                                                     type="button"
                                                     className="arrangement-track-plugin-picker-item muted"
@@ -4493,13 +5807,18 @@ export default function StuuShell() {
                                                       scanVstPlugins();
                                                     }}
                                                   >
-                                                    {pluginScanPending ? 'Scanne Plugins...' : 'Plugins scannen'}
+                                                    {pluginScanPending ? 'Scanne Effekt-Plugins...' : 'Effekt-Plugins scannen'}
                                                   </button>
-                                                ) : availablePlugins.map((plugin) => (
+                                                ) : availableEffectPlugins.map((plugin) => {
+                                                  const pluginUiMeta = resolveTracktionPluginUiMeta(plugin.uid, plugin.name);
+                                                  const PluginIcon = pluginUiMeta?.icon || null;
+                                                  const pluginTooltip = buildPluginHelpTooltip(plugin.name, pluginUiMeta);
+                                                  return (
                                                   <button
                                                     key={`track_chain_picker_${track.track_id}_${slotIndex}_${plugin.uid}`}
                                                     type="button"
                                                     className="arrangement-track-plugin-picker-item"
+                                                    title={pluginTooltip}
                                                     disabled={pluginLoadPending}
                                                     onClick={(event) => {
                                                       event.stopPropagation();
@@ -4507,14 +5826,19 @@ export default function StuuShell() {
                                                         trackId: track.track_id,
                                                         pluginUid: plugin.uid,
                                                         insertIndex: slotIndex,
+                                                        slotKind: 'effect',
                                                         onSuccess: () => setOpenTrackPluginPicker(null),
                                                       });
                                                     }}
                                                   >
-                                                    <span>{plugin.name}</span>
+                                                    <span className="plugin-name-with-icon truncate">
+                                                      {PluginIcon ? <PluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                                      <span>{plugin.name}</span>
+                                                    </span>
                                                     <small>{plugin.type}</small>
                                                   </button>
-                                                ))}
+                                                  );
+                                                })}
                                               </div>
                                             ) : null}
                                           </div>
@@ -4547,16 +5871,16 @@ export default function StuuShell() {
                                       </button>
                                       <button
                                         type="button"
-                                        className={`arrangement-track-chain-enable ${track.chain_enabled ? 'enabled' : 'disabled'}`}
-                                        title={track.chain_enabled ? 'Effektkette aus (Leistung sparen)' : 'Effektkette ein'}
-                                        aria-label={track.chain_enabled ? 'Effektkette aus' : 'Effektkette ein'}
+                                        className={`arrangement-track-chain-enable ${isChainEnabled ? 'enabled' : 'disabled'}`}
+                                        title={isChainEnabled ? 'Effektkette aus (Leistung sparen)' : 'Effektkette ein'}
+                                        aria-label={isChainEnabled ? 'Effektkette aus' : 'Effektkette ein'}
                                         onPointerDown={(event) => {
                                           event.stopPropagation();
                                           event.preventDefault();
-                                          setTrackChainEnabled(track.track_id, !track.chain_enabled);
+                                          setTrackChainEnabled(track.track_id, !isChainEnabled);
                                         }}
                                       >
-                                        <TrackChainPlugIcon />
+                                        <span className="arrangement-track-chain-enable-label">FX</span>
                                       </button>
                                     </div>
                                   </div>
@@ -4595,13 +5919,16 @@ export default function StuuShell() {
                               key={`track_context_${item.id}`}
                               type="button"
                               role="menuitem"
-                              className="arrangement-track-context-item"
+                              className={`arrangement-track-context-item ${item.id === 'delete' ? 'arrangement-track-context-item-delete' : ''}`}
+                              aria-label={item.id === 'delete' ? 'Track entfernen' : item.label}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 handleTrackContextAction(contextMenuTrack, item.id);
                               }}
                             >
-                              {item.label}
+                              {item.id === 'delete' ? (
+                                <Trash2 size={14} strokeWidth={2} aria-hidden="true" />
+                              ) : item.label}
                             </button>
                           ))}
                         </div>
@@ -4649,14 +5976,14 @@ export default function StuuShell() {
                             if (editTool === 'slice') {
                               const context = getGridPointerContext(event);
                               if (context) {
-                                const snapped = snapToGrid(context.bars, sliceSnapStep);
-                                setSlicePreviewBars(snapped);
+                                const bars = snapToGrid(context.bars, snapStep);
+                                setSlicePreviewBars(bars);
                                 const gridEl = arrangementGridRef.current;
                                 const scrollEl = arrangementScrollRef.current;
-                                if (gridEl && scrollEl && Number.isFinite(snapped)) {
+                                if (gridEl && scrollEl && Number.isFinite(bars)) {
                                   const gridRect = gridEl.getBoundingClientRect();
                                   const scrollLeft = scrollEl.scrollLeft || 0;
-                                  const lineLeftPx = gridRect.left + (snapped * barWidth) - scrollLeft;
+                                  const lineLeftPx = gridRect.left + (bars * barWidth) - scrollLeft;
                                   setSliceCursorPosition({ lineLeftPx, clientY: event.clientY });
                                 }
                               }
@@ -4692,7 +6019,7 @@ export default function StuuShell() {
                             return (
                               <div
                                 key={`lane_${track.track_id}`}
-                                className={`arrangement-grid-row ${isSelected ? 'active' : ''} ${isHovered ? 'hovered' : ''} ${showTrackNodes ? 'track-chain-expanded' : 'track-chain-collapsed'} ${dropTargetTrackId === track.track_id ? 'drop-target' : ''}`}
+                                className={`arrangement-grid-row ${isSelected ? 'active' : ''} ${isHovered ? 'hovered' : ''} ${track.mix?.mute ? 'track-muted' : ''} ${track.mix?.solo ? 'track-soloed' : ''} ${showTrackNodes ? 'track-chain-expanded' : 'track-chain-collapsed'} ${dropTargetTrackId === track.track_id ? 'drop-target' : ''}`}
                                 onMouseEnter={() => setHoveredTrackId(track.track_id)}
                                 onMouseLeave={() => setHoveredTrackId((current) => (current === track.track_id ? null : current))}
                                 onDragOver={(event) => handleTrackFileDragOver(event, track.track_id)}
@@ -4775,8 +6102,10 @@ export default function StuuShell() {
                                                 event.stopPropagation();
                                                 emitMutation('clip:delete', { trackId: track.track_id, clipId: clip.id });
                                               }}
+                                              aria-label="Clip entfernen"
+                                              title="Clip entfernen"
                                             >
-                                              x
+                                              <Trash2 size={11} strokeWidth={2} aria-hidden="true" />
                                             </button>
                                           </div>
                                           <div className="timeline-clip-waveform-wrap">
@@ -4817,8 +6146,10 @@ export default function StuuShell() {
                                               event.stopPropagation();
                                               emitMutation('clip:delete', { trackId: track.track_id, clipId: clip.id });
                                             }}
+                                            aria-label="Clip entfernen"
+                                            title="Clip entfernen"
                                           >
-                                            x
+                                            <Trash2 size={11} strokeWidth={2} aria-hidden="true" />
                                           </button>
                                           <div
                                             className="clip-resize-handle"
@@ -4875,129 +6206,541 @@ export default function StuuShell() {
                               setTrackChainModalTrackId(null);
                               setOpenTrackPluginPicker(null);
                             }}
+                            aria-label="Schliessen"
                           >
-                            Schliessen
+                            <X size={14} strokeWidth={2} aria-hidden="true" />
                           </button>
                         </div>
-                        <div className="track-chain-modal-list" data-track-plugin-picker-root="true">
-                          {trackChainModalSlots.map(({ slotIndex, node }) => {
-                            const hasNode = Boolean(node);
-                            const bypassed = Boolean(node?.bypassed);
-                            return (
-                              <div
-                                key={`track_chain_modal_slot_${trackChainModalTrack.track_id}_${slotIndex}`}
-                                className={`track-chain-modal-item ${hasNode ? 'filled' : 'empty'} ${bypassed ? 'bypassed' : ''}`}
-                                draggable={hasNode}
-                                onClick={() => {
-                                  if (!hasNode) {
-                                    openTrackSlotPluginPicker(trackChainModalTrack.track_id, slotIndex, 'modal');
-                                  }
-                                }}
-                                onDragStart={(event) => {
-                                  if (!hasNode) {
-                                    return;
-                                  }
-                                  event.dataTransfer.effectAllowed = 'move';
-                                  event.dataTransfer.setData('text/plain', String(slotIndex));
-                                }}
-                                onDragOver={(event) => {
-                                  event.preventDefault();
-                                }}
-                                onDrop={(event) => {
-                                  event.preventDefault();
-                                  const sourceIndex = Number(event.dataTransfer.getData('text/plain'));
-                                  if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= trackChainModalNodes.length) {
-                                    return;
-                                  }
-                                  const targetIndex = clamp(slotIndex, 0, Math.max(0, trackChainModalNodes.length - 1));
-                                  reorderTrackVstNodes(trackChainModalTrack.track_id, sourceIndex, targetIndex);
-                                }}
-                              >
-                                <div className="track-chain-modal-item-main">
-                                  <span>{slotIndex + 1}</span>
-                                  <strong>{hasNode ? (node?.plugin || node?.plugin_uid || node?.id || 'Plugin') : 'Leerer Slot'}</strong>
-                                </div>
-                                <div className="track-chain-modal-item-actions">
-                                  {hasNode ? (
-                                    <>
-                                      <button
-                                        type="button"
-                                        className={`arrangement-track-chain-slot-bypass ${bypassed ? 'active' : ''}`}
-                                        onClick={() => setVstNodeBypassed(node, !bypassed)}
-                                      >
-                                        <TrackChainBypassIcon active={bypassed} />
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="arrangement-track-chain-slot-remove"
-                                        onClick={() => removeVstNode(node)}
-                                      >
-                                        x
-                                      </button>
-                                    </>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      className="track-chain-modal-item-add"
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        openTrackSlotPluginPicker(trackChainModalTrack.track_id, slotIndex, 'modal');
+                        <div className="track-chain-modal-canvas" data-track-plugin-picker-root="true">
+                          <div className="track-chain-modal-flow">
+                            {trackChainModalSlots.map(({ slotIndex, node }) => {
+                              const hasNode = Boolean(node);
+                              const bypassed = Boolean(node?.bypassed);
+                              const pluginDisplayName = hasNode
+                                ? resolveNodePluginDisplayName(node, pluginNameByUid)
+                                : 'Leerer Slot';
+                              const pluginUiMeta = hasNode
+                                ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
+                                : null;
+                              const SlotPluginIcon = pluginUiMeta?.icon || null;
+                              const slotTooltip = hasNode
+                                ? buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)
+                                : `Slot ${slotIndex + 1}: Plugin hinzufuegen`;
+                              const isPickerTarget = Boolean(
+                                trackChainModalPluginPickerOpen
+                                && openTrackPluginPicker?.slotIndex === slotIndex,
+                              );
+                              return (
+                                <div
+                                  key={`track_chain_modal_slot_${trackChainModalTrack.track_id}_${slotIndex}`}
+                                  className="track-chain-modal-flow-segment"
+                                >
+                                  <div
+                                    className={`track-chain-modal-slot-shell ${hasNode ? 'filled' : 'empty'} ${bypassed ? 'bypassed' : ''} ${isPickerTarget ? 'picker-target' : ''}`}
+                                  >
+                                    <span className="track-chain-modal-slot-number">{slotIndex + 1}</span>
+                                    <div
+                                      className={`track-chain-modal-slot ${hasNode ? 'filled' : 'empty'} ${bypassed ? 'bypassed' : ''}`}
+                                      onDragOver={(event) => {
+                                        event.preventDefault();
+                                      }}
+                                      onDrop={(event) => {
+                                        event.preventDefault();
+                                        const sourceIndex = Number(event.dataTransfer.getData('text/plain'));
+                                        if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= trackChainModalNodes.length) {
+                                          return;
+                                        }
+                                        const targetIndex = clamp(slotIndex, 0, Math.max(0, trackChainModalNodes.length - 1));
+                                        reorderTrackVstNodes(trackChainModalTrack.track_id, sourceIndex, targetIndex);
                                       }}
                                     >
-                                      + Plugin
-                                    </button>
-                                  )}
+                                      <button
+                                        type="button"
+                                        className="track-chain-modal-slot-main"
+                                        draggable={hasNode}
+                                        title={slotTooltip}
+                                        onDragStart={(event) => {
+                                          if (!hasNode) {
+                                            return;
+                                          }
+                                          event.dataTransfer.effectAllowed = 'move';
+                                          event.dataTransfer.setData('text/plain', String(slotIndex));
+                                        }}
+                                        onClick={() => {
+                                          if (!hasNode) {
+                                            openTrackSlotPluginPicker(trackChainModalTrack.track_id, slotIndex, 'modal');
+                                            return;
+                                          }
+                                          setInspector({ type: 'node', nodeId: node.id });
+                                          openVstNodeEditor(node);
+                                        }}
+                                      >
+                                        <span className="track-chain-modal-slot-label">
+                                          {hasNode ? (
+                                            <span className="plugin-name-with-icon truncate">
+                                              {SlotPluginIcon ? <SlotPluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                              <span>{formatTrackChainPluginName(pluginDisplayName)}</span>
+                                            </span>
+                                          ) : 'add Effect'}
+                                        </span>
+                                      </button>
+                                      {hasNode ? (
+                                        <div className="track-chain-modal-slot-tools">
+                                          <button
+                                            type="button"
+                                            className={`arrangement-track-chain-slot-bypass ${bypassed ? 'active' : ''}`}
+                                            title={bypassed ? 'Bypass deaktivieren' : 'Bypass aktivieren'}
+                                            onClick={() => setVstNodeBypassed(node, !bypassed)}
+                                          >
+                                            <TrackChainBypassIcon active={bypassed} />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="arrangement-track-chain-slot-remove"
+                                            title="Plugin entfernen"
+                                            aria-label="Plugin entfernen"
+                                            onClick={() => removeVstNode(node)}
+                                          >
+                                            <Trash2 size={11} strokeWidth={2} aria-hidden="true" />
+                                          </button>
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                    <div className="track-chain-modal-slot-meta">
+                                      <strong>{`Slot ${slotIndex + 1}`}</strong>
+                                      <span title={slotTooltip}>{hasNode ? pluginDisplayName : 'Klick zum Hinzufuegen'}</span>
+                                    </div>
+                                  </div>
+                                  {slotIndex < trackChainModalSlots.length - 1 ? (
+                                    <span className="track-chain-modal-connector" aria-hidden="true">
+                                      <TrackChainArrowIcon />
+                                    </span>
+                                  ) : null}
                                 </div>
-                              </div>
-                            );
-                          })}
+                              );
+                            })}
+                          </div>
                         </div>
                         <div className="track-chain-modal-footer" data-track-plugin-picker-root="true">
-                          <button
-                            type="button"
-                            className="track-chain-modal-add"
-                            onClick={() => openTrackSlotPluginPicker(trackChainModalTrack.track_id, trackChainModalNodes.length, 'modal')}
-                          >
-                            + Plugin
-                          </button>
-                          {openTrackPluginPicker
-                          && openTrackPluginPicker.scope === 'modal'
-                          && openTrackPluginPicker.trackId === trackChainModalTrack.track_id ? (
+                          <div className="track-chain-modal-footer-row">
+                            <span className="track-chain-modal-footer-hint">
+                              {trackChainModalPluginPickerOpen
+                                ? `Slot ${Number(openTrackPluginPicker?.slotIndex ?? 0) + 1}: Plugin auswaehlen`
+                                : 'Leeren Slot klicken, um ein Plugin hinzuzufuegen'}
+                            </span>
+                          </div>
+                          {trackChainModalPluginPickerOpen ? (
                             <div
                               className="arrangement-track-plugin-picker modal"
                               role="menu"
                               aria-label={`Track ${trackChainModalTrack.track_id} Plugin-Auswahl`}
                               data-track-plugin-picker-root="true"
                             >
-                              {availablePlugins.length === 0 ? (
+                              {availableEffectPlugins.length === 0 ? (
                                 <button
                                   type="button"
                                   className="arrangement-track-plugin-picker-item muted"
                                   onClick={() => scanVstPlugins()}
                                 >
-                                  {pluginScanPending ? 'Scanne Plugins...' : 'Plugins scannen'}
+                                  {pluginScanPending ? 'Scanne Effekt-Plugins...' : 'Effekt-Plugins scannen'}
                                 </button>
-                              ) : availablePlugins.map((plugin) => (
-                                <button
-                                  key={`track_chain_modal_picker_${trackChainModalTrack.track_id}_${plugin.uid}`}
-                                  type="button"
-                                  className="arrangement-track-plugin-picker-item"
-                                  disabled={pluginLoadPending}
-                                  onClick={() => {
-                                    addVst({
-                                      trackId: trackChainModalTrack.track_id,
-                                      pluginUid: plugin.uid,
-                                      insertIndex: openTrackPluginPicker.slotIndex,
-                                      onSuccess: () => setOpenTrackPluginPicker(null),
-                                    });
-                                  }}
-                                >
-                                  <span>{plugin.name}</span>
-                                  <small>{plugin.type}</small>
-                                </button>
-                              ))}
+                              ) : availableEffectPlugins.map((plugin) => {
+                                const pluginUiMeta = resolveTracktionPluginUiMeta(plugin.uid, plugin.name);
+                                const PluginIcon = pluginUiMeta?.icon || null;
+                                const pluginTooltip = buildPluginHelpTooltip(plugin.name, pluginUiMeta);
+                                return (
+                                  <button
+                                    key={`track_chain_modal_picker_${trackChainModalTrack.track_id}_${plugin.uid}`}
+                                    type="button"
+                                    className="arrangement-track-plugin-picker-item"
+                                    title={pluginTooltip}
+                                    disabled={pluginLoadPending}
+                                    onClick={() => {
+                                      addVst({
+                                        trackId: trackChainModalTrack.track_id,
+                                        pluginUid: plugin.uid,
+                                        insertIndex: openTrackPluginPicker.slotIndex,
+                                        slotKind: 'effect',
+                                        onSuccess: () => setOpenTrackPluginPicker(null),
+                                      });
+                                    }}
+                                  >
+                                    <span className="plugin-name-with-icon truncate">
+                                      {PluginIcon ? <PluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                      <span>{plugin.name}</span>
+                                    </span>
+                                    <small>{plugin.type}</small>
+                                  </button>
+                                );
+                              })}
                             </div>
                           ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  {showSettingsModal ? (
+                    <div
+                      className="settings-modal-overlay"
+                      role="presentation"
+                      onPointerDown={() => setShowSettingsModal(false)}
+                    >
+                      <div
+                        className="settings-modal"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label="Einstellungen"
+                        onPointerDown={(e) => e.stopPropagation()}
+                      >
+                        <div className="settings-modal-head">
+                          <h2>Settings</h2>
+                          <button
+                            type="button"
+                            className="settings-modal-close"
+                            onClick={() => setShowSettingsModal(false)}
+                            aria-label="Schliessen"
+                          >
+                            <X size={14} strokeWidth={2} aria-hidden="true" />
+                          </button>
+                        </div>
+                        <div className="settings-modal-tabs">
+                          {['AUDIO', 'VST PLUGINS', 'GENERAL'].map((tab) => (
+                            <button
+                              key={tab}
+                              type="button"
+                              className={`settings-modal-tab ${settingsTab === tab ? 'active' : ''}`}
+                              onClick={() => setSettingsTab(tab)}
+                            >
+                              {tab}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="settings-modal-body">
+                          {settingsTab === 'AUDIO' ? (
+                            <div className="settings-audio-panel">
+                              {connection !== 'online' || !state?.nativeTransport ? (
+                                <div className="settings-audio-unavailable" role="status">
+                                  <p><strong>Native-Engine nicht verbunden.</strong></p>
+                                  <p>Für Audio-Ausgabe und Geräteliste die App mit der Native-Engine starten:</p>
+                                  <p><code>npm run dev</code> (aus dem Projektroot <code>thestuu</code>).</p>
+                                  <p>Damit starten Native-Binary, Engine und Dashboard zusammen.</p>
+                                </div>
+                              ) : null}
+                              <label className="audio-output-select-wrap">
+                                <span className="audio-output-label">Audio-Ausgabe</span>
+                                <select
+                                  className="audio-output-select"
+                                  value={audioOutputCurrentId}
+                                  onChange={(e) => {
+                                    const id = e.target.value;
+                                    if (!id) return;
+                                    socketRef.current?.emit('audio:set-output', { deviceId: id }, (res) => {
+                                      if (res?.ok) setAudioOutputCurrentId(id);
+                                    });
+                                  }}
+                                  title="z. B. interne Lautsprecher oder externe Soundkarte"
+                                  aria-label="Audio-Ausgabe wählen"
+                                  disabled={connection !== 'online' || !state?.nativeTransport}
+                                >
+                                  {audioOutputDevices.length === 0 ? (
+                                    <option value="">
+                                      {connection === 'online' && state?.nativeTransport
+                                        ? '— Keine Geräte (Tracktion-Backend nötig) —'
+                                        : '— Keine Geräte (Native offline) —'}
+                                    </option>
+                                  ) : (
+                                    audioOutputDevices.map((d) => (
+                                      <option key={d.id} value={d.id}>{d.name || d.id}</option>
+                                    ))
+                                  )}
+                                </select>
+                              </label>
+                              {connection === 'online' && state?.nativeTransport && audioOutputDevices.length === 0 ? (
+                                <p className="settings-audio-hint settings-audio-hint-warning">
+                                  Für echte Audio-Geräte das <strong>Tracktion-Backend</strong> einrichten: <code>STUU_NATIVE_VENDOR_DIR</code> auf einen Klon von <code>tracktion_engine</code> setzen und App neu starten. Siehe <code>apps/native-engine/README.md</code>.
+                                </p>
+                              ) : (
+                                <p className="settings-audio-hint">
+                                  Wähle das Ausgabegerät für Wiedergabe (z. B. interne Lautsprecher oder externe Soundkarte).
+                                </p>
+                              )}
+                              <label className="audio-output-select-wrap">
+                                <span className="audio-output-label">Audio-Eingabe</span>
+                                <select
+                                  className="audio-output-select"
+                                  value={audioInputCurrentId}
+                                  onChange={(e) => {
+                                    const id = e.target.value;
+                                    if (!id) return;
+                                    socketRef.current?.emit('audio:set-input', { deviceId: id }, (res) => {
+                                      if (res?.ok) setAudioInputCurrentId(id);
+                                    });
+                                  }}
+                                  title="Quelle für Aufnahme (z. B. Mikrofon oder Line-In)"
+                                  aria-label="Audio-Eingabe wählen"
+                                  disabled={connection !== 'online' || !state?.nativeTransport}
+                                >
+                                  {audioInputDevices.length === 0 ? (
+                                    <option value="">
+                                      {connection === 'online' && state?.nativeTransport
+                                        ? '— Keine Eingabegeräte —'
+                                        : '— Keine Geräte (Native offline) —'}
+                                    </option>
+                                  ) : (
+                                    audioInputDevices.map((d) => (
+                                      <option key={d.id} value={d.id}>{d.name || d.id}</option>
+                                    ))
+                                  )}
+                                </select>
+                              </label>
+                              <p className="settings-audio-hint">
+                                Wähle das Eingabegerät für Aufnahme (z. B. Mikrofon oder Line-In). Wird beim Record-Button der Spuren verwendet.
+                              </p>
+                              {(audioStatus && (audioStatus.sampleRate != null || audioStatus.outputChannels != null)) ? (
+                                <dl className="settings-audio-status">
+                                  {audioStatus.sampleRate != null ? (
+                                    <>
+                                      <dt>Sample rate (Hz)</dt>
+                                      <dd>{Math.round(audioStatus.sampleRate)}</dd>
+                                    </>
+                                  ) : null}
+                                  <dt>Status</dt>
+                                  <dd>
+                                    {audioStatus.sampleRate != null && audioStatus.outputChannels != null
+                                      ? `Offen, ${Math.round(audioStatus.sampleRate)} Hz, ${audioStatus.outputChannels} Ausgänge`
+                                      : audioStatus.sampleRate != null
+                                        ? `${Math.round(audioStatus.sampleRate)} Hz`
+                                        : audioStatus.outputChannels != null
+                                          ? `${audioStatus.outputChannels} Ausgänge`
+                                          : '—'}
+                                    {audioStatus.outputLatencySeconds != null && audioStatus.outputLatencySeconds > 0
+                                      ? ` · Latenz: ${(audioStatus.outputLatencySeconds * 1000).toFixed(1)} ms`
+                                      : ''}
+                                    {audioStatus.blockSize != null ? ` · Block: ${audioStatus.blockSize} Samples` : ''}
+                                  </dd>
+                                </dl>
+                              ) : null}
+                            </div>
+                          ) : settingsTab === 'VST PLUGINS' ? (
+                            <div className="settings-vst-panel">
+                              <div className="settings-vst-toolbar">
+                                <div className="settings-vst-subtabs" role="tablist" aria-label="VST Plugin Kategorien">
+                                  <button
+                                    type="button"
+                                    className={`settings-vst-subtab ${settingsVstPluginTab === 'effects' ? 'active' : ''}`}
+                                    onClick={() => setSettingsVstPluginTab('effects')}
+                                  >
+                                    Effects ({availableEffectPlugins.length})
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={`settings-vst-subtab ${settingsVstPluginTab === 'generators' ? 'active' : ''}`}
+                                    onClick={() => setSettingsVstPluginTab('generators')}
+                                  >
+                                    Generators ({availableGeneratorPlugins.length})
+                                  </button>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="settings-vst-rescan"
+                                  onClick={() => scanVstPlugins()}
+                                  disabled={pluginScanPending || connection !== 'online' || !state?.nativeTransport}
+                                >
+                                  {pluginScanPending ? 'Scanne...' : 'Rescan'}
+                                </button>
+                              </div>
+                              <div className="settings-vst-search-row">
+                                <input
+                                  id="settings-vst-search"
+                                  type="search"
+                                  className="settings-vst-search-input"
+                                  value={settingsVstSearch}
+                                  onChange={(event) => setSettingsVstSearch(event.target.value)}
+                                  placeholder="Suche nach Name, UID, Typ"
+                                  aria-label="Plugin Suche"
+                                />
+                                <div className="settings-vst-source-filters" role="group" aria-label="Plugin Source Filter">
+                                  <label className={`settings-vst-source-filter ${settingsVstSourceFilter === 'all' ? 'active' : ''}`}>
+                                    <input
+                                      type="checkbox"
+                                      checked={settingsVstSourceFilter === 'all'}
+                                      onChange={() => setSettingsVstSourceFilter('all')}
+                                    />
+                                    <span>{`ALL (${settingsVstSourceCounts.all})`}</span>
+                                  </label>
+                                  <label className={`settings-vst-source-filter ${settingsVstSourceFilter === 'native' ? 'active' : ''}`}>
+                                    <input
+                                      type="checkbox"
+                                      checked={settingsVstSourceFilter === 'native'}
+                                      onChange={() => setSettingsVstSourceFilter('native')}
+                                    />
+                                    <span>{`NATIVE (${settingsVstSourceCounts.native})`}</span>
+                                  </label>
+                                  <label className={`settings-vst-source-filter ${settingsVstSourceFilter === 'external' ? 'active' : ''}`}>
+                                    <input
+                                      type="checkbox"
+                                      checked={settingsVstSourceFilter === 'external'}
+                                      onChange={() => setSettingsVstSourceFilter('external')}
+                                    />
+                                    <span>{`EXTERNAL (${settingsVstSourceCounts.external})`}</span>
+                                  </label>
+                                </div>
+                              </div>
+
+                              {connection !== 'online' || !state?.nativeTransport ? (
+                                <div className="settings-audio-unavailable" role="status">
+                                  <p><strong>Native-Engine nicht verbunden.</strong></p>
+                                  <p>Plugin-Scan und Plugin-Liste sind nur mit aktiver Native-Engine verfuegbar.</p>
+                                </div>
+                              ) : settingsVstPlugins.length === 0 ? (
+                                <div className="settings-placeholder-panel">
+                                  <p>
+                                    {settingsVstPluginTab === 'effects'
+                                      ? 'Keine Effekt-Plugins gefunden.'
+                                      : 'Keine Generator-Plugins gefunden.'}
+                                  </p>
+                                  <p>Mit Rescan erneut suchen.</p>
+                                </div>
+                              ) : settingsFilteredVstPlugins.length === 0 ? (
+                                <div className="settings-placeholder-panel">
+                                  <p>Keine Treffer mit dem aktuellen Filter.</p>
+                                  <p>Filter anpassen oder Rescan starten.</p>
+                                </div>
+                              ) : (
+                                <div className="settings-vst-list" role="list" aria-label="VST Plugin Liste">
+                                  {settingsFilteredVstPlugins.map((plugin) => {
+                                    const pluginUiMeta = resolveTracktionPluginUiMeta(plugin.uid, plugin.name);
+                                    const PluginIcon = pluginUiMeta?.icon || null;
+                                    const pluginTooltip = buildPluginHelpTooltip(plugin.name, pluginUiMeta);
+                                    return (
+                                      <div
+                                        key={`settings_vst_${settingsVstPluginTab}_${plugin.uid}`}
+                                        className="settings-vst-item"
+                                        role="listitem"
+                                        title={pluginTooltip}
+                                      >
+                                        <div className="settings-vst-item-main">
+                                          <strong className="plugin-name-with-icon truncate">
+                                            {PluginIcon ? <PluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                            <span>{plugin.name}</span>
+                                          </strong>
+                                          <small>{plugin.uid}</small>
+                                        </div>
+                                        <div className="settings-vst-item-meta">
+                                          <span>{plugin.type}</span>
+                                          <span>{plugin.isNative ? 'Native' : 'External'}</span>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="settings-placeholder-panel">
+                              <p>Allgemeine Einstellungen — in Arbeit.</p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  {importTrackRenamePrompt ? (
+                    <div
+                      className="import-track-rename-modal-overlay"
+                      role="presentation"
+                      onPointerDown={() => {
+                        resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
+                      }}
+                    >
+                      <div
+                        className="import-track-rename-modal"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label={`Track ${importTrackRenamePrompt.trackId} Namen uebernehmen`}
+                        onPointerDown={(event) => event.stopPropagation()}
+                      >
+                        <div className="import-track-rename-modal-head">
+                          <div className="import-track-rename-modal-head-title">
+                            <h2>Namen uebernehmen?</h2>
+                            <button
+                              type="button"
+                              className="import-track-rename-modal-close"
+                              aria-label="Schliessen"
+                              onClick={() => {
+                                resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
+                              }}
+                            >
+                              <X size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                          </div>
+                          <p>
+                            {importTrackRenamePrompt.choices.length > 1
+                              ? `Track ${importTrackRenamePrompt.trackId}: Waehle einen Dateinamen fuer den Track.`
+                              : `Track ${importTrackRenamePrompt.trackId}: Dateinamen als Trackname uebernehmen?`}
+                          </p>
+                        </div>
+
+                        {importTrackRenamePrompt.choices.length > 1 ? (
+                          <div className="import-track-rename-modal-list">
+                            {importTrackRenamePrompt.choices.map((choice) => (
+                              <label
+                                key={`import_track_rename_choice_${choice.id}`}
+                                className={`import-track-rename-modal-item ${importTrackRenamePrompt.selectedChoiceId === choice.id ? 'selected' : ''}`}
+                              >
+                                <input
+                                  type="radio"
+                                  name="import-track-rename-choice"
+                                  value={choice.id}
+                                  checked={importTrackRenamePrompt.selectedChoiceId === choice.id}
+                                  onChange={() => {
+                                    setImportTrackRenamePrompt((current) => {
+                                      if (!current) {
+                                        return current;
+                                      }
+                                      return {
+                                        ...current,
+                                        selectedChoiceId: choice.id,
+                                      };
+                                    });
+                                  }}
+                                />
+                                <span>{choice.trackName}</span>
+                                <small>{choice.sourceName}</small>
+                              </label>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="import-track-rename-modal-single-name">
+                            {importTrackRenamePrompt.choices[0]?.trackName || `Track ${importTrackRenamePrompt.trackId}`}
+                          </p>
+                        )}
+
+                        <div className="import-track-rename-modal-actions">
+                          <button
+                            type="button"
+                            className="import-track-rename-modal-btn"
+                            onClick={() => {
+                              resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
+                            }}
+                          >
+                            Nein
+                          </button>
+                          <button
+                            type="button"
+                            className="import-track-rename-modal-btn primary"
+                            onClick={() => {
+                              const selectedChoice = importTrackRenamePrompt.choices.find((choice) => (
+                                choice.id === importTrackRenamePrompt.selectedChoiceId
+                              )) || importTrackRenamePrompt.choices[0];
+                              resolveImportTrackRenamePrompt({
+                                apply: true,
+                                trackName: selectedChoice?.trackName || '',
+                              });
+                            }}
+                          >
+                            Ja
+                          </button>
                         </div>
                       </div>
                     </div>
@@ -5070,7 +6813,7 @@ export default function StuuShell() {
                             <div className="mix-strip-toggle-row">
                               <button
                                 type="button"
-                                className={trackMix.mute ? 'active' : ''}
+                                className={`mute-toggle ${trackMix.mute ? 'active' : ''}`}
                                 onClick={(event) => {
                                   event.stopPropagation();
                                   setMute(track.track_id, !trackMix.mute);
@@ -5138,11 +6881,20 @@ export default function StuuShell() {
                               {Array.from({ length: MIXER_INSPECTOR_SLOT_COUNT }, (_, slotIndex) => {
                                 const node = visibleNodes[slotIndex] || null;
                                 const bypassed = Boolean(node?.bypassed);
+                                const pluginDisplayName = node
+                                  ? resolveNodePluginDisplayName(node, pluginNameByUid)
+                                  : '';
+                                const pluginUiMeta = node
+                                  ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
+                                  : null;
+                                const slotTooltip = node
+                                  ? `Slot ${slotIndex + 1}: ${buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)}`
+                                  : `Slot ${slotIndex + 1} leer`;
                                 return (
                                   <span
                                     key={`mix_strip_slot_${track.track_id}_${slotIndex}`}
                                     className={`mix-strip-slot-dot ${node ? 'filled' : ''} ${bypassed ? 'bypassed' : ''}`}
-                                    title={node ? `${slotIndex + 1}. ${node.plugin || node.plugin_uid || node.id}` : `Slot ${slotIndex + 1} leer`}
+                                    title={slotTooltip}
                                   />
                                 );
                               })}
@@ -5166,7 +6918,7 @@ export default function StuuShell() {
                           <div className="mix-channel-toggle-row">
                             <button
                               type="button"
-                              className={mixSelectedTrackMix.mute ? 'active' : ''}
+                              className={`mute-toggle ${mixSelectedTrackMix.mute ? 'active' : ''}`}
                               onClick={() => setMute(mixSelectedTrack.track_id, !mixSelectedTrackMix.mute)}
                             >
                               <TrackMixToggleIcon action="mute" active={mixSelectedTrackMix.mute} />
@@ -5187,9 +6939,9 @@ export default function StuuShell() {
                             </button>
                             <button
                               type="button"
-                              className={`mix-chain-enabled-toggle ${mixSelectedTrack.chain_enabled ? 'active' : ''}`}
-                              onClick={() => setTrackChainEnabled(mixSelectedTrack.track_id, !mixSelectedTrack.chain_enabled)}
-                              title={mixSelectedTrack.chain_enabled ? 'Effektkette aus' : 'Effektkette ein'}
+                              className={`mix-chain-enabled-toggle ${mixSelectedTrack.chain_enabled !== false ? 'active' : ''}`}
+                              onClick={() => setTrackChainEnabled(mixSelectedTrack.track_id, mixSelectedTrack.chain_enabled === false)}
+                              title={mixSelectedTrack.chain_enabled !== false ? 'Effektkette aus' : 'Effektkette ein'}
                             >
                               FX
                             </button>
@@ -5246,6 +6998,16 @@ export default function StuuShell() {
                           {mixSelectedTrackSlots.map(({ slotIndex, node }) => {
                             const hasNode = Boolean(node);
                             const bypassed = Boolean(node?.bypassed);
+                            const pluginDisplayName = hasNode
+                              ? resolveNodePluginDisplayName(node, pluginNameByUid)
+                              : '';
+                            const pluginUiMeta = hasNode
+                              ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
+                              : null;
+                            const SlotPluginIcon = pluginUiMeta?.icon || null;
+                            const slotTooltip = hasNode
+                              ? buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)
+                              : `Slot ${slotIndex + 1}: Plugin hinzufuegen`;
                             return (
                               <div
                                 key={`mix_channel_slot_${mixSelectedTrack.track_id}_${slotIndex}`}
@@ -5279,23 +7041,24 @@ export default function StuuShell() {
                                 <button
                                   type="button"
                                   className="mix-channel-slot-main"
+                                  title={slotTooltip}
                                   onClick={() => {
                                     if (!hasNode) {
                                       openTrackSlotPluginPicker(mixSelectedTrack.track_id, slotIndex, 'mix');
                                       return;
                                     }
                                     setInspector({ type: 'node', nodeId: node.id });
+                                    openVstNodeEditor(node);
                                   }}
                                 >
-                                  {hasNode
-                                    ? formatTrackChainPluginName(node.plugin || node.plugin_uid || node.id || 'Plugin')
-                                    : 'Leerer Slot'}
+                                  {hasNode ? (
+                                    <span className="plugin-name-with-icon wrap">
+                                      {SlotPluginIcon ? <SlotPluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                      <span>{pluginDisplayName}</span>
+                                    </span>
+                                  ) : 'Leerer Slot'}
                                 </button>
                                 <div className="mix-channel-slot-actions">
-                                  <span
-                                    className={`mix-channel-slot-led ${hasNode ? 'filled' : ''} ${bypassed ? 'bypassed' : ''}`}
-                                    title={hasNode ? (bypassed ? 'Bypassed' : 'Aktiv') : 'Leer'}
-                                  />
                                   {hasNode ? (
                                     <>
                                       <button
@@ -5311,8 +7074,9 @@ export default function StuuShell() {
                                         className="mix-channel-slot-remove"
                                         onClick={() => removeVstNode(node)}
                                         title="Plugin entfernen"
+                                        aria-label="Plugin entfernen"
                                       >
-                                        x
+                                        <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
                                       </button>
                                     </>
                                   ) : (
@@ -5354,33 +7118,43 @@ export default function StuuShell() {
 
                         {mixPluginPickerOpen ? (
                           <div className="mix-channel-plugin-picker" role="menu" aria-label="Plugin Auswahl">
-                            {availablePlugins.length === 0 ? (
+                            {availableEffectPlugins.length === 0 ? (
                               <button
                                 type="button"
                                 className="mix-channel-plugin-picker-item muted"
                                 onClick={() => scanVstPlugins()}
                               >
-                                {pluginScanPending ? 'Scanne Plugins...' : 'Plugins scannen'}
+                                {pluginScanPending ? 'Scanne Effekt-Plugins...' : 'Effekt-Plugins scannen'}
                               </button>
-                            ) : availablePlugins.map((plugin) => (
-                              <button
-                                key={`mix_channel_picker_${mixSelectedTrack.track_id}_${plugin.uid}`}
-                                type="button"
-                                className="mix-channel-plugin-picker-item"
-                                disabled={pluginLoadPending}
-                                onClick={() => {
-                                  addVst({
-                                    trackId: mixSelectedTrack.track_id,
-                                    pluginUid: plugin.uid,
-                                    insertIndex: openTrackPluginPicker?.slotIndex,
-                                    onSuccess: () => setOpenTrackPluginPicker(null),
-                                  });
-                                }}
-                              >
-                                <span>{plugin.name}</span>
-                                <small>{plugin.type}</small>
-                              </button>
-                            ))}
+                            ) : availableEffectPlugins.map((plugin) => {
+                              const pluginUiMeta = resolveTracktionPluginUiMeta(plugin.uid, plugin.name);
+                              const PluginIcon = pluginUiMeta?.icon || null;
+                              const pluginTooltip = buildPluginHelpTooltip(plugin.name, pluginUiMeta);
+                              return (
+                                <button
+                                  key={`mix_channel_picker_${mixSelectedTrack.track_id}_${plugin.uid}`}
+                                  type="button"
+                                  className="mix-channel-plugin-picker-item"
+                                  title={pluginTooltip}
+                                  disabled={pluginLoadPending}
+                                  onClick={() => {
+                                    addVst({
+                                      trackId: mixSelectedTrack.track_id,
+                                      pluginUid: plugin.uid,
+                                      insertIndex: openTrackPluginPicker?.slotIndex,
+                                      slotKind: 'effect',
+                                      onSuccess: () => setOpenTrackPluginPicker(null),
+                                    });
+                                  }}
+                                >
+                                  <span className="plugin-name-with-icon truncate">
+                                    {PluginIcon ? <PluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                    <span>{plugin.name}</span>
+                                  </span>
+                                  <small>{plugin.type}</small>
+                                </button>
+                              );
+                            })}
                           </div>
                         ) : null}
                       </>
@@ -5573,6 +7347,7 @@ export default function StuuShell() {
                     multiple
                     className="import-file-input-hidden"
                     onChange={(event) => {
+                      importTargetTrackIdRef.current = track.track_id;
                       handleTrackImportInputChange(event);
                       setOpenTrackMenuId(null);
                       setTrackContextMenu(null);

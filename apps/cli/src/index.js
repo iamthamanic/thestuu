@@ -11,7 +11,7 @@ Options:
   --port <number>         Dashboard port (default: 3000)
   --engine-port <number>  Engine port (default: 3987)
   --project <name>        Project filename in ~/.thestuu/projects
-  --native-backend <id>   Native backend: tracktion | stub (default: tracktion)
+  --native-backend <id>   Native backend: tracktion (erforderlich)
   --native-vendor-dir <path> Path containing JUCE + tracktion_engine sources
   --native-socket <path>  Unix socket path for native transport bridge
   --no-native             Disable native transport process and use JS transport clock
@@ -64,8 +64,8 @@ function parseArgs(argv) {
 
     if (arg === '--native-backend') {
       const nextValue = (args[index + 1] || '').toLowerCase();
-      if (nextValue !== 'stub' && nextValue !== 'tracktion') {
-        throw new Error(`Invalid value for --native-backend: ${args[index + 1]}. Use "stub" or "tracktion".`);
+      if (nextValue !== 'tracktion') {
+        throw new Error(`Invalid value for --native-backend: ${args[index + 1]}. Nur "tracktion" wird unterstützt (Stub wurde entfernt).`);
       }
       options.nativeBackend = nextValue;
       index += 1;

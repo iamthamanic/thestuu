@@ -335,12 +335,13 @@ async function ensureNativeEngineBinary(repoRoot, options = {}) {
 
   if (vendorDir) {
     configureArgs.push(`-DSTUU_THIRD_PARTY_DIR=${path.resolve(vendorDir)}`);
+    configureArgs.push('-DTE_ADD_EXAMPLES=OFF');
   }
   if (process.env.STUU_NATIVE_CXX && process.env.STUU_NATIVE_CXX.trim()) {
     configureArgs.push(`-DCMAKE_CXX_COMPILER=${compiler}`);
   }
 
-  console.log(`[thestuu-cli] configuring native engine via CMake (${tracktionEnabled ? 'tracktion' : 'stub'} backend)...`);
+  console.log('[thestuu-cli] configuring native engine via CMake (Tracktion backend)...');
   await runCommand(cmake, configureArgs, { cwd: repoRoot });
   await runCommand(cmake, ['--build', buildDir, '--target', 'thestuu-native', '--config', 'Release'], { cwd: repoRoot });
 
@@ -457,6 +458,8 @@ function attachShutdown(children) {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
+const DEFAULT_VENDOR_SUBPATH = path.join('vendor', 'tracktion_engine');
+
 export async function runStartCommand(options) {
   const commandFile = fileURLToPath(import.meta.url);
   const cliDir = path.resolve(path.dirname(commandFile), '..');
@@ -464,6 +467,20 @@ export async function runStartCommand(options) {
 
   const stuuHome = process.env.STUU_HOME || path.join(os.homedir(), '.thestuu');
   const host = process.env.STUU_HOST || '127.0.0.1';
+  const vendorDirRaw = (options.nativeVendorDir || process.env.STUU_NATIVE_VENDOR_DIR || '').trim();
+  const vendorDir = vendorDirRaw || path.join(repoRoot, DEFAULT_VENDOR_SUBPATH);
+
+  if (options.native !== false) {
+    try {
+      await fs.access(path.join(vendorDir, 'CMakeLists.txt'));
+    } catch {
+      throw new Error(
+        `TheStuu benötigt das Tracktion-Backend. Kein tracktion_engine unter: ${vendorDir}. ` +
+        'Setze STUU_NATIVE_VENDOR_DIR auf den Pfad zu einem tracktion_engine-Klon (mit JUCE-Submodule) oder starte mit --native-vendor-dir <pfad>. Siehe apps/native-engine/README.md bzw. scripts/setup-tracktion.sh.'
+      );
+    }
+  }
+
   const { projectPath } = await ensureHomeFiles(stuuHome, options.project || 'welcome.stu');
 
   const commonEnv = {
@@ -512,7 +529,7 @@ export async function runStartCommand(options) {
 
       const nativeBinary = await ensureNativeEngineBinary(repoRoot, {
         tracktionEnabled: tracktionRequested,
-        vendorDir: options.nativeVendorDir || process.env.STUU_NATIVE_VENDOR_DIR,
+        vendorDir,
       });
       nativeChild = spawnNativeEngine({
         binaryPath: nativeBinary,
@@ -654,10 +671,8 @@ export async function runStartCommand(options) {
   console.log(`[thestuu-cli] dashboard mode: ${dashboardMode}`);
   if (options.native !== false && nativeChild) {
     console.log(`[thestuu-cli] native socket: ${nativeSocketPath}`);
-    console.log(`[thestuu-cli] native backend: ${tracktionRequested ? 'tracktion' : 'stub'}`);
-    if (options.nativeVendorDir || process.env.STUU_NATIVE_VENDOR_DIR) {
-      console.log(`[thestuu-cli] native vendor dir: ${options.nativeVendorDir || process.env.STUU_NATIVE_VENDOR_DIR}`);
-    }
+    console.log('[thestuu-cli] native backend: tracktion');
+    console.log(`[thestuu-cli] native vendor dir: ${vendorDir}`);
   } else if (options.native !== false) {
     console.log('[thestuu-cli] native mode: reused with existing engine process');
   }
