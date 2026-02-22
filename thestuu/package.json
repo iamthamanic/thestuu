@@ -1,0 +1,16 @@
+{
+  "name": "thestuu-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TheStuu – start always runs Native-Engine + Engine + Dashboard via CLI",
+  "scripts": {
+    "dev": "node apps/cli/bin/thestuu.js start",
+    "start": "node apps/cli/bin/thestuu.js start",
+    "dev:engine": "npm run start --prefix apps/engine",
+    "dev:dashboard": "npm run dev --prefix apps/dashboard"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

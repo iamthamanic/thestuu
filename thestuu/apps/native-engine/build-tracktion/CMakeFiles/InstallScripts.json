@@ -1,0 +1,18 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/juce/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/juce/modules/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/juce/extras/Build/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/juce/extras/Build/juceaide/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/modules/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/examples/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/examples/Benchmarks/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/examples/TestRunner/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/examples/DemoRunner/cmake_install.cmake",
+		"/Users/halteverbotsocialmacpro/Desktop/arsvivai/thestuu/thestuu/apps/native-engine/build-tracktion/tracktion_engine/examples/EngineInPluginDemo/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

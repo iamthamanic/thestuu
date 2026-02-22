@@ -1,0 +1,7 @@
+extend-exclude = [
+  ".codex-home",
+  ".venv-semgrep",
+  ".shim",
+  ".shimwrapper",
+  "node_modules",
+]
