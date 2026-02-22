@@ -1,0 +1,9 @@
+{
+  "name": "thestuu-root",
+  "private": true,
+  "description": "Weiterleitung: npm run dev muss im Ordner thestuu/thestuu laufen",
+  "scripts": {
+    "dev": "npm run dev --prefix thestuu",
+    "start": "npm run start --prefix thestuu"
+  }
+}
