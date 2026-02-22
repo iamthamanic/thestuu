@@ -331,6 +331,26 @@ body {
   gap: 8px;
 }
 
+.daw-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 10px;
+  margin-right: 4px;
+  border-radius: 2px;
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: lowercase;
+}
+
+/* Weißer Rahmen + Abstände für Logo – höhere Spezifität als .daw-menu-left span */
+.daw-menu-left span.daw-logo {
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  padding: 4px 10px;
+}
+
 .audio-output-select-wrap {
   display: inline-flex;
   align-items: center;
@@ -536,7 +556,19 @@ body {
   font-size: 10px;
   font-weight: 700;
   text-align: center;
-  line-height: 14px;
+}
+
+/* Solo-Button: Notenschlüssel (Violinschlüssel, Unicode U+1D11E) */
+.track-mix-solo-clef {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  width: 14px;
+  height: 14px;
+  text-align: center;
+  font-family: "Apple Symbols", "Segoe UI Symbol", "Noto Music", sans-serif;
 }
 
 .multi-select-icon-placeholder {

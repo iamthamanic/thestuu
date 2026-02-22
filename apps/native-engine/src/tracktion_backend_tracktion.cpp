@@ -1863,6 +1863,7 @@ static void transportRebuildGraphOnlyImpl() {
   auto& transport = gState->edit->getTransport();
   const bool wasPlaying = transport.isPlaying();
   const auto savedPosition = transport.getPosition();
+  std::fprintf(stderr, "[thestuu-native] transportRebuildGraphOnly: wasPlaying=%d\n", wasPlaying ? 1 : 0);
   /* Free context so playingFlag is cleared; then rebuild. When we play(), performPlay()
    * will run (playingFlag was cleared) and start the new graph's playhead. */
   transport.freePlaybackContext();
@@ -1870,6 +1871,7 @@ static void transportRebuildGraphOnlyImpl() {
   if (wasPlaying) {
     transport.setPosition(savedPosition);
     transport.play(false);
+    std::fprintf(stderr, "[thestuu-native] transportRebuildGraphOnly: wasPlaying=1 resume (setPosition + play)\n");
   }
 }
 

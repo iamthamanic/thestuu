@@ -1158,7 +1158,9 @@ function TrackMixToggleIcon({ action, active = false }) {
   if (action === 'mute') return <VolumeX size={14} strokeWidth={2} aria-hidden="true" />;
   if (action === 'solo') {
     return (
-      <span className="track-mix-solo-letter" aria-hidden="true">S</span>
+      <span className="track-mix-solo-clef" aria-hidden="true" title="Solo">
+        {'\uD834\uDD1E'}
+      </span>
     );
   }
   return null;
@@ -4973,6 +4975,7 @@ export default function StuuShell() {
               <div className="daw-menu-bar">
                 <div className="daw-menu-row daw-menu-row-1">
                   <div className="daw-menu-left">
+                    <span className="daw-logo" aria-hidden="true">thestuu</span>
                     {DAW_MENU_ITEMS.map((item) =>
                       item === 'SETTINGS' ? (
                         <button
