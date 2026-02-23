@@ -112,8 +112,41 @@ bool clearAllAudioClips(std::string& error);
 /** Same as clearAllAudioClips but runs on the JUCE message thread. */
 bool clearAllAudioClipsOnMessageThread(std::string& error);
 
+/** Describes one audio clip in the edit (for sync from native to engine after recording). */
+struct EditClipInfo {
+  int32_t trackId = 0;
+  std::string sourcePath;
+  double startSeconds = 0.0;
+  double lengthSeconds = 0.0;
+  std::string name;
+};
+/** Fill list of audio clips currently in the edit (all audio tracks, wave clips only). Used after recording so engine can merge new clips into playlist. Must run on message thread or use getEditAudioClipsOnMessageThread. */
+bool getEditAudioClips(std::vector<EditClipInfo>& out, std::string& error);
+bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::string& error);
+
+/**
+ * Live spectrum analyzer frame from the native audio path.
+ * Current MVP source is the global post-output (master) and mirrors pre/post until track/plugin taps are added.
+ */
+struct SpectrumAnalyzerSnapshot {
+  bool available = false;
+  bool preMirrorsPost = true;
+  std::string scope = "master";
+  std::string channels = "mono";
+  double sampleRate = 0.0;
+  int fftSize = 0;
+  double minDb = -96.0;
+  double maxDb = 0.0;
+  int64_t timestamp = 0;
+  std::vector<float> freqsHz;
+  std::vector<float> preDb;
+  std::vector<float> postDb;
+};
+bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out);
+
 struct TransportSnapshot {
   bool playing = false;
+  bool isRecording = false;
   double bpm = 128.0;
   double positionBars = 0.0;
   double positionBeats = 0.0;
@@ -126,6 +159,8 @@ struct TransportSnapshot {
 
 bool getTransportSnapshot(TransportSnapshot& out);
 void transportPlay();
+/** Start playback with recording; use when at least one track is record-armed. */
+void transportRecord();
 /** Rebuild playback graph from current edit (all tracks/clips). Call after sync so play is instant. */
 void transportEnsureContext();
 void transportPause();

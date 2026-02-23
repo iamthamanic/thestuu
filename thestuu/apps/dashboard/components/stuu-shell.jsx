@@ -1,5 +1,6 @@
 'use client';
 
+import Image from 'next/image';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -17,6 +18,7 @@ import {
   Filter,
   Gauge,
   LayoutGrid,
+  Minus,
   MousePointer2,
   MoveHorizontal,
   PaintBucket,
@@ -58,10 +60,15 @@ const MIN_VOLUME_DB = -80;
 const MAX_VOLUME_DB = Number((20 * Math.log10(1.2)).toFixed(1));
 const MIN_VISIBLE_TRACKS = 1;
 const TRACK_NAME_LIMIT = 25;
+const FLOATING_WINDOW_LAYOUTS_STORAGE_KEY = 'thestuu-floating-window-layouts-v1';
+const FLOATING_WINDOW_MARGIN = 12;
+const FLOATING_WINDOW_DOCK_HEIGHT = 46;
+const FLOATING_WINDOW_DOCK_GAP = 10;
 const TRACK_CHAIN_VISIBLE_SLOTS = 7;
 const TRACK_CHAIN_MODAL_MIN_SLOTS = TRACK_CHAIN_VISIBLE_SLOTS;
 const TRACK_CHAIN_PLUGIN_NAME_LIMIT = 14;
 const MIXER_INSPECTOR_SLOT_COUNT = 10;
+const FADE_CURVE_ORDER = ['linear', 'convex', 'concave', 'sCurve'];
 const DEFAULT_METRONOME_ENABLED = false;
 const DEFAULT_WAVEFORM_SAMPLE_COUNT = 1024;
 const MIN_WAVEFORM_SAMPLE_COUNT = 24;
@@ -113,6 +120,48 @@ const EDIT_TOOL_OPTIONS = [
 ];
 const DEFAULT_EDIT_TOOL = 'select';
 const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3987';
+const LIVE_ENGINE_LOG_LIMIT = 500;
+
+function normalizeLiveEngineLogLevel(level) {
+  if (level === 'error' || level === 'warn' || level === 'info') {
+    return level;
+  }
+  return 'log';
+}
+
+function normalizeLiveEngineLogEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const text = typeof entry.text === 'string'
+    ? entry.text
+    : typeof entry.message === 'string'
+      ? entry.message
+      : '';
+  if (!text) {
+    return null;
+  }
+  const tsValue = Number(entry.ts ?? entry.timestamp);
+  const ts = Number.isFinite(tsValue) ? tsValue : Date.now();
+  const id = typeof entry.id === 'string' && entry.id.trim()
+    ? entry.id
+    : `ui_log_${ts}_${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id,
+    ts,
+    level: normalizeLiveEngineLogLevel(entry.level),
+    text: text.replace(/\r/g, ''),
+  };
+}
+
+function formatLiveEngineLogTime(ts) {
+  const date = new Date(Number.isFinite(Number(ts)) ? Number(ts) : Date.now());
+  const h = String(date.getHours()).padStart(2, '0');
+  const m = String(date.getMinutes()).padStart(2, '0');
+  const s = String(date.getSeconds()).padStart(2, '0');
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  return `${h}:${m}:${s}.${ms}`;
+}
 
 const TRACKTION_PLUGIN_UI_META = {
   '4bandeq': {
@@ -234,6 +283,482 @@ function buildPluginHelpTooltip(pluginName, pluginUiMeta) {
   return `${resolvedName}: ${pluginUiMeta.description}`;
 }
 
+function getPluginParameterLookupToken(parameter) {
+  if (!parameter || typeof parameter !== 'object') {
+    return '';
+  }
+  return normalizePluginLookupToken(`${parameter.id || ''} ${parameter.name || ''}`);
+}
+
+function findPluginParameterByTokenHints(parameters, hints) {
+  if (!Array.isArray(parameters) || parameters.length === 0 || !Array.isArray(hints) || hints.length === 0) {
+    return null;
+  }
+
+  const normalizedHints = hints
+    .map((hint) => normalizePluginLookupToken(hint))
+    .filter(Boolean);
+
+  if (normalizedHints.length === 0) {
+    return null;
+  }
+
+  let bestMatch = null;
+  let bestScore = -1;
+  for (const parameter of parameters) {
+    const token = getPluginParameterLookupToken(parameter);
+    if (!token) {
+      continue;
+    }
+
+    let score = -1;
+    for (const hint of normalizedHints) {
+      if (!hint) {
+        continue;
+      }
+      if (token === hint) {
+        score = Math.max(score, 100);
+      } else if (token.startsWith(hint) || token.endsWith(hint)) {
+        score = Math.max(score, 80);
+      } else if (token.includes(hint)) {
+        score = Math.max(score, 60);
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = parameter;
+    }
+  }
+
+  return bestScore >= 0 ? bestMatch : null;
+}
+
+function buildTracktionEqInspectorGainParams(parameters) {
+  if (!Array.isArray(parameters) || parameters.length === 0) {
+    return null;
+  }
+
+  const gainParams = {
+    loGain: findPluginParameterByTokenHints(parameters, ['loGain', 'lowGain']),
+    midGain1: findPluginParameterByTokenHints(parameters, ['midGain1', 'mid1Gain', 'gainMid1']),
+    midGain2: findPluginParameterByTokenHints(parameters, ['midGain2', 'mid2Gain', 'gainMid2']),
+    hiGain: findPluginParameterByTokenHints(parameters, ['hiGain', 'highGain']),
+  };
+
+  const availableCount = Object.values(gainParams).filter(Boolean).length;
+  return availableCount > 0 ? gainParams : null;
+}
+
+function getPluginParameterActualValue(parameter, fallbackNormalized = null) {
+  const normalizedRaw = fallbackNormalized ?? parameter?.value;
+  const normalized = clamp(Number(normalizedRaw), 0, 1);
+  const min = Number(parameter?.min);
+  const max = Number(parameter?.max);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+    return normalized;
+  }
+  return min + ((max - min) * normalized);
+}
+
+function getPluginParameterNormalizedFromActual(parameter, actualValue) {
+  const min = Number(parameter?.min);
+  const max = Number(parameter?.max);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+    return clamp(Number(actualValue), 0, 1);
+  }
+  const normalized = (Number(actualValue) - min) / (max - min);
+  return clamp(normalized, 0, 1);
+}
+
+function deriveTracktionEqInspectorEasyMacros(gainParams) {
+  if (!gainParams) {
+    return { mud: 0, presence: 0, softness: 0 };
+  }
+
+  const mid1Gain = gainParams.midGain1 ? getPluginParameterActualValue(gainParams.midGain1) : 0;
+  const mid2Gain = gainParams.midGain2 ? getPluginParameterActualValue(gainParams.midGain2) : 0;
+  const hiGain = gainParams.hiGain ? getPluginParameterActualValue(gainParams.hiGain) : 0;
+
+  return {
+    mud: clamp((-mid1Gain) / 6, 0, 1),
+    presence: clamp(mid2Gain / 5, 0, 1),
+    softness: clamp((-hiGain) / 5, 0, 1),
+  };
+}
+
+function isTracktionEqInspectorEffectivelyFlat(gainParams, toleranceDb = 0.15) {
+  if (!gainParams || !isObject(gainParams)) {
+    return true;
+  }
+
+  const gainKeys = ['loGain', 'midGain1', 'midGain2', 'hiGain'];
+  let availableCount = 0;
+
+  for (const key of gainKeys) {
+    const parameter = gainParams[key];
+    if (!parameter) {
+      continue;
+    }
+    availableCount += 1;
+    const actualValue = getPluginParameterActualValue(parameter);
+    if (!Number.isFinite(actualValue) || Math.abs(actualValue) > toleranceDb) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function buildTracktionEqInspectorEasyGainTargets(macros) {
+  const mud = clamp(Number(macros?.mud) || 0, 0, 1);
+  const presence = clamp(Number(macros?.presence) || 0, 0, 1);
+  const softness = clamp(Number(macros?.softness) || 0, 0, 1);
+
+  return {
+    loGain: -(2.2 * mud),
+    midGain1: -(6.0 * mud),
+    midGain2: 5.0 * presence,
+    hiGain: -(5.0 * softness),
+  };
+}
+
+function buildTracktionEqInspectorPresetGainTargets(presetId) {
+  switch (presetId) {
+    case 'flat':
+      return { loGain: 0.0, midGain1: 0.0, midGain2: 0.0, hiGain: 0.0 };
+    case 'clean_up':
+      return { loGain: -1.0, midGain1: -3.0, midGain2: 1.2, hiGain: 1.0 };
+    case 'vocal_clarity':
+      return { loGain: -1.4, midGain1: -2.5, midGain2: 3.6, hiGain: 2.4 };
+    case 'bass_tight':
+      return { loGain: -1.4, midGain1: -4.0, midGain2: 1.0, hiGain: 0.0 };
+    case 'air_brilliance':
+      return { loGain: 0.0, midGain1: -0.8, midGain2: 2.1, hiGain: 4.5 };
+    default:
+      return null;
+  }
+}
+
+function formatTracktionEqInspectorMiniFreqLabel(hz) {
+  const value = Number(hz);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '';
+  }
+  if (value >= 1000) {
+    const khz = value / 1000;
+    return khz >= 10 ? `${khz.toFixed(0)}k` : `${khz.toFixed(1)}k`;
+  }
+  return `${Math.round(value)}`;
+}
+
+function formatTracktionEqInspectorReadoutFreq(hz) {
+  const value = Number(hz);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '-';
+  }
+  if (value >= 1000) {
+    const khz = value / 1000;
+    return khz >= 10 ? `${khz.toFixed(1)} kHz` : `${khz.toFixed(2)} kHz`;
+  }
+  return `${Math.round(value)} Hz`;
+}
+
+function formatTracktionEqInspectorReadoutDb(db) {
+  const value = Number(db);
+  if (!Number.isFinite(value)) {
+    return '-';
+  }
+  return `${value >= 0 ? '+' : ''}${value.toFixed(1)} dB`;
+}
+
+function formatTracktionEqInspectorReadoutQ(q) {
+  const value = Number(q);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '-';
+  }
+  return `Q ${value.toFixed(2)}`;
+}
+
+function buildTracktionEqInspectorCurveData(parameters) {
+  if (!Array.isArray(parameters) || parameters.length === 0) {
+    return null;
+  }
+
+  const bandSpecs = [
+    {
+      id: 'low',
+      label: 'Low',
+      color: '#5fe28a',
+      defaultFreqHz: 110,
+      defaultQ: 0.75,
+      freqHints: ['loFreq', 'lowFreq'],
+      gainHints: ['loGain', 'lowGain'],
+      qHints: ['loQ', 'lowQ'],
+    },
+    {
+      id: 'mid1',
+      label: 'Mid 1',
+      color: '#74c0ff',
+      defaultFreqHz: 300,
+      defaultQ: 1.1,
+      freqHints: ['midFreq1', 'mid1Freq', 'freqMid1'],
+      gainHints: ['midGain1', 'mid1Gain', 'gainMid1'],
+      qHints: ['midQ1', 'mid1Q', 'qMid1'],
+    },
+    {
+      id: 'mid2',
+      label: 'Mid 2',
+      color: '#ffc658',
+      defaultFreqHz: 3200,
+      defaultQ: 1.15,
+      freqHints: ['midFreq2', 'mid2Freq', 'freqMid2'],
+      gainHints: ['midGain2', 'mid2Gain', 'gainMid2'],
+      qHints: ['midQ2', 'mid2Q', 'qMid2'],
+    },
+    {
+      id: 'high',
+      label: 'High',
+      color: '#ff8aa5',
+      defaultFreqHz: 12000,
+      defaultQ: 0.75,
+      freqHints: ['hiFreq', 'highFreq'],
+      gainHints: ['hiGain', 'highGain'],
+      qHints: ['hiQ', 'highQ'],
+    },
+  ];
+
+  const bands = bandSpecs.map((spec) => {
+    const freqParam = findPluginParameterByTokenHints(parameters, spec.freqHints);
+    const gainParam = findPluginParameterByTokenHints(parameters, spec.gainHints);
+    const qParam = findPluginParameterByTokenHints(parameters, spec.qHints);
+
+    const freqHz = clamp(
+      freqParam ? getPluginParameterActualValue(freqParam) : spec.defaultFreqHz,
+      20,
+      20000,
+    );
+    const gainDb = clamp(
+      gainParam ? getPluginParameterActualValue(gainParam) : 0,
+      -18,
+      18,
+    );
+    const qValue = Math.max(
+      0.1,
+      qParam ? getPluginParameterActualValue(qParam) : spec.defaultQ,
+    );
+
+    return {
+      ...spec,
+      freqHz,
+      gainDb,
+      qValue,
+      freqParam,
+      gainParam,
+      qParam,
+    };
+  });
+
+  const width = 280;
+  const height = 116;
+  const minFreq = 20;
+  const maxFreq = 20000;
+  const maxDb = 18;
+  const minDb = -18;
+  const log10 = (v) => Math.log(v) / Math.LN10;
+  const logMin = log10(minFreq);
+  const logRange = log10(maxFreq) - logMin;
+  const zeroY = Number((((maxDb - 0) / (maxDb - minDb)) * height).toFixed(2));
+
+  const xForFreq = (freqHz) => {
+    const f = clamp(Number(freqHz) || minFreq, minFreq, maxFreq);
+    return Number((((log10(f) - logMin) / logRange) * width).toFixed(2));
+  };
+
+  const yForDb = (db) => {
+    const clampedDb = clamp(Number(db) || 0, minDb, maxDb);
+    return Number((((maxDb - clampedDb) / (maxDb - minDb)) * height).toFixed(2));
+  };
+
+  const points = [];
+  for (let i = 0; i <= width; i += 1) {
+    const x = i;
+    const norm = x / width;
+    const freq = minFreq * ((maxFreq / minFreq) ** norm);
+    const logFreq = log10(freq);
+
+    let db = 0;
+    for (const band of bands) {
+      const bandLog = log10(band.freqHz);
+      const delta = logFreq - bandLog;
+      const sigma = band.id === 'low' || band.id === 'high'
+        ? 0.23
+        : clamp(0.22 / Math.max(0.55, band.qValue), 0.06, 0.22);
+      db += band.gainDb * Math.exp(-((delta * delta) / (2 * sigma * sigma)));
+    }
+
+    points.push({ x, y: yForDb(db), db: clamp(db, minDb, maxDb), freqHz: freq });
+  }
+
+  if (points.length === 0) {
+    return null;
+  }
+
+  const strokePath = points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+    .join(' ');
+  const fillPath = `${strokePath} L ${width} ${zeroY} L 0 ${zeroY} Z`;
+
+  const nodePoints = bands.map((band) => ({
+    id: band.id,
+    label: band.label,
+    color: band.color,
+    x: xForFreq(band.freqHz),
+    y: yForDb(band.gainDb),
+    gainDb: Number(band.gainDb.toFixed(1)),
+    freqHz: band.freqHz,
+    qValue: band.qValue,
+  }));
+
+  const ticks = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000].map((freqHz) => ({
+    freqHz,
+    x: xForFreq(freqHz),
+    label: formatTracktionEqInspectorMiniFreqLabel(freqHz),
+  }));
+
+  const dbLines = [-12, -6, 0, 6, 12].map((db) => ({
+    db,
+    y: yForDb(db),
+  }));
+
+  return {
+    width,
+    height,
+    zeroY,
+    strokePath,
+    fillPath,
+    samples: points,
+    bands: bands.map((band) => ({
+      id: band.id,
+      label: band.label,
+      color: band.color,
+      freqHz: band.freqHz,
+      gainDb: band.gainDb,
+      qValue: band.qValue,
+      paramIds: {
+        freq: band.freqParam?.id || null,
+        gain: band.gainParam?.id || null,
+        q: band.qParam?.id || null,
+      },
+    })),
+    nodePoints,
+    ticks,
+    dbLines,
+  };
+}
+
+function normalizeIncomingEqAnalyzerFrame(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+  if (payload.available === false) {
+    return null;
+  }
+
+  const freqsHz = Array.isArray(payload.freqsHz)
+    ? payload.freqsHz.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+  const preDb = Array.isArray(payload.preDb)
+    ? payload.preDb.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+    : [];
+  const postDb = Array.isArray(payload.postDb)
+    ? payload.postDb.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+    : [];
+  const count = Math.min(freqsHz.length, preDb.length, postDb.length);
+  if (count < 8) {
+    return null;
+  }
+
+  return {
+    available: true,
+    preMirrorsPost: Boolean(payload.preMirrorsPost),
+    scope: typeof payload.scope === 'string' ? payload.scope : 'master',
+    channels: typeof payload.channels === 'string' ? payload.channels : 'mono',
+    sampleRate: Number(payload.sampleRate) || null,
+    fftSize: Number.isInteger(Number(payload.fftSize)) ? Number(payload.fftSize) : null,
+    minDb: Number.isFinite(Number(payload.minDb)) ? Number(payload.minDb) : -96,
+    maxDb: Number.isFinite(Number(payload.maxDb)) ? Number(payload.maxDb) : 6,
+    timestamp: Number.isFinite(Number(payload.timestamp)) ? Number(payload.timestamp) : Date.now(),
+    freqsHz: freqsHz.slice(0, count),
+    preDb: preDb.slice(0, count),
+    postDb: postDb.slice(0, count),
+  };
+}
+
+function buildTracktionEqAnalyzerOverlayData(curve, analyzerFrame) {
+  if (!curve || !analyzerFrame || !Array.isArray(analyzerFrame.freqsHz)) {
+    return null;
+  }
+
+  const width = Number(curve.width) || 280;
+  const height = Number(curve.height) || 116;
+  const minFreq = 20;
+  const maxFreq = 20000;
+  const minDb = Number.isFinite(Number(analyzerFrame.minDb)) ? Number(analyzerFrame.minDb) : -96;
+  const maxDbRaw = Number.isFinite(Number(analyzerFrame.maxDb)) ? Number(analyzerFrame.maxDb) : 6;
+  const maxDb = Math.max(minDb + 12, maxDbRaw);
+  const dbRange = Math.max(1, maxDb - minDb);
+  const log10 = (v) => Math.log(v) / Math.LN10;
+  const logMin = log10(minFreq);
+  const logRange = log10(maxFreq) - logMin;
+  const xForFreq = (freqHz) => {
+    const f = clamp(Number(freqHz) || minFreq, minFreq, maxFreq);
+    return Number((((log10(f) - logMin) / logRange) * width).toFixed(2));
+  };
+  const yForAnalyzerDb = (db) => {
+    const clampedDb = clamp(Number(db) || minDb, minDb, maxDb);
+    return Number((((maxDb - clampedDb) / dbRange) * height).toFixed(2));
+  };
+  const toPath = (freqs, values) => {
+    const points = [];
+    const count = Math.min(freqs.length, values.length);
+    for (let i = 0; i < count; i += 1) {
+      const x = xForFreq(freqs[i]);
+      const y = yForAnalyzerDb(values[i]);
+      points.push({ x, y });
+    }
+    if (points.length < 2) {
+      return null;
+    }
+    const linePath = points
+      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+      .join(' ');
+    const fillPath = `${linePath} L ${points[points.length - 1].x} ${height} L ${points[0].x} ${height} Z`;
+    return { linePath, fillPath, points };
+  };
+
+  const pre = toPath(analyzerFrame.freqsHz, analyzerFrame.preDb);
+  const post = toPath(analyzerFrame.freqsHz, analyzerFrame.postDb);
+  if (!pre && !post) {
+    return null;
+  }
+
+  return {
+    pre,
+    post,
+    minDb,
+    maxDb,
+    preMirrorsPost: Boolean(analyzerFrame.preMirrorsPost),
+    scope: analyzerFrame.scope || 'master',
+    channels: analyzerFrame.channels || 'mono',
+    timestamp: analyzerFrame.timestamp || Date.now(),
+  };
+}
+
+function formatInspectorEqMacroPercent(value) {
+  return `${Math.round(clamp(Number(value) || 0, 0, 1) * 100)}%`;
+}
+
 function getEditToolTooltip(tool) {
   if (!tool) {
     return '';
@@ -269,6 +794,10 @@ const DEFAULT_CHAT_MESSAGES = [
 
 const FALLBACK_STATE = {
   playing: false,
+  appPreferences: {
+    record_count_in_enabled: true,
+    record_use_standard_mic: false,
+  },
   transport: {
     bar: 1,
     beat: 1,
@@ -908,6 +1437,164 @@ function parseOptionalBool(value) {
   return null;
 }
 
+function getDefaultFloatingWindowLayouts() {
+  return {
+    trackChain: {
+      x: 72,
+      y: 72,
+      width: 980,
+      height: 560,
+      minWidth: 620,
+      minHeight: 320,
+      zIndex: 30,
+      minimized: false,
+      maximized: false,
+      restoreBounds: null,
+    },
+    settings: {
+      x: 64,
+      y: 68,
+      width: 520,
+      height: 620,
+      minWidth: 420,
+      minHeight: 260,
+      zIndex: 10,
+      minimized: false,
+      maximized: false,
+      restoreBounds: null,
+    },
+    recordMic: {
+      x: 120,
+      y: 118,
+      width: 420,
+      height: 340,
+      minWidth: 320,
+      minHeight: 190,
+      zIndex: 20,
+      minimized: false,
+      maximized: false,
+      restoreBounds: null,
+    },
+    importTrackRename: {
+      x: 140,
+      y: 140,
+      width: 520,
+      height: 380,
+      minWidth: 420,
+      minHeight: 240,
+      zIndex: 40,
+      minimized: false,
+      maximized: false,
+      restoreBounds: null,
+    },
+  };
+}
+
+function getFloatingWindowViewportBounds() {
+  if (typeof window === 'undefined') {
+    return { width: 1280, height: 800 };
+  }
+  return {
+    width: Math.max(640, window.innerWidth || 0),
+    height: Math.max(420, window.innerHeight || 0),
+  };
+}
+
+function normalizeFloatingWindowLayoutEntry(id, rawValue, viewport = getFloatingWindowViewportBounds()) {
+  const defaults = getDefaultFloatingWindowLayouts()[id] || getDefaultFloatingWindowLayouts().settings;
+  const source = isObject(rawValue) ? rawValue : {};
+  const minWidth = Math.max(240, Math.round(Number(source.minWidth) || defaults.minWidth || 320));
+  const minHeight = Math.max(90, Math.round(Number(source.minHeight) || defaults.minHeight || 180));
+  const maxWidth = Math.max(minWidth, viewport.width - (FLOATING_WINDOW_MARGIN * 2));
+  const dockReserve = FLOATING_WINDOW_DOCK_HEIGHT + FLOATING_WINDOW_DOCK_GAP;
+  const maxHeight = Math.max(minHeight, viewport.height - (FLOATING_WINDOW_MARGIN * 2) - dockReserve);
+  const width = Math.round(clamp(Number(source.width) || defaults.width, minWidth, maxWidth));
+  const height = Math.round(clamp(Number(source.height) || defaults.height, minHeight, maxHeight));
+  const minimized = parseOptionalBool(source.minimized);
+  const maximized = parseOptionalBool(source.maximized);
+  const visibleHeight = (typeof minimized === 'boolean' && minimized) ? 42 : height;
+  const x = Math.round(clamp(
+    Number(source.x) || defaults.x,
+    FLOATING_WINDOW_MARGIN,
+    Math.max(FLOATING_WINDOW_MARGIN, viewport.width - width - FLOATING_WINDOW_MARGIN),
+  ));
+  const y = Math.round(clamp(
+    Number(source.y) || defaults.y,
+    FLOATING_WINDOW_MARGIN,
+    Math.max(FLOATING_WINDOW_MARGIN, viewport.height - visibleHeight - FLOATING_WINDOW_MARGIN - dockReserve),
+  ));
+  const restoreBounds = isObject(source.restoreBounds)
+    ? {
+      x: Math.round(Number(source.restoreBounds.x) || x),
+      y: Math.round(Number(source.restoreBounds.y) || y),
+      width: Math.round(Number(source.restoreBounds.width) || width),
+      height: Math.round(Number(source.restoreBounds.height) || height),
+    }
+    : null;
+
+  return {
+    ...defaults,
+    x,
+    y,
+    width,
+    height,
+    minWidth,
+    minHeight,
+    zIndex: Math.max(1, Math.round(Number(source.zIndex) || defaults.zIndex || 1)),
+    minimized: typeof minimized === 'boolean' ? minimized : defaults.minimized,
+    maximized: typeof maximized === 'boolean' ? maximized : defaults.maximized,
+    restoreBounds,
+  };
+}
+
+function normalizeFloatingWindowLayouts(rawValue, viewport = getFloatingWindowViewportBounds()) {
+  const defaults = getDefaultFloatingWindowLayouts();
+  const source = isObject(rawValue) ? rawValue : {};
+  return {
+    trackChain: normalizeFloatingWindowLayoutEntry('trackChain', source.trackChain, viewport),
+    settings: normalizeFloatingWindowLayoutEntry('settings', source.settings, viewport),
+    recordMic: normalizeFloatingWindowLayoutEntry('recordMic', source.recordMic, viewport),
+    importTrackRename: normalizeFloatingWindowLayoutEntry('importTrackRename', source.importTrackRename, viewport),
+    // Preserve future entries if they exist; normalize only known windows for now.
+    ...Object.fromEntries(
+      Object.entries(source)
+        .filter(([key]) => !Object.prototype.hasOwnProperty.call(defaults, key))
+        .map(([key, value]) => [key, value]),
+    ),
+  };
+}
+
+function loadFloatingWindowLayoutsFromStorage() {
+  const defaults = getDefaultFloatingWindowLayouts();
+  if (typeof window === 'undefined') {
+    return defaults;
+  }
+  try {
+    const raw = window.localStorage.getItem(FLOATING_WINDOW_LAYOUTS_STORAGE_KEY);
+    if (!raw) {
+      return normalizeFloatingWindowLayouts(defaults);
+    }
+    const parsed = JSON.parse(raw);
+    return normalizeFloatingWindowLayouts(parsed);
+  } catch {
+    return normalizeFloatingWindowLayouts(defaults);
+  }
+}
+
+function getNextFloatingWindowZCounter(layouts) {
+  if (!isObject(layouts)) {
+    return 100;
+  }
+  let maxZ = 0;
+  for (const value of Object.values(layouts)) {
+    const z = Number(value?.zIndex);
+    if (Number.isFinite(z)) {
+      maxZ = Math.max(maxZ, z);
+    }
+  }
+  return maxZ + 10;
+}
+
 function normalizePluginKind(kindValue, fallbackIsInstrument = null) {
   if (typeof kindValue === 'string') {
     const normalized = kindValue.trim().toLowerCase();
@@ -973,6 +1660,8 @@ function createDefaultTrackMix(trackId) {
     mute: false,
     solo: false,
     record_armed: false,
+    record_input_device_id: null,
+    record_input_device_name: null,
   };
 }
 
@@ -985,6 +1674,8 @@ function normalizeTrackMixEntry(entry, trackId) {
     mute: Boolean(safeEntry.mute),
     solo: Boolean(safeEntry.solo),
     record_armed: Boolean(safeEntry.record_armed ?? safeEntry.recordArmed),
+    record_input_device_id: typeof safeEntry.record_input_device_id === 'string' ? safeEntry.record_input_device_id : null,
+    record_input_device_name: typeof safeEntry.record_input_device_name === 'string' ? safeEntry.record_input_device_name : null,
   };
 }
 
@@ -1322,6 +2013,10 @@ function resolveNodePluginDisplayName(node, pluginNameByUid) {
 
 export default function StuuShell() {
   const socketRef = useRef(null);
+  const connectionStatusLogsDropdownRef = useRef(null);
+  const connectionStatusLogsTriggerRef = useRef(null);
+  const connectionStatusLogsPanelRef = useRef(null);
+  const connectionStatusLogsViewportRef = useRef(null);
   const clipDraftsRef = useRef({});
   const importFileInputRef = useRef(null);
   const importTargetTrackIdRef = useRef(null);
@@ -1343,6 +2038,8 @@ export default function StuuShell() {
   const playheadPointerHandlersRef = useRef(null);
   const toolPointerHandlersRef = useRef(null);
   const toolDragRef = useRef(null);
+  const countInTimeoutRef = useRef(null);
+  const countInIntervalRef = useRef(null);
   const metronomeAudioContextRef = useRef(null);
   const metronomeFrameRef = useRef(null);
   const metronomeLastStepRef = useRef(null);
@@ -1355,6 +2052,8 @@ export default function StuuShell() {
   const trackRowDragBlockedRef = useRef(false);
   const playheadDragBarsRef = useRef(null);
   const previewStopTimeoutRef = useRef(null);
+  const inspectorEqProParamRowRefs = useRef(new Map());
+  const inspectorEqAnalyzerFrozenRef = useRef(false);
   const latestTransportRef = useRef(FALLBACK_STATE.transport);
   const transportUiCommitRef = useRef({ lastMs: 0, playing: false });
   const transportSnapshotRef = useRef({
@@ -1375,6 +2074,8 @@ export default function StuuShell() {
     lastTimestamp: null,
     lastLogMs: 0,
   });
+  const floatingWindowInteractionRef = useRef(null);
+  const activateFloatingWindowRef = useRef(null);
   const loadedProjectFileRef = useRef(null);
   const chatHistoryLoadedRef = useRef(false);
   const lastSyncedViewRef = useRef({
@@ -1385,6 +2086,9 @@ export default function StuuShell() {
   });
 
   const [connection, setConnection] = useState('connecting');
+  const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [connectionLogs, setConnectionLogs] = useState([]);
+  const [connectionLogsPortalLayout, setConnectionLogsPortalLayout] = useState(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [settingsTab, setSettingsTab] = useState('AUDIO');
   const [settingsVstPluginTab, setSettingsVstPluginTab] = useState('effects');
@@ -1395,6 +2099,11 @@ export default function StuuShell() {
   const [audioInputDevices, setAudioInputDevices] = useState([]);
   const [audioInputCurrentId, setAudioInputCurrentId] = useState('');
   const [audioStatus, setAudioStatus] = useState(/** @type {{ sampleRate: number | null; blockSize: number | null; outputLatencySeconds: number | null; outputChannels: number | null } | null} */ (null));
+  /** Track id for which the "choose mic for record" modal is open; null = closed. */
+  const [recordMicModalTrackId, setRecordMicModalTrackId] = useState(/** @type {number | null} */ (null));
+  const [recordMicInputDevices, setRecordMicInputDevices] = useState(/** @type {{ id: string; name: string }[]} */ ([]));
+  const [floatingWindowLayouts, setFloatingWindowLayouts] = useState(() => loadFloatingWindowLayoutsFromStorage());
+  const [, setFloatingWindowZCounter] = useState(() => getNextFloatingWindowZCounter(loadFloatingWindowLayoutsFromStorage()));
   const [enginePort, setEnginePort] = useState(() => {
     try {
       const u = new URL(ENGINE_BASE_URL);
@@ -1412,11 +2121,23 @@ export default function StuuShell() {
   const [isBpmInputFocused, setIsBpmInputFocused] = useState(false);
   const [activeTab, setActiveTab] = useState('Edit');
   const [state, setState] = useState(FALLBACK_STATE);
+  const recordCountInEnabledPreference = typeof state?.appPreferences?.record_count_in_enabled === 'boolean'
+    ? state.appPreferences.record_count_in_enabled
+    : FALLBACK_STATE.appPreferences.record_count_in_enabled;
+  const recordUseStandardMicPreference = typeof state?.appPreferences?.record_use_standard_mic === 'boolean'
+    ? state.appPreferences.record_use_standard_mic
+    : FALLBACK_STATE.appPreferences.record_use_standard_mic;
   const [transport, setTransport] = useState(FALLBACK_STATE.transport);
   const [meters, setMeters] = useState({});
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState(DEFAULT_CHAT_MESSAGES);
   const [inspector, setInspector] = useState({ type: 'project' });
+  const [inspectorEqViewMode, setInspectorEqViewMode] = useState('easy');
+  const [inspectorEqSelectedBandId, setInspectorEqSelectedBandId] = useState('mid1');
+  const [inspectorEqCurveHover, setInspectorEqCurveHover] = useState(null);
+  const [inspectorEqPinnedReadout, setInspectorEqPinnedReadout] = useState(null);
+  const [inspectorEqAnalyzerFrame, setInspectorEqAnalyzerFrame] = useState(null);
+  const [inspectorEqAnalyzerFrozen, setInspectorEqAnalyzerFrozen] = useState(false);
   const [activePatternId, setActivePatternId] = useState(null);
   const [clipDrafts, setClipDrafts] = useState({});
   const [clipInteraction, setClipInteraction] = useState(null);
@@ -1497,6 +2218,66 @@ export default function StuuShell() {
   const [slicePreviewBars, setSlicePreviewBars] = useState(null);
   const [sliceCursorPosition, setSliceCursorPosition] = useState(null);
   const [importTrackRenamePrompt, setImportTrackRenamePrompt] = useState(null);
+  const appendConnectionLogEntry = useCallback((entry) => {
+    const normalized = normalizeLiveEngineLogEntry(entry);
+    if (!normalized) {
+      return;
+    }
+    setConnectionLogs((prev) => {
+      const next = [...prev, normalized];
+      return next.length > LIVE_ENGINE_LOG_LIMIT ? next.slice(-LIVE_ENGINE_LOG_LIMIT) : next;
+    });
+  }, []);
+  const updateConnectionLogsPortalLayout = useCallback(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const anchorEl = connectionStatusLogsTriggerRef.current || connectionStatusLogsDropdownRef.current;
+    if (!anchorEl) {
+      return;
+    }
+    const rect = anchorEl.getBoundingClientRect();
+    const viewportWidth = Math.max(0, window.innerWidth || 0);
+    const viewportHeight = Math.max(0, window.innerHeight || 0);
+    if (viewportWidth <= 0 || viewportHeight <= 0) {
+      return;
+    }
+    const compact = viewportWidth <= 1080;
+    const gutter = compact ? 12 : 20;
+    const preferredWidth = compact ? 280 : 300;
+    const width = Math.max(260, Math.min(preferredWidth, viewportWidth - gutter * 2));
+    const left = Math.min(
+      Math.max(rect.right - width - 8, gutter),
+      Math.max(gutter, viewportWidth - width - gutter),
+    );
+    const measuredPanelHeight = Number(connectionStatusLogsPanelRef.current?.getBoundingClientRect?.().height);
+    const desiredPanelHeight = Number.isFinite(measuredPanelHeight) && measuredPanelHeight > 0
+      ? measuredPanelHeight
+      : 156;
+    const availableBelow = Math.max(120, viewportHeight - rect.bottom - gutter - 8);
+    const availableAbove = Math.max(120, rect.top - gutter - 8);
+    const canFitBelow = desiredPanelHeight <= availableBelow;
+    const canFitAbove = desiredPanelHeight <= availableAbove;
+    const placeAbove = !canFitBelow && (canFitAbove || availableAbove > availableBelow);
+    const maxHeight = Math.max(120, placeAbove ? availableAbove : availableBelow);
+    let top = placeAbove
+      ? rect.top - Math.min(desiredPanelHeight, maxHeight) - 8
+      : rect.bottom + 8;
+    top = Math.max(gutter, Math.min(top, Math.max(gutter, viewportHeight - maxHeight - gutter)));
+
+    setConnectionLogsPortalLayout((prev) => {
+      if (
+        prev
+        && Math.abs(prev.left - left) < 0.5
+        && Math.abs(prev.top - top) < 0.5
+        && Math.abs(prev.width - width) < 0.5
+        && Math.abs((prev.maxHeight ?? 0) - maxHeight) < 0.5
+      ) {
+        return prev;
+      }
+      return { left, top, width, maxHeight, placement: placeAbove ? 'top' : 'bottom' };
+    });
+  }, []);
   const pluginNameByUid = useMemo(() => {
     const map = new Map();
     for (const plugin of availablePlugins) {
@@ -1607,6 +2388,10 @@ export default function StuuShell() {
   }, [clipDrafts]);
 
   useEffect(() => {
+    inspectorEqAnalyzerFrozenRef.current = inspectorEqAnalyzerFrozen;
+  }, [inspectorEqAnalyzerFrozen]);
+
+  useEffect(() => {
     return () => {
       if (importTrackRenamePromptResolverRef.current) {
         importTrackRenamePromptResolverRef.current({ apply: false, trackName: '' });
@@ -1614,6 +2399,60 @@ export default function StuuShell() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined') {
+        clearFloatingWindowInteraction();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    window.localStorage.setItem(FLOATING_WINDOW_LAYOUTS_STORAGE_KEY, JSON.stringify(floatingWindowLayouts));
+  }, [floatingWindowLayouts]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+    const handleResize = () => {
+      setFloatingWindowLayouts((prev) => normalizeFloatingWindowLayouts(prev, getFloatingWindowViewportBounds()));
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!showSettingsModal) {
+      return;
+    }
+    activateFloatingWindowRef.current?.('settings', { unminimize: true });
+  }, [showSettingsModal]);
+
+  useEffect(() => {
+    if (recordMicModalTrackId == null) {
+      return;
+    }
+    activateFloatingWindowRef.current?.('recordMic', { unminimize: true });
+  }, [recordMicModalTrackId]);
+
+  useEffect(() => {
+    if (trackChainModalTrackId == null) {
+      return;
+    }
+    activateFloatingWindowRef.current?.('trackChain', { unminimize: true });
+  }, [trackChainModalTrackId]);
+
+  useEffect(() => {
+    if (!importTrackRenamePrompt) {
+      return;
+    }
+    activateFloatingWindowRef.current?.('importTrackRename', { unminimize: true });
+  }, [importTrackRenamePrompt]);
 
   useEffect(() => {
     try {
@@ -1676,31 +2515,149 @@ export default function StuuShell() {
     const socket = createEngineSocket();
     socketRef.current = socket;
 
-    socket.on('connect', () => setConnection('online'));
-    socket.on('disconnect', () => setConnection('offline'));
-    socket.on('connect_error', () => setConnection('offline'));
-    socket.io.on('reconnect_attempt', () => setConnection('connecting'));
+    const handleConnect = () => {
+      setConnection('online');
+      appendConnectionLogEntry({ level: 'info', text: '[thestuu-ui] socket connected' });
+    };
+    const handleDisconnect = () => {
+      setConnection('offline');
+      appendConnectionLogEntry({ level: 'warn', text: '[thestuu-ui] socket disconnected' });
+    };
+    const handleConnectError = () => {
+      setConnection('offline');
+      appendConnectionLogEntry({ level: 'error', text: '[thestuu-ui] socket connect_error' });
+    };
+    const handleReconnectAttempt = () => {
+      setConnection('connecting');
+      appendConnectionLogEntry({ level: 'info', text: '[thestuu-ui] socket reconnect_attempt' });
+    };
+    const handleEngineLogsInit = (payload) => {
+      const entries = Array.isArray(payload?.entries)
+        ? payload.entries.map(normalizeLiveEngineLogEntry).filter(Boolean)
+        : [];
+      setConnectionLogs(entries.slice(-LIVE_ENGINE_LOG_LIMIT));
+    };
+    const handleEngineLog = (entry) => {
+      appendConnectionLogEntry(entry);
+    };
+
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
+    socket.on('connect_error', handleConnectError);
+    socket.io.on('reconnect_attempt', handleReconnectAttempt);
     socket.on('engine:ready', (payload) => {
       if (Number.isFinite(payload?.enginePort)) setEnginePort(payload.enginePort);
     });
+    socket.on('engine:logs:init', handleEngineLogsInit);
+    socket.on('engine:log', handleEngineLog);
     socket.on('engine:state', (payload) => {
       setState(payload);
       setTrackChainEnabledOverrides({});
     });
     socket.on('engine:meter', (payload) => setMeters(getMeterMap(payload)));
+    socket.on('engine:analyzer', (payload) => {
+      if (inspectorEqAnalyzerFrozenRef.current) {
+        return;
+      }
+      setInspectorEqAnalyzerFrame(normalizeIncomingEqAnalyzerFrame(payload));
+    });
     socket.on('engine:transport', (payload) => {
       applyEngineTransportPayload(payload);
     });
 
     return () => {
-      socket.off('connect');
-      socket.off('disconnect');
-      socket.off('connect_error');
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+      socket.off('connect_error', handleConnectError);
+      socket.off('engine:logs:init', handleEngineLogsInit);
+      socket.off('engine:log', handleEngineLog);
       socket.off('engine:ready');
-      socket.io.off('reconnect_attempt');
+      socket.off('engine:analyzer');
+      socket.io.off('reconnect_attempt', handleReconnectAttempt);
       socket.close();
     };
-  }, [applyEngineTransportPayload]);
+  }, [appendConnectionLogEntry, applyEngineTransportPayload]);
+
+  useEffect(() => {
+    if (!showConnectionLogs) {
+      setConnectionLogsPortalLayout(null);
+      return;
+    }
+    const handlePointerDown = (event) => {
+      const target = event.target;
+      const insideTrigger = connectionStatusLogsDropdownRef.current?.contains(target);
+      const insidePanel = connectionStatusLogsPanelRef.current?.contains(target);
+      if (!insideTrigger && !insidePanel) {
+        setShowConnectionLogs(false);
+      }
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setShowConnectionLogs(false);
+      }
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [showConnectionLogs]);
+
+  useEffect(() => {
+    if (!showConnectionLogs) {
+      return;
+    }
+    let rafId = 0;
+    const scheduleUpdate = () => {
+      if (typeof window === 'undefined') {
+        return;
+      }
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        updateConnectionLogsPortalLayout();
+      });
+    };
+    scheduleUpdate();
+    window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('scroll', scheduleUpdate, true);
+    return () => {
+      window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('scroll', scheduleUpdate, true);
+      if (rafId && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
+  }, [showConnectionLogs, updateConnectionLogsPortalLayout]);
+
+  useEffect(() => {
+    if (!showConnectionLogs || typeof window === 'undefined') {
+      return;
+    }
+    let rafId = window.requestAnimationFrame(() => {
+      rafId = 0;
+      updateConnectionLogsPortalLayout();
+    });
+    return () => {
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
+  }, [showConnectionLogs, connectionLogs.length, updateConnectionLogsPortalLayout]);
+
+  useEffect(() => {
+    if (!showConnectionLogs) {
+      return;
+    }
+    const viewport = connectionStatusLogsViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    viewport.scrollTop = viewport.scrollHeight;
+  }, [connectionLogs, showConnectionLogs]);
 
   useEffect(() => {
     if (connection !== 'online' || !state?.nativeTransport || !socketRef.current) {
@@ -1729,6 +2686,17 @@ export default function StuuShell() {
       }
     });
   }, [connection, state?.nativeTransport]);
+
+  useEffect(() => {
+    if (recordMicModalTrackId == null || !socketRef.current || connection !== 'online' || !state?.nativeTransport) {
+      return;
+    }
+    socketRef.current.emit('audio:get-inputs', {}, (res) => {
+      if (res?.ok && Array.isArray(res.devices)) {
+        setRecordMicInputDevices(res.devices);
+      }
+    });
+  }, [recordMicModalTrackId, connection, state?.nativeTransport]);
 
   useEffect(() => {
     if (!showSettingsModal || !socketRef.current || connection !== 'online' || !state?.nativeTransport) {
@@ -2488,6 +3456,144 @@ export default function StuuShell() {
         value: Number(value),
       }));
   }, [inspectorNode]);
+
+  const inspectorTracktionEqUi = useMemo(() => {
+    if (!inspectorNode || inspectorNode.type !== 'vst_instrument') {
+      return null;
+    }
+
+    const token = resolveTracktionPluginToken(inspectorNode.plugin_uid, inspectorNode.plugin);
+    if (token !== '4bandeq') {
+      return null;
+    }
+
+    const gainParams = buildTracktionEqInspectorGainParams(inspectorNodeParameters);
+    const curve = buildTracktionEqInspectorCurveData(inspectorNodeParameters);
+    return {
+      gainParams,
+      isEffectivelyFlat: isTracktionEqInspectorEffectivelyFlat(gainParams),
+      easyMacros: deriveTracktionEqInspectorEasyMacros(gainParams),
+      curve,
+    };
+  }, [inspectorNode, inspectorNodeParameters]);
+
+  const inspectorEqAnalyzerAvailable = connection === 'online' && state?.nativeTransport === true;
+  const inspectorTracktionEqAnalyzerOverlay = useMemo(() => {
+    if (!inspectorTracktionEqUi?.curve || !inspectorEqAnalyzerFrame) {
+      return null;
+    }
+    return buildTracktionEqAnalyzerOverlayData(inspectorTracktionEqUi.curve, inspectorEqAnalyzerFrame);
+  }, [inspectorTracktionEqUi, inspectorEqAnalyzerFrame]);
+  const inspectorTracktionEqAnalyzerStatusText = useMemo(() => {
+    if (!inspectorEqAnalyzerAvailable) {
+      return 'Analyzer nur mit Native-Engine';
+    }
+    if (!inspectorTracktionEqAnalyzerOverlay) {
+      return 'Analyzer wartet auf Signal';
+    }
+    const mode = inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'PRE≈POST' : 'PRE/POST';
+    return `${inspectorTracktionEqAnalyzerOverlay.scope.toUpperCase()} · ${mode}`;
+  }, [inspectorEqAnalyzerAvailable, inspectorTracktionEqAnalyzerOverlay]);
+
+  const inspectorTracktionEqSelectedBand = useMemo(() => {
+    const bands = inspectorTracktionEqUi?.curve?.bands;
+    if (!Array.isArray(bands) || bands.length === 0) {
+      return null;
+    }
+    return bands.find((band) => band.id === inspectorEqSelectedBandId) || bands[1] || bands[0] || null;
+  }, [inspectorTracktionEqUi, inspectorEqSelectedBandId]);
+
+  const inspectorTracktionEqBandByParamId = useMemo(() => {
+    const map = new Map();
+    const bands = inspectorTracktionEqUi?.curve?.bands;
+    if (!Array.isArray(bands)) {
+      return map;
+    }
+    for (const band of bands) {
+      const ids = [band?.paramIds?.freq, band?.paramIds?.gain, band?.paramIds?.q];
+      for (const id of ids) {
+        if (typeof id === 'string' && id.trim() && !map.has(id)) {
+          map.set(id, band);
+        }
+      }
+    }
+    return map;
+  }, [inspectorTracktionEqUi]);
+
+  const inspectorTracktionEqCurveReadout = useMemo(() => {
+    if (inspectorEqPinnedReadout && Number.isFinite(inspectorEqPinnedReadout.freqHz) && Number.isFinite(inspectorEqPinnedReadout.gainDb)) {
+      return inspectorEqPinnedReadout;
+    }
+    if (inspectorEqCurveHover && Number.isFinite(inspectorEqCurveHover.freqHz) && Number.isFinite(inspectorEqCurveHover.gainDb)) {
+      return inspectorEqCurveHover;
+    }
+    if (inspectorTracktionEqSelectedBand) {
+      return {
+        source: 'band',
+        bandId: inspectorTracktionEqSelectedBand.id,
+        label: inspectorTracktionEqSelectedBand.label,
+        freqHz: inspectorTracktionEqSelectedBand.freqHz,
+        gainDb: inspectorTracktionEqSelectedBand.gainDb,
+      };
+    }
+    return null;
+  }, [inspectorEqPinnedReadout, inspectorEqCurveHover, inspectorTracktionEqSelectedBand]);
+
+  const inspectorTracktionEqMiniCurveHighlightBandId = useMemo(() => {
+    if (typeof inspectorEqPinnedReadout?.bandId === 'string' && inspectorEqPinnedReadout.bandId) {
+      return inspectorEqPinnedReadout.bandId;
+    }
+    if (typeof inspectorEqCurveHover?.bandId === 'string' && inspectorEqCurveHover.bandId) {
+      return inspectorEqCurveHover.bandId;
+    }
+    return inspectorEqSelectedBandId;
+  }, [inspectorEqPinnedReadout, inspectorEqCurveHover, inspectorEqSelectedBandId]);
+
+  const inspectorTracktionEqSelectedBandParamIdSet = useMemo(() => {
+    const ids = [
+      inspectorTracktionEqSelectedBand?.paramIds?.freq,
+      inspectorTracktionEqSelectedBand?.paramIds?.gain,
+      inspectorTracktionEqSelectedBand?.paramIds?.q,
+    ].filter((id) => typeof id === 'string' && id.trim());
+    return new Set(ids);
+  }, [inspectorTracktionEqSelectedBand]);
+
+  const inspectorTracktionEqSelectedBandParamKey = useMemo(() => {
+    return Array.from(inspectorTracktionEqSelectedBandParamIdSet).join('|');
+  }, [inspectorTracktionEqSelectedBandParamIdSet]);
+
+  useEffect(() => {
+    if (inspector.type !== 'node') {
+      return;
+    }
+    setInspectorEqViewMode('easy');
+    setInspectorEqSelectedBandId('mid1');
+    setInspectorEqCurveHover(null);
+    setInspectorEqPinnedReadout(null);
+    setInspectorEqAnalyzerFrozen(false);
+  }, [inspector.type, inspectorNode?.id]);
+
+  useEffect(() => {
+    if (inspectorEqViewMode !== 'pro' || !inspectorTracktionEqSelectedBandParamKey) {
+      return;
+    }
+
+    const selectedParamIds = inspectorTracktionEqSelectedBandParamKey.split('|').filter(Boolean);
+    const targetParamId = selectedParamIds.find((paramId) => inspectorEqProParamRowRefs.current.has(paramId));
+    if (!targetParamId) {
+      return;
+    }
+
+    const targetRow = inspectorEqProParamRowRefs.current.get(targetParamId);
+    if (!targetRow || typeof targetRow.scrollIntoView !== 'function') {
+      return;
+    }
+
+    const rafId = window.requestAnimationFrame(() => {
+      targetRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [inspectorEqViewMode, inspectorNode?.id, inspectorTracktionEqSelectedBandParamKey]);
 
   useEffect(() => {
     if (!Number.isInteger(selectedTrackId) || selectedTrackId <= 0) {
@@ -3591,8 +4697,18 @@ export default function StuuShell() {
       + `input="${String(bpmInputValue || '').trim()}"`,
     );
 
+    const anyRecordArmed = (state?.project?.mixer ?? []).some((e) => e.record_armed);
+    const shouldAutoMetronome = Boolean(state?.project?.record_auto_metronome) && anyRecordArmed;
+    if (shouldAutoMetronome && !metronomeEnabled) {
+      setState((prev) => ({
+        ...prev,
+        project: { ...prev?.project, metronome_enabled: true },
+      }));
+      emitMutation('project:update-view', { metronomeEnabled: true });
+    }
+
     const beginPlay = () => {
-      if (metronomeEnabled) {
+      if (metronomeEnabled || shouldAutoMetronome) {
         primeMetronomeAudio();
       }
       applyEngineTransportPayload({
@@ -3602,6 +4718,36 @@ export default function StuuShell() {
       });
       emitMutation('transport:play', { bpm: desiredBpm });
     };
+
+    const countInBeats = recordCountInEnabledPreference
+      ? Math.max(1, Math.min(10, Number(state?.project?.record_count_in_beats) || 4))
+      : 0;
+    if (anyRecordArmed && countInBeats > 0) {
+      if (countInTimeoutRef.current) clearTimeout(countInTimeoutRef.current);
+      if (countInIntervalRef.current) clearInterval(countInIntervalRef.current);
+      if (metronomeEnabled || shouldAutoMetronome) primeMetronomeAudio();
+      const beatIntervalMs = (60 / Math.max(20, Math.min(300, desiredBpm))) * 1000;
+      const timeSig = { numerator: Number(state?.project?.time_signature_numerator) || 4, denominator: Number(state?.project?.time_signature_denominator) || 4 };
+      triggerMetronomeTick(getMetronomeAccent(0, timeSig));
+      let count = 1;
+      countInIntervalRef.current = setInterval(() => {
+        if (count < countInBeats) triggerMetronomeTick(getMetronomeAccent(count, timeSig));
+        count += 1;
+        if (count >= countInBeats) {
+          if (countInIntervalRef.current) clearInterval(countInIntervalRef.current);
+          countInIntervalRef.current = null;
+        }
+      }, beatIntervalMs);
+      countInTimeoutRef.current = setTimeout(() => {
+        countInTimeoutRef.current = null;
+        if (countInIntervalRef.current) {
+          clearInterval(countInIntervalRef.current);
+          countInIntervalRef.current = null;
+        }
+        beginPlay();
+      }, countInBeats * beatIntervalMs);
+      return;
+    }
 
     const socket = socketRef.current;
     if (desiredBpm !== projectBpmForInput && socket) {
@@ -3623,6 +4769,8 @@ export default function StuuShell() {
 
   function transportPause() {
     clearPreviewStopTimer();
+    if (countInTimeoutRef.current) { clearTimeout(countInTimeoutRef.current); countInTimeoutRef.current = null; }
+    if (countInIntervalRef.current) { clearInterval(countInIntervalRef.current); countInIntervalRef.current = null; }
     emitMutation('transport:pause', {});
   }
 
@@ -3636,6 +4784,8 @@ export default function StuuShell() {
 
   function transportStop() {
     clearPreviewStopTimer();
+    if (countInTimeoutRef.current) { clearTimeout(countInTimeoutRef.current); countInTimeoutRef.current = null; }
+    if (countInIntervalRef.current) { clearInterval(countInIntervalRef.current); countInIntervalRef.current = null; }
     emitMutation('transport:stop', {});
   }
 
@@ -3741,10 +4891,464 @@ export default function StuuShell() {
     });
   }
 
+  function updateAppPreferences(patch) {
+    if (!isObject(patch)) {
+      return;
+    }
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(patch, 'record_count_in_enabled')) {
+      nextPatch.record_count_in_enabled = Boolean(patch.record_count_in_enabled);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'record_use_standard_mic')) {
+      nextPatch.record_use_standard_mic = Boolean(patch.record_use_standard_mic);
+    }
+    if (Object.keys(nextPatch).length === 0) {
+      return;
+    }
+
+    setState((prev) => {
+      const baseState = isObject(prev) ? prev : FALLBACK_STATE;
+      const basePrefs = isObject(baseState.appPreferences) ? baseState.appPreferences : FALLBACK_STATE.appPreferences;
+      return {
+        ...baseState,
+        appPreferences: {
+          ...basePrefs,
+          ...nextPatch,
+        },
+      };
+    });
+
+    const socket = socketRef.current;
+    if (!socket) {
+      appendSystemMessage('App-Preferences konnten nicht gespeichert werden: Keine Engine-Verbindung.');
+      return;
+    }
+
+    socket.emit('app-preferences:update', nextPatch, (res) => {
+      if (!res?.ok) {
+        appendSystemMessage(`Fehler (app-preferences:update): ${res?.error || 'Unbekannter Fehler'}`);
+        return;
+      }
+      if (isObject(res.app_preferences)) {
+        setState((prev) => {
+          const baseState = isObject(prev) ? prev : FALLBACK_STATE;
+          return {
+            ...baseState,
+            appPreferences: {
+              ...(isObject(baseState.appPreferences) ? baseState.appPreferences : FALLBACK_STATE.appPreferences),
+              ...res.app_preferences,
+            },
+          };
+        });
+      }
+    });
+  }
+
+  function clearFloatingWindowInteraction() {
+    const handlers = floatingWindowInteractionRef.current;
+    if (!handlers || typeof window === 'undefined') {
+      return;
+    }
+    window.removeEventListener('pointermove', handlers.handleMove);
+    window.removeEventListener('pointerup', handlers.handleEnd);
+    window.removeEventListener('pointercancel', handlers.handleEnd);
+    floatingWindowInteractionRef.current = null;
+  }
+
+  function getFloatingWindowLayout(windowId) {
+    const raw = isObject(floatingWindowLayouts) ? floatingWindowLayouts[windowId] : null;
+    return normalizeFloatingWindowLayoutEntry(windowId, raw, getFloatingWindowViewportBounds());
+  }
+
+  function consumeFloatingWindowZIndex() {
+    let nextZ = 100;
+    setFloatingWindowZCounter((prev) => {
+      nextZ = Math.max(1, Number(prev) || 1);
+      return nextZ + 10;
+    });
+    return nextZ;
+  }
+
+  function patchFloatingWindowLayout(windowId, patchOrUpdater) {
+    setFloatingWindowLayouts((prevLayouts) => {
+      const normalizedLayouts = normalizeFloatingWindowLayouts(prevLayouts, getFloatingWindowViewportBounds());
+      const current = normalizeFloatingWindowLayoutEntry(windowId, normalizedLayouts[windowId], getFloatingWindowViewportBounds());
+      const patch = typeof patchOrUpdater === 'function'
+        ? patchOrUpdater(current, normalizedLayouts)
+        : patchOrUpdater;
+      if (!isObject(patch)) {
+        return normalizedLayouts;
+      }
+      const nextEntry = normalizeFloatingWindowLayoutEntry(windowId, { ...current, ...patch }, getFloatingWindowViewportBounds());
+      return {
+        ...normalizedLayouts,
+        [windowId]: nextEntry,
+      };
+    });
+  }
+
+  function activateFloatingWindow(windowId, options = {}) {
+    const nextZ = consumeFloatingWindowZIndex();
+    const unminimize = Boolean(options?.unminimize);
+    patchFloatingWindowLayout(windowId, (current) => ({
+      zIndex: nextZ,
+      minimized: unminimize ? false : current.minimized,
+    }));
+  }
+  activateFloatingWindowRef.current = activateFloatingWindow;
+
+  function minimizeFloatingWindow(windowId) {
+    patchFloatingWindowLayout(windowId, (current) => ({
+      minimized: true,
+      maximized: false,
+      restoreBounds: current.maximized
+        ? (current.restoreBounds || { x: current.x, y: current.y, width: current.width, height: current.height })
+        : current.restoreBounds,
+    }));
+  }
+
+  function restoreFloatingWindow(windowId) {
+    activateFloatingWindow(windowId, { unminimize: true });
+  }
+
+  function toggleFloatingWindowMaximize(windowId) {
+    patchFloatingWindowLayout(windowId, (current) => {
+      if (current.maximized) {
+        const restore = isObject(current.restoreBounds) ? current.restoreBounds : null;
+        if (!restore) {
+          return { maximized: false };
+        }
+        return {
+          maximized: false,
+          minimized: false,
+          x: restore.x,
+          y: restore.y,
+          width: restore.width,
+          height: restore.height,
+        };
+      }
+      return {
+        minimized: false,
+        maximized: true,
+        restoreBounds: {
+          x: current.x,
+          y: current.y,
+          width: current.width,
+          height: current.height,
+        },
+      };
+    });
+    activateFloatingWindow(windowId);
+  }
+
+  function beginFloatingWindowDrag(windowId, event) {
+    if (event.button != null && event.button !== 0) {
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('button, input, select, textarea, a, [role="button"], .floating-window-resize-handle')) {
+      return;
+    }
+    const current = getFloatingWindowLayout(windowId);
+    if (current.maximized) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    activateFloatingWindow(windowId);
+
+    const startLayout = current;
+    const originClientX = event.clientX;
+    const originClientY = event.clientY;
+
+    clearFloatingWindowInteraction();
+
+    const handleMove = (moveEvent) => {
+      const dx = moveEvent.clientX - originClientX;
+      const dy = moveEvent.clientY - originClientY;
+      patchFloatingWindowLayout(windowId, {
+        x: Math.round(startLayout.x + dx),
+        y: Math.round(startLayout.y + dy),
+      });
+    };
+
+    const handleEnd = () => {
+      clearFloatingWindowInteraction();
+    };
+
+    floatingWindowInteractionRef.current = { handleMove, handleEnd };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleEnd);
+    window.addEventListener('pointercancel', handleEnd);
+  }
+
+  function beginFloatingWindowResize(windowId, edge, event) {
+    if (event.button != null && event.button !== 0) {
+      return;
+    }
+    const current = getFloatingWindowLayout(windowId);
+    if (current.maximized) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    activateFloatingWindow(windowId);
+
+    const startLayout = current;
+    const originClientX = event.clientX;
+    const originClientY = event.clientY;
+    const edgeToken = typeof edge === 'string' ? edge.toLowerCase() : '';
+    clearFloatingWindowInteraction();
+
+    const handleMove = (moveEvent) => {
+      const dx = moveEvent.clientX - originClientX;
+      const dy = moveEvent.clientY - originClientY;
+      let nextX = startLayout.x;
+      let nextY = startLayout.y;
+      let nextWidth = startLayout.width;
+      let nextHeight = startLayout.height;
+
+      if (edgeToken.includes('e')) {
+        nextWidth = startLayout.width + dx;
+      }
+      if (edgeToken.includes('s')) {
+        nextHeight = startLayout.height + dy;
+      }
+      if (edgeToken.includes('w')) {
+        nextX = startLayout.x + dx;
+        nextWidth = startLayout.width - dx;
+      }
+      if (edgeToken.includes('n')) {
+        nextY = startLayout.y + dy;
+        nextHeight = startLayout.height - dy;
+      }
+
+      patchFloatingWindowLayout(windowId, {
+        x: Math.round(nextX),
+        y: Math.round(nextY),
+        width: Math.round(nextWidth),
+        height: Math.round(nextHeight),
+      });
+    };
+
+    const handleEnd = () => {
+      clearFloatingWindowInteraction();
+    };
+
+    floatingWindowInteractionRef.current = { handleMove, handleEnd };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleEnd);
+    window.addEventListener('pointercancel', handleEnd);
+  }
+
+  function getFloatingWindowShellStyle(windowId) {
+    const entry = getFloatingWindowLayout(windowId);
+    const viewport = getFloatingWindowViewportBounds();
+    const dockReserve = FLOATING_WINDOW_DOCK_HEIGHT + FLOATING_WINDOW_DOCK_GAP;
+    if (entry.maximized) {
+      return {
+        position: 'fixed',
+        left: FLOATING_WINDOW_MARGIN,
+        top: FLOATING_WINDOW_MARGIN,
+        width: Math.max(entry.minWidth, viewport.width - (FLOATING_WINDOW_MARGIN * 2)),
+        height: Math.max(entry.minHeight, viewport.height - (FLOATING_WINDOW_MARGIN * 2) - dockReserve),
+        maxHeight: 'none',
+        zIndex: 300 + entry.zIndex,
+      };
+    }
+    return {
+      position: 'fixed',
+      left: entry.x,
+      top: entry.y,
+      width: entry.width,
+      height: entry.height,
+      maxHeight: 'none',
+      zIndex: 300 + entry.zIndex,
+    };
+  }
+
+  function getFloatingWindowLayerStyle(windowId) {
+    const entry = getFloatingWindowLayout(windowId);
+    return {
+      pointerEvents: 'none',
+      background: 'transparent',
+      padding: 0,
+      zIndex: 280 + entry.zIndex,
+    };
+  }
+
+  function isFloatingWindowMinimized(windowId) {
+    return Boolean(getFloatingWindowLayout(windowId).minimized);
+  }
+
+  function beginModalDrag(kind, event) {
+    beginFloatingWindowDrag(kind, event);
+  }
+
+  function getDraggableModalStyle(kindOrOffset) {
+    if (typeof kindOrOffset === 'string') {
+      return getFloatingWindowShellStyle(kindOrOffset);
+    }
+    return getFloatingWindowShellStyle('settings');
+  }
+
+  function renderFloatingWindowResizeHandles(windowId) {
+    const entry = getFloatingWindowLayout(windowId);
+    if (entry.maximized) {
+      return null;
+    }
+    return ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map((edge) => (
+      <button
+        key={`${windowId}_resize_${edge}`}
+        type="button"
+        className={`floating-window-resize-handle floating-window-resize-${edge}`}
+        aria-label={`Fenstergröße ändern (${edge})`}
+        tabIndex={-1}
+        onPointerDown={(event) => beginFloatingWindowResize(windowId, edge, event)}
+      />
+    ));
+  }
+
+  function isFloatingWindowOpen(windowId) {
+    if (windowId === 'trackChain') {
+      return trackChainModalTrackId != null;
+    }
+    if (windowId === 'settings') {
+      return Boolean(showSettingsModal);
+    }
+    if (windowId === 'recordMic') {
+      return recordMicModalTrackId != null;
+    }
+    if (windowId === 'importTrackRename') {
+      return Boolean(importTrackRenamePrompt);
+    }
+    return false;
+  }
+
+  function closeFloatingWindow(windowId) {
+    if (windowId === 'trackChain') {
+      setTrackChainModalTrackId(null);
+      setOpenTrackPluginPicker(null);
+      return;
+    }
+    if (windowId === 'settings') {
+      setShowSettingsModal(false);
+      return;
+    }
+    if (windowId === 'recordMic') {
+      setRecordMicModalTrackId(null);
+      return;
+    }
+    if (windowId === 'importTrackRename') {
+      resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
+    }
+  }
+
+  function getFloatingWindowTitle(windowId) {
+    if (windowId === 'trackChain') {
+      return trackChainModalTrack ? `${trackChainModalTrack.name || `Track ${trackChainModalTrack.track_id}`} · FX` : 'Node Chain';
+    }
+    if (windowId === 'settings') {
+      return 'Settings';
+    }
+    if (windowId === 'recordMic') {
+      return recordMicModalTrackId != null ? `Mic Track ${recordMicModalTrackId}` : 'Mic';
+    }
+    if (windowId === 'importTrackRename') {
+      return importTrackRenamePrompt
+        ? `Track ${importTrackRenamePrompt.trackId} Name`
+        : 'Track Name übernehmen';
+    }
+    return windowId;
+  }
+
+  function setAudioInputDevice(deviceId, onResult) {
+    if (!socketRef.current || !deviceId) {
+      if (typeof onResult === 'function') {
+        onResult({ ok: false, error: 'missing socket or device id' });
+      }
+      return;
+    }
+    socketRef.current.emit('audio:set-input', { deviceId }, (res) => {
+      if (res?.ok) {
+        setAudioInputCurrentId(deviceId);
+      }
+      if (typeof onResult === 'function') {
+        onResult(res);
+      }
+    });
+  }
+
   function setRecordArm(trackId, recordArmed) {
     applyLocalTrackMix(trackId, { record_armed: Boolean(recordArmed) });
     ensureTrackExists(trackId, () => {
       emitMutation('track:set-record-arm', { trackId, recordArmed: Boolean(recordArmed) });
+    });
+  }
+
+  function setRecordArmWithMic(trackId, deviceId, deviceName, options = {}) {
+    const onFailure = typeof options?.onFailure === 'function' ? options.onFailure : null;
+    const onSuccess = typeof options?.onSuccess === 'function' ? options.onSuccess : null;
+    if (!deviceId) {
+      onFailure?.({ ok: false, error: 'missing device id' });
+      return;
+    }
+    setAudioInputDevice(deviceId, (resAudio) => {
+      if (!resAudio?.ok) {
+        onFailure?.(resAudio);
+        return;
+      }
+      applyLocalTrackMix(trackId, {
+        record_armed: true,
+        record_input_device_id: deviceId,
+        record_input_device_name: deviceName || deviceId,
+      });
+      ensureTrackExists(trackId, () => {
+        emitMutation('track:set-record-arm', {
+          trackId,
+          recordArmed: true,
+          record_input_device_id: deviceId,
+          record_input_device_name: deviceName || deviceId,
+        });
+      });
+      setRecordMicModalTrackId(null);
+      onSuccess?.(resAudio);
+    });
+  }
+
+  function openRecordArmMicSelection(trackId) {
+    const resolvedTrackId = Number(trackId);
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0) {
+      return;
+    }
+
+    if (!recordUseStandardMicPreference) {
+      setRecordMicModalTrackId(resolvedTrackId);
+      return;
+    }
+
+    const fallbackMessage = 'eingestelltes Standard-Mikrofon nicht verfügbar. Bitte Mikrofon auswählen.';
+    const selectedDeviceId = typeof audioInputCurrentId === 'string' ? audioInputCurrentId.trim() : '';
+    if (!selectedDeviceId) {
+      appendSystemMessage(fallbackMessage);
+      setRecordMicModalTrackId(resolvedTrackId);
+      return;
+    }
+
+    const knownDevices = audioInputDevices.length > 0 ? audioInputDevices : recordMicInputDevices;
+    const matchingDevice = knownDevices.find((device) => device?.id === selectedDeviceId) || null;
+    if (knownDevices.length > 0 && !matchingDevice) {
+      appendSystemMessage(fallbackMessage);
+      setRecordMicModalTrackId(resolvedTrackId);
+      return;
+    }
+
+    setRecordArmWithMic(resolvedTrackId, selectedDeviceId, matchingDevice?.name || selectedDeviceId, {
+      onFailure: () => {
+        appendSystemMessage(fallbackMessage);
+        setRecordMicModalTrackId(resolvedTrackId);
+      },
     });
   }
 
@@ -4049,6 +5653,175 @@ export default function StuuShell() {
       plugin_index: pluginIndex,
       param_id: paramId,
       value: nextValue,
+    });
+  }
+
+  function applyInspectorTracktionEqGainTargets(targets) {
+    if (!inspectorNode || inspectorNode.type !== 'vst_instrument') {
+      return;
+    }
+    if (!inspectorTracktionEqUi?.gainParams || !targets || typeof targets !== 'object') {
+      return;
+    }
+
+    for (const [role, targetGainDb] of Object.entries(targets)) {
+      const parameter = inspectorTracktionEqUi.gainParams[role];
+      if (!parameter || typeof parameter.id !== 'string' || !parameter.id) {
+        continue;
+      }
+      const normalizedValue = getPluginParameterNormalizedFromActual(parameter, Number(targetGainDb));
+      setVstNodeParameter(inspectorNode, parameter.id, normalizedValue);
+    }
+  }
+
+  function applyInspectorTracktionEqPreset(presetId) {
+    const targets = buildTracktionEqInspectorPresetGainTargets(presetId);
+    if (!targets) {
+      return;
+    }
+    applyInspectorTracktionEqGainTargets(targets);
+  }
+
+  function setInspectorTracktionEqEasyMacro(macroId, nextValue) {
+    if (!inspectorTracktionEqUi?.gainParams) {
+      return;
+    }
+
+    const current = inspectorTracktionEqUi.easyMacros || { mud: 0, presence: 0, softness: 0 };
+    const nextMacros = {
+      mud: current.mud,
+      presence: current.presence,
+      softness: current.softness,
+      [macroId]: clamp(Number(nextValue), 0, 1),
+    };
+    applyInspectorTracktionEqGainTargets(buildTracktionEqInspectorEasyGainTargets(nextMacros));
+  }
+
+  function selectInspectorTracktionEqBand(bandId) {
+    if (typeof bandId !== 'string' || !bandId.trim()) {
+      return;
+    }
+    setInspectorEqSelectedBandId(bandId);
+  }
+
+  function registerInspectorEqProParamRowRef(paramId, element) {
+    if (typeof paramId !== 'string' || !paramId) {
+      return;
+    }
+    if (element) {
+      inspectorEqProParamRowRefs.current.set(paramId, element);
+      return;
+    }
+    inspectorEqProParamRowRefs.current.delete(paramId);
+  }
+
+  function toggleInspectorEqAnalyzerFreeze() {
+    setInspectorEqAnalyzerFrozen((previous) => !previous);
+  }
+
+  function toggleInspectorTracktionEqReadoutPin() {
+    if (inspectorEqPinnedReadout) {
+      setInspectorEqPinnedReadout(null);
+      return;
+    }
+
+    const current = inspectorTracktionEqCurveReadout;
+    if (!current || !Number.isFinite(Number(current.freqHz)) || !Number.isFinite(Number(current.gainDb))) {
+      return;
+    }
+
+    setInspectorEqPinnedReadout({
+      source: 'pinned',
+      bandId: typeof current.bandId === 'string' ? current.bandId : null,
+      label: typeof current.label === 'string' ? current.label : null,
+      freqHz: Number(current.freqHz),
+      gainDb: Number(current.gainDb),
+    });
+    setInspectorEqCurveHover(null);
+  }
+
+  function previewInspectorTracktionEqBandHover(band) {
+    if (inspectorEqPinnedReadout) {
+      return;
+    }
+    if (!band || typeof band !== 'object') {
+      return;
+    }
+    if (!Number.isFinite(Number(band.freqHz)) || !Number.isFinite(Number(band.gainDb))) {
+      return;
+    }
+    setInspectorEqCurveHover({
+      source: 'pro-row-band',
+      bandId: typeof band.id === 'string' ? band.id : null,
+      label: typeof band.label === 'string' ? band.label : null,
+      freqHz: Number(band.freqHz),
+      gainDb: Number(band.gainDb),
+    });
+  }
+
+  function clearInspectorTracktionEqCurveHover() {
+    if (inspectorEqPinnedReadout) {
+      return;
+    }
+    setInspectorEqCurveHover(null);
+  }
+
+  function handleInspectorTracktionEqCurvePointerMove(event) {
+    if (inspectorEqPinnedReadout) {
+      return;
+    }
+    const curve = inspectorTracktionEqUi?.curve;
+    if (!curve || !Array.isArray(curve.samples) || curve.samples.length === 0) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      return;
+    }
+
+    const x = clamp(((event.clientX - rect.left) / rect.width) * curve.width, 0, curve.width);
+    const y = clamp(((event.clientY - rect.top) / rect.height) * curve.height, 0, curve.height);
+    const sampleIndex = clamp(Math.round(x), 0, curve.samples.length - 1);
+    const sample = curve.samples[sampleIndex];
+    if (!sample) {
+      return;
+    }
+
+    let nearestNode = null;
+    let nearestNodeDistance = 12;
+    if (Array.isArray(curve.nodePoints)) {
+      for (const point of curve.nodePoints) {
+        if (!point) {
+          continue;
+        }
+        const dx = Number(point.x) - x;
+        const dy = Number(point.y) - y;
+        const distance = Math.sqrt((dx * dx) + (dy * dy));
+        if (distance < nearestNodeDistance) {
+          nearestNodeDistance = distance;
+          nearestNode = point;
+        }
+      }
+    }
+
+    if (nearestNode) {
+      setInspectorEqCurveHover({
+        source: 'band',
+        bandId: nearestNode.id,
+        label: nearestNode.label,
+        freqHz: nearestNode.freqHz,
+        gainDb: nearestNode.gainDb,
+      });
+      return;
+    }
+
+    setInspectorEqCurveHover({
+      source: 'curve',
+      bandId: null,
+      label: null,
+      freqHz: sample.freqHz,
+      gainDb: sample.db,
     });
   }
 
@@ -4676,7 +6449,6 @@ export default function StuuShell() {
     event.stopPropagation();
   }
 
-  const FADE_CURVE_ORDER = ['linear', 'convex', 'concave', 'sCurve'];
   function beginFadeHandleInteraction(which, event, trackId, clip) {
     event.preventDefault();
     event.stopPropagation();
@@ -4933,6 +6705,121 @@ export default function StuuShell() {
   const showDawTopShell = activeTab === 'Edit' || activeTab === 'Mix';
   const canUndoProject = Boolean(state?.history?.canUndo);
   const canRedoProject = Boolean(state?.history?.canRedo);
+  const connectionStatusVariant = connection === 'online' && state?.nativeTransport === true
+    ? 'online'
+    : connection === 'online'
+      ? 'no-audio'
+      : connection;
+  const connectionStatusTitle = connection === 'offline' || connection === 'connecting'
+    ? `Engine nicht erreichbar (${enginePort}). Starte alle Dienste mit: npm run start (im Projektroot). Prüfe ob Port ${enginePort} frei ist.`
+    : connection === 'online' && state?.nativeTransport !== true
+      ? 'Native-Engine nicht verbunden – kein Ton. Starte mit: npm run start (Projektroot).'
+      : undefined;
+  const connectionStatusText = connection === 'online' && state?.nativeTransport === true
+    ? 'online'
+    : connection === 'online'
+      ? 'no audio'
+      : connection;
+  const canRenderConnectionLogsPortal = showConnectionLogs
+    && connectionLogsPortalLayout
+    && typeof document !== 'undefined';
+  const connectionLogsTerminalMaxHeight = Math.max(
+    88,
+    Number(connectionLogsPortalLayout?.maxHeight ?? 210) - 48,
+  );
+  const connectionLogsTerminalHeight = Math.max(
+    72,
+    Math.min(96, connectionLogsTerminalMaxHeight),
+  );
+  const renderConnectionStatusWithLogs = () => (
+    <span className="status-terminal-wrap" ref={connectionStatusLogsDropdownRef}>
+      <span className={`status status-badge ${connectionStatusVariant}`} title={connectionStatusTitle}>
+        {connectionStatusText}
+        <span className="status-port" title={`Engine: ${enginePort}`}>:{enginePort}</span>
+        <a
+          href={`http://127.0.0.1:${enginePort}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="status-open-icon"
+          title="Engine in neuem Tab öffnen"
+          aria-label="Engine in neuem Tab öffnen"
+        >
+          <ExternalLink size={12} aria-hidden="true" />
+        </a>
+      </span>
+      <div className={`status-log-dropdown ${showConnectionLogs ? 'open' : ''}`}>
+        <button
+          type="button"
+          ref={connectionStatusLogsTriggerRef}
+          className="status-log-trigger"
+          onClick={() => {
+            updateConnectionLogsPortalLayout();
+            setShowConnectionLogs((prev) => !prev);
+          }}
+          aria-expanded={showConnectionLogs}
+          aria-haspopup="dialog"
+          aria-label={showConnectionLogs ? 'Live-Logs schließen' : 'Live-Logs öffnen'}
+          title="Live-Logs"
+        >
+          logs
+          <ChevronRight className="status-log-trigger-icon" size={12} aria-hidden="true" />
+        </button>
+      </div>
+      {canRenderConnectionLogsPortal
+        ? createPortal(
+            <div
+              ref={connectionStatusLogsPanelRef}
+              className="status-log-panel"
+              style={{
+                position: 'fixed',
+                left: connectionLogsPortalLayout.left,
+                top: connectionLogsPortalLayout.top,
+                width: connectionLogsPortalLayout.width,
+                maxHeight: connectionLogsPortalLayout.maxHeight,
+                right: 'auto',
+              }}
+              role="dialog"
+              aria-label="Engine Live-Logs"
+            >
+              <div className="status-log-panel-header">
+                <span className="status-log-panel-title">Live Logs</span>
+                <span className="status-log-panel-meta">{connectionLogs.length} lines</span>
+                <button
+                  type="button"
+                  className="status-log-panel-clear"
+                  onClick={() => setConnectionLogs([])}
+                >
+                  clear
+                </button>
+              </div>
+              <div
+                ref={connectionStatusLogsViewportRef}
+                className="status-log-terminal"
+                style={{
+                  height: connectionLogsTerminalHeight,
+                  maxHeight: connectionLogsTerminalHeight,
+                }}
+                role="log"
+                aria-live="polite"
+                aria-relevant="additions text"
+              >
+                {connectionLogs.length === 0 ? (
+                  <div className="status-log-empty">Noch keine Logs. Warte auf Engine-Events…</div>
+                ) : (
+                  connectionLogs.map((entry) => (
+                    <div key={entry.id} className={`status-log-line level-${entry.level}`}>
+                      <span className="status-log-time">{formatLiveEngineLogTime(entry.ts)}</span>
+                      <span className="status-log-text">{entry.text}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+    </span>
+  );
 
   return (
     <>
@@ -4974,7 +6861,14 @@ export default function StuuShell() {
                 <div className="daw-menu-row daw-menu-row-1">
                   <div className="daw-menu-left">
                     <span className="daw-logo" aria-hidden="true">
-                      <img src="/thestuulogo.png" alt="THE STUU" className="daw-logo-img" />
+                      <Image
+                        src="/thestuulogo.png"
+                        alt="THE STUU"
+                        className="daw-logo-img"
+                        width={774}
+                        height={172}
+                        priority
+                      />
                     </span>
                     {DAW_MENU_ITEMS.map((item) =>
                       item === 'SETTINGS' ? (
@@ -4982,7 +6876,10 @@ export default function StuuShell() {
                           key={item}
                           type="button"
                           className="daw-menu-item-button"
-                          onClick={() => setShowSettingsModal(true)}
+                          onClick={() => {
+                            setShowSettingsModal(true);
+                            restoreFloatingWindow('settings');
+                          }}
                           aria-label="Einstellungen öffnen"
                         >
                           {item}
@@ -4993,29 +6890,7 @@ export default function StuuShell() {
                     )}
                   </div>
                   <div className="daw-menu-right">
-                    <span
-                      className={`status status-badge ${connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no-audio' : connection}`}
-                      title={
-                        connection === 'offline' || connection === 'connecting'
-                          ? `Engine nicht erreichbar (${enginePort}). Starte alle Dienste mit: npm run start (im Projektroot). Prüfe ob Port ${enginePort} frei ist.`
-                          : connection === 'online' && state?.nativeTransport !== true
-                            ? 'Native-Engine nicht verbunden – kein Ton. Starte mit: npm run start (Projektroot).'
-                            : undefined
-                      }
-                    >
-                      {connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no audio' : connection}
-                      <span className="status-port" title={`Engine: ${enginePort}`}>:{enginePort}</span>
-                      <a
-                        href={`http://127.0.0.1:${enginePort}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="status-open-icon"
-                        title="Engine in neuem Tab öffnen"
-                        aria-label="Engine in neuem Tab öffnen"
-                      >
-                        <ExternalLink size={12} aria-hidden="true" />
-                      </a>
-                    </span>
+                    {renderConnectionStatusWithLogs()}
                   </div>
                 </div>
                 <div className="daw-menu-row daw-menu-row-2 view-tab-row">
@@ -5176,22 +7051,7 @@ export default function StuuShell() {
                 <h1>{state?.project?.project_name || 'TheStuu Session'}</h1>
                 <p>
                   Connection:{' '}
-                  <span
-                    className={`status status-badge ${connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no-audio' : connection}`}
-                    title={
-                      connection === 'offline' || connection === 'connecting'
-                        ? `Engine nicht erreichbar (${enginePort}). Starte alle Dienste mit: npm run start (im Projektroot). Prüfe ob Port ${enginePort} frei ist.`
-                        : connection === 'online' && state?.nativeTransport !== true
-                          ? 'Native-Engine nicht verbunden – kein Ton. Starte mit: npm run start (Projektroot).'
-                          : undefined
-                    }
-                  >
-                    {connection === 'online' && state?.nativeTransport === true ? 'online' : connection === 'online' ? 'no audio' : connection}
-                    <span className="status-port" title={`Engine: ${enginePort}`}>:{enginePort}</span>
-                    <a href={`http://127.0.0.1:${enginePort}`} target="_blank" rel="noopener noreferrer" className="status-open-icon" title="Engine in neuem Tab öffnen" aria-label="Engine in neuem Tab öffnen">
-                      <ExternalLink size={12} aria-hidden="true" />
-                    </a>
-                  </span>
+                  {renderConnectionStatusWithLogs()}
                 </p>
               </div>
 
@@ -5612,12 +7472,21 @@ export default function StuuShell() {
                                     aria-label="Record Arm"
                                     onClick={(event) => {
                                       event.stopPropagation();
-                                      setRecordArm(track.track_id, !track.mix.record_armed);
+                                      if (track.mix.record_armed) {
+                                        setRecordArm(track.track_id, false);
+                                      } else {
+                                        openRecordArmMicSelection(track.track_id);
+                                      }
                                     }}
                                   >
                                     R
                                   </button>
                                 </div>
+                                {(track.mix.record_armed && (track.mix.record_input_device_name || track.mix.record_input_device_id)) ? (
+                                  <div className="arrangement-track-mic-label" title="Aufnahme-Mikrofon">
+                                    Mikro: {track.mix.record_input_device_name || track.mix.record_input_device_id}
+                                  </div>
+                                ) : null}
                                 <label className="arrangement-track-mini-field arrangement-track-mini-field-volume">
                                   <span>Vol</span>
                                   <input
@@ -5868,6 +7737,7 @@ export default function StuuShell() {
                                           setTrackContextMenu(null);
                                           setOpenTrackPluginPicker(null);
                                           setTrackChainModalTrackId(track.track_id);
+                                          restoreFloatingWindow('trackChain');
                                         }}
                                       >
                                         <TrackChainOpenIcon />
@@ -6184,35 +8054,59 @@ export default function StuuShell() {
                     </section>
                   </div>
                   </div>
-                  {trackChainModalTrack ? (
+                  {trackChainModalTrack && !isFloatingWindowMinimized('trackChain') ? (
                     <div
-                      className="track-chain-modal-overlay"
+                      className="track-chain-modal-overlay floating-window-overlay"
                       role="presentation"
-                      onPointerDown={() => {
-                        setTrackChainModalTrackId(null);
-                        setOpenTrackPluginPicker(null);
-                      }}
+                      style={getFloatingWindowLayerStyle('trackChain')}
                     >
                       <div
                         className="track-chain-modal"
                         role="dialog"
                         aria-modal="true"
                         aria-label={`Track ${trackChainModalTrack.track_id} Node-Kette`}
-                        onPointerDown={(event) => event.stopPropagation()}
+                        style={getFloatingWindowShellStyle('trackChain')}
+                        onPointerDown={(event) => {
+                          event.stopPropagation();
+                          activateFloatingWindow('trackChain');
+                        }}
                       >
-                        <div className="track-chain-modal-head">
+                        <div
+                          className="track-chain-modal-head"
+                          onPointerDown={(event) => beginModalDrag('trackChain', event)}
+                        >
                           <h2>{`${trackChainModalTrack.name} · Node Chain`}</h2>
-                          <button
-                            type="button"
-                            className="track-chain-modal-close"
-                            onClick={() => {
-                              setTrackChainModalTrackId(null);
-                              setOpenTrackPluginPicker(null);
-                            }}
-                            aria-label="Schliessen"
-                          >
-                            <X size={14} strokeWidth={2} aria-hidden="true" />
-                          </button>
+                          <div className="settings-modal-window-controls">
+                            <button
+                              type="button"
+                              className="settings-modal-window-btn"
+                              onClick={() => minimizeFloatingWindow('trackChain')}
+                              aria-label="Minimieren"
+                              title="Minimieren"
+                            >
+                              <Minus size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-modal-window-btn"
+                              onClick={() => toggleFloatingWindowMaximize('trackChain')}
+                              aria-label={getFloatingWindowLayout('trackChain').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                              title={getFloatingWindowLayout('trackChain').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                            >
+                              {getFloatingWindowLayout('trackChain').maximized
+                                ? <Square size={12} strokeWidth={2} aria-hidden="true" />
+                                : <LayoutGrid size={14} strokeWidth={2} aria-hidden="true" />}
+                            </button>
+                            <button
+                              type="button"
+                              className="track-chain-modal-close settings-modal-close"
+                              onClick={() => closeFloatingWindow('trackChain')}
+                              aria-label="Schliessen"
+                              title="Schliessen"
+                            >
+                              <X size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                          </div>
                         </div>
                         <div className="track-chain-modal-canvas" data-track-plugin-picker-root="true">
                           <div className="track-chain-modal-flow">
@@ -6379,35 +8273,151 @@ export default function StuuShell() {
                             </div>
                           ) : null}
                         </div>
+                        {renderFloatingWindowResizeHandles('trackChain')}
                       </div>
                     </div>
                   ) : null}
-                  {showSettingsModal ? (
+                  {recordMicModalTrackId != null && !isFloatingWindowMinimized('recordMic') ? (
                     <div
-                      className="settings-modal-overlay"
+                      className="settings-modal-overlay floating-window-overlay"
                       role="presentation"
-                      onPointerDown={() => setShowSettingsModal(false)}
+                      style={getFloatingWindowLayerStyle('recordMic')}
+                    >
+                      <div
+                        className="settings-modal record-mic-modal"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label="Mikrofon für Aufnahme wählen"
+                        style={getDraggableModalStyle('recordMic')}
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          activateFloatingWindow('recordMic');
+                        }}
+                      >
+                        <div
+                          className="settings-modal-head"
+                          onPointerDown={(e) => beginModalDrag('recordMic', e)}
+                        >
+                          <h2>Mikrofon für Aufnahme (Track {recordMicModalTrackId})</h2>
+                          <div className="settings-modal-window-controls">
+                            <button
+                              type="button"
+                              className="settings-modal-window-btn"
+                              onClick={() => minimizeFloatingWindow('recordMic')}
+                              aria-label="Minimieren"
+                              title="Minimieren"
+                            >
+                              <Minus size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-modal-window-btn"
+                              onClick={() => toggleFloatingWindowMaximize('recordMic')}
+                              aria-label={getFloatingWindowLayout('recordMic').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                              title={getFloatingWindowLayout('recordMic').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                            >
+                              {getFloatingWindowLayout('recordMic').maximized
+                                ? <Square size={12} strokeWidth={2} aria-hidden="true" />
+                                : <LayoutGrid size={14} strokeWidth={2} aria-hidden="true" />}
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-modal-close"
+                              onClick={() => setRecordMicModalTrackId(null)}
+                              aria-label="Schliessen"
+                              title="Schliessen"
+                            >
+                              <X size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                          </div>
+                        </div>
+                        <div className="settings-modal-body">
+                          <p className="settings-audio-hint">Wähle das Mikrofon, mit dem diese Spur aufgenommen werden soll.</p>
+                          {recordMicInputDevices.length === 0 ? (
+                            <p className="settings-audio-hint">Lade Eingabegeräte …</p>
+                          ) : (
+                            <ul className="record-mic-list">
+                              {recordMicInputDevices.map((d) => (
+                                <li key={d.id}>
+                                  <button
+                                    type="button"
+                                    className="record-mic-option"
+                                    onClick={() => setRecordArmWithMic(recordMicModalTrackId, d.id, d.name || d.id)}
+                                  >
+                                    {d.name || d.id}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-ghost"
+                            onClick={() => setRecordMicModalTrackId(null)}
+                          >
+                            Abbrechen
+                          </button>
+                        </div>
+                        {renderFloatingWindowResizeHandles('recordMic')}
+                      </div>
+                    </div>
+                  ) : null}
+                  {showSettingsModal && !isFloatingWindowMinimized('settings') ? (
+                    <div
+                      className="settings-modal-overlay floating-window-overlay"
+                      role="presentation"
+                      style={getFloatingWindowLayerStyle('settings')}
                     >
                       <div
                         className="settings-modal"
                         role="dialog"
                         aria-modal="true"
                         aria-label="Einstellungen"
-                        onPointerDown={(e) => e.stopPropagation()}
+                        style={getDraggableModalStyle('settings')}
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          activateFloatingWindow('settings');
+                        }}
                       >
-                        <div className="settings-modal-head">
+                        <div
+                          className="settings-modal-head"
+                          onPointerDown={(e) => beginModalDrag('settings', e)}
+                        >
                           <h2>Settings</h2>
-                          <button
-                            type="button"
-                            className="settings-modal-close"
-                            onClick={() => setShowSettingsModal(false)}
-                            aria-label="Schliessen"
-                          >
-                            <X size={14} strokeWidth={2} aria-hidden="true" />
-                          </button>
+                          <div className="settings-modal-window-controls">
+                            <button
+                              type="button"
+                              className="settings-modal-window-btn"
+                              onClick={() => minimizeFloatingWindow('settings')}
+                              aria-label="Minimieren"
+                              title="Minimieren"
+                            >
+                              <Minus size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-modal-window-btn"
+                              onClick={() => toggleFloatingWindowMaximize('settings')}
+                              aria-label={getFloatingWindowLayout('settings').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                              title={getFloatingWindowLayout('settings').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                            >
+                              {getFloatingWindowLayout('settings').maximized
+                                ? <Square size={12} strokeWidth={2} aria-hidden="true" />
+                                : <LayoutGrid size={14} strokeWidth={2} aria-hidden="true" />}
+                            </button>
+                            <button
+                              type="button"
+                              className="settings-modal-close"
+                              onClick={() => setShowSettingsModal(false)}
+                              aria-label="Schliessen"
+                              title="Schliessen"
+                            >
+                              <X size={14} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                          </div>
                         </div>
                         <div className="settings-modal-tabs">
-                          {['AUDIO', 'VST PLUGINS', 'GENERAL'].map((tab) => (
+                          {['AUDIO', 'VST PLUGINS', 'RECORD', 'GENERAL'].map((tab) => (
                             <button
                               key={tab}
                               type="button"
@@ -6441,7 +8451,7 @@ export default function StuuShell() {
                                       if (res?.ok) setAudioOutputCurrentId(id);
                                     });
                                   }}
-                                  title="z. B. interne Lautsprecher oder externe Soundkarte"
+                                  title="z. B. interne Lautsprecher, Bluetooth-Kopfhörer oder externe Soundkarte"
                                   aria-label="Audio-Ausgabe wählen"
                                   disabled={connection !== 'online' || !state?.nativeTransport}
                                 >
@@ -6452,9 +8462,14 @@ export default function StuuShell() {
                                         : '— Keine Geräte (Native offline) —'}
                                     </option>
                                   ) : (
-                                    audioOutputDevices.map((d) => (
-                                      <option key={d.id} value={d.id}>{d.name || d.id}</option>
-                                    ))
+                                    <>
+                                      <option value="" disabled>
+                                        — Bluetooth-Gerät wird angezeigt, wenn es mit dem Computer verbunden ist —
+                                      </option>
+                                      {audioOutputDevices.map((d) => (
+                                        <option key={d.id} value={d.id}>{d.name || d.id}</option>
+                                      ))}
+                                    </>
                                   )}
                                 </select>
                               </label>
@@ -6475,11 +8490,9 @@ export default function StuuShell() {
                                   onChange={(e) => {
                                     const id = e.target.value;
                                     if (!id) return;
-                                    socketRef.current?.emit('audio:set-input', { deviceId: id }, (res) => {
-                                      if (res?.ok) setAudioInputCurrentId(id);
-                                    });
+                                    setAudioInputDevice(id);
                                   }}
-                                  title="Quelle für Aufnahme (z. B. Mikrofon oder Line-In)"
+                                  title="Quelle für Aufnahme (z. B. Mikrofon, Bluetooth-Kopfhörer oder Line-In)"
                                   aria-label="Audio-Eingabe wählen"
                                   disabled={connection !== 'online' || !state?.nativeTransport}
                                 >
@@ -6490,14 +8503,19 @@ export default function StuuShell() {
                                         : '— Keine Geräte (Native offline) —'}
                                     </option>
                                   ) : (
-                                    audioInputDevices.map((d) => (
-                                      <option key={d.id} value={d.id}>{d.name || d.id}</option>
-                                    ))
+                                    <>
+                                      <option value="" disabled>
+                                        — Bluetooth-Mikrofon wird angezeigt, wenn es mit dem Computer verbunden ist —
+                                      </option>
+                                      {audioInputDevices.map((d) => (
+                                        <option key={d.id} value={d.id}>{d.name || d.id}</option>
+                                      ))}
+                                    </>
                                   )}
                                 </select>
                               </label>
                               <p className="settings-audio-hint">
-                                Wähle das Eingabegerät für Aufnahme (z. B. Mikrofon oder Line-In). Wird beim Record-Button der Spuren verwendet.
+                                Wähle das Eingabegerät für Aufnahme (z. B. Mikrofon, Bluetooth-Kopfhörer oder Line-In). Wird beim Record-Button der Spuren verwendet.
                               </p>
                               {(audioStatus && (audioStatus.sampleRate != null || audioStatus.outputChannels != null)) ? (
                                 <dl className="settings-audio-status">
@@ -6523,6 +8541,104 @@ export default function StuuShell() {
                                   </dd>
                                 </dl>
                               ) : null}
+                            </div>
+                          ) : settingsTab === 'RECORD' ? (
+                            <div className="settings-record-panel">
+                              <label className="settings-record-option">
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(state?.project?.record_auto_metronome)}
+                                  onChange={(e) => {
+                                    const v = e.target.checked;
+                                    setState((prev) => ({
+                                      ...prev,
+                                      project: { ...prev?.project, record_auto_metronome: v },
+                                    }));
+                                    emitMutation('project:update-view', { record_auto_metronome: v });
+                                  }}
+                                />
+                                <span>Metronom beim Record automatisch aktivieren</span>
+                              </label>
+                              <p className="settings-audio-hint">Wenn mindestens eine Spur auf Aufnahme steht und du Play drückst, wird das Metronom automatisch eingeschaltet.</p>
+                              <label className="settings-record-option">
+                                <input
+                                  type="checkbox"
+                                  checked={recordCountInEnabledPreference}
+                                  onChange={(e) => {
+                                    updateAppPreferences({ record_count_in_enabled: Boolean(e.target.checked) });
+                                  }}
+                                />
+                                <span>Einzählzeit vor Aufnahme aktivieren</span>
+                              </label>
+                              <label className="settings-record-option settings-record-count-in">
+                                <span>Einzählzeit (Beats vor Aufnahme)</span>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  max={10}
+                                  disabled={!recordCountInEnabledPreference}
+                                  value={Math.max(1, Math.min(10, Number(state?.project?.record_count_in_beats) || 4))}
+                                  onChange={(e) => {
+                                    const raw = Number(e.target.value);
+                                    const v = Number.isInteger(raw) && raw >= 1 && raw <= 10 ? raw : 4;
+                                    setState((prev) => ({
+                                      ...prev,
+                                      project: { ...prev?.project, record_count_in_beats: v },
+                                    }));
+                                    emitMutation('project:update-view', { record_count_in_beats: v });
+                                  }}
+                                />
+                              </label>
+                              <p className="settings-audio-hint">
+                                {recordCountInEnabledPreference
+                                  ? 'Anzahl Beats im Tempo des Projekts vor Start der Aufnahme (1–10). Die Ticks laufen in der Geschwindigkeit der BPM.'
+                                  : 'Einzählzeit ist deaktiviert. Aufnahme startet sofort; der zuletzt eingestellte Wert bleibt gespeichert.'}
+                              </p>
+                              <label className="settings-record-option">
+                                <input
+                                  type="checkbox"
+                                  checked={recordUseStandardMicPreference}
+                                  onChange={(e) => {
+                                    updateAppPreferences({ record_use_standard_mic: Boolean(e.target.checked) });
+                                  }}
+                                />
+                                <span>Standard-Mikrofon beim Record Arm verwenden</span>
+                              </label>
+                              <label className="audio-output-select-wrap">
+                                <span className="audio-output-label">Standard-Mikrofon (Audio-Eingabe)</span>
+                                <select
+                                  className="audio-output-select"
+                                  value={audioInputCurrentId}
+                                  onChange={(e) => {
+                                    const id = e.target.value;
+                                    if (!id) return;
+                                    setAudioInputDevice(id);
+                                  }}
+                                  title="Standard-Mikrofon für Record Arm"
+                                  aria-label="Standard-Mikrofon wählen"
+                                  disabled={!recordUseStandardMicPreference || connection !== 'online' || !state?.nativeTransport}
+                                >
+                                  {audioInputDevices.length === 0 ? (
+                                    <option value="">
+                                      {connection === 'online' && state?.nativeTransport
+                                        ? '— Keine Eingabegeräte —'
+                                        : '— Keine Geräte (Native offline) —'}
+                                    </option>
+                                  ) : (
+                                    <>
+                                      <option value="" disabled>
+                                        — Standard-Mikrofon auswählen —
+                                      </option>
+                                      {audioInputDevices.map((d) => (
+                                        <option key={`record_pref_${d.id}`} value={d.id}>{d.name || d.id}</option>
+                                      ))}
+                                    </>
+                                  )}
+                                </select>
+                              </label>
+                              <p className="settings-audio-hint">
+                                Wenn aktiviert, verwendet der <code>R</code>-Button am Track/Mixer direkt dieses Mikrofon. Wenn es nicht verfügbar ist, wird die Mikrofon-Auswahl geöffnet.
+                              </p>
                             </div>
                           ) : settingsTab === 'VST PLUGINS' ? (
                             <div className="settings-vst-panel">
@@ -6645,27 +8761,55 @@ export default function StuuShell() {
                             </div>
                           )}
                         </div>
+                        {renderFloatingWindowResizeHandles('settings')}
                       </div>
                     </div>
                   ) : null}
                   {importTrackRenamePrompt ? (
                     <div
-                      className="import-track-rename-modal-overlay"
+                      className="import-track-rename-modal-overlay floating-window-overlay"
                       role="presentation"
-                      onPointerDown={() => {
-                        resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
-                      }}
+                      style={getFloatingWindowLayerStyle('importTrackRename')}
                     >
                       <div
                         className="import-track-rename-modal"
                         role="dialog"
                         aria-modal="true"
                         aria-label={`Track ${importTrackRenamePrompt.trackId} Namen uebernehmen`}
-                        onPointerDown={(event) => event.stopPropagation()}
+                        style={getDraggableModalStyle('importTrackRename')}
+                        onPointerDown={(event) => {
+                          event.stopPropagation();
+                          activateFloatingWindow('importTrackRename');
+                        }}
                       >
-                        <div className="import-track-rename-modal-head">
+                        <div
+                          className="import-track-rename-modal-head"
+                          onPointerDown={(event) => beginModalDrag('importTrackRename', event)}
+                        >
                           <div className="import-track-rename-modal-head-title">
                             <h2>Namen uebernehmen?</h2>
+                            <div className="settings-modal-window-controls">
+                              <button
+                                type="button"
+                                className="settings-modal-window-btn"
+                                onClick={() => minimizeFloatingWindow('importTrackRename')}
+                                aria-label="Minimieren"
+                                title="Minimieren"
+                              >
+                                <Minus size={14} strokeWidth={2} aria-hidden="true" />
+                              </button>
+                              <button
+                                type="button"
+                                className="settings-modal-window-btn"
+                                onClick={() => toggleFloatingWindowMaximize('importTrackRename')}
+                                aria-label={getFloatingWindowLayout('importTrackRename').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                                title={getFloatingWindowLayout('importTrackRename').maximized ? 'Wiederherstellen' : 'Maximieren'}
+                              >
+                                {getFloatingWindowLayout('importTrackRename').maximized
+                                  ? <Square size={12} strokeWidth={2} aria-hidden="true" />
+                                  : <LayoutGrid size={14} strokeWidth={2} aria-hidden="true" />}
+                              </button>
+                            </div>
                             <button
                               type="button"
                               className="import-track-rename-modal-close"
@@ -6745,6 +8889,7 @@ export default function StuuShell() {
                             Ja
                           </button>
                         </div>
+                        {renderFloatingWindowResizeHandles('importTrackRename')}
                       </div>
                     </div>
                   ) : null}
@@ -6794,6 +8939,7 @@ export default function StuuShell() {
                             }}
                             onDoubleClick={() => {
                               setTrackChainModalTrackId(track.track_id);
+                              restoreFloatingWindow('trackChain');
                             }}
                             role="button"
                             tabIndex={0}
@@ -6843,7 +8989,11 @@ export default function StuuShell() {
                                 className={`record-toggle ${trackMix.record_armed ? 'active' : ''}`}
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  setRecordArm(track.track_id, !trackMix.record_armed);
+                                  if (trackMix.record_armed) {
+                                    setRecordArm(track.track_id, false);
+                                  } else {
+                                    openRecordArmMicSelection(track.track_id);
+                                  }
                                 }}
                                 title="Record Arm"
                                 aria-label={`Track ${track.track_id} Record Arm`}
@@ -6851,6 +9001,9 @@ export default function StuuShell() {
                                 R
                               </button>
                             </div>
+                            {(trackMix.record_armed && (trackMix.record_input_device_name || trackMix.record_input_device_id)) ? (
+                              <div className="arrangement-track-mic-label mix-strip-mic-label">Mikro: {trackMix.record_input_device_name || trackMix.record_input_device_id}</div>
+                            ) : null}
 
                             <label className="mix-strip-pan">
                               <span>PAN</span>
@@ -6936,7 +9089,13 @@ export default function StuuShell() {
                             <button
                               type="button"
                               className={`record-toggle ${mixSelectedTrackMix.record_armed ? 'active' : ''}`}
-                              onClick={() => setRecordArm(mixSelectedTrack.track_id, !mixSelectedTrackMix.record_armed)}
+                              onClick={() => {
+                                if (mixSelectedTrackMix.record_armed) {
+                                  setRecordArm(mixSelectedTrack.track_id, false);
+                                } else {
+                                  openRecordArmMicSelection(mixSelectedTrack.track_id);
+                                }
+                              }}
                             >
                               R
                             </button>
@@ -6949,6 +9108,9 @@ export default function StuuShell() {
                               FX
                             </button>
                           </div>
+                          {(mixSelectedTrackMix.record_armed && (mixSelectedTrackMix.record_input_device_name || mixSelectedTrackMix.record_input_device_id)) ? (
+                            <div className="arrangement-track-mic-label mix-inspector-mic-label">Mikro: {mixSelectedTrackMix.record_input_device_name || mixSelectedTrackMix.record_input_device_id}</div>
+                          ) : null}
 
                           <label className="mix-channel-field">
                             VOL
@@ -7110,6 +9272,7 @@ export default function StuuShell() {
                             className="mix-channel-open-nodes"
                             onClick={() => {
                               setTrackChainModalTrackId(mixSelectedTrack.track_id);
+                              restoreFloatingWindow('trackChain');
                             }}
                           >
                             Node Modal
@@ -7283,31 +9446,341 @@ export default function StuuShell() {
               </div>
 
               {inspectorNode.type === 'vst_instrument' ? (
-                <div className="vst-param-list">
-                  {inspectorNodeParameters.length > 0 ? (
-                    inspectorNodeParameters.map((parameter) => {
-                      const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
-                      return (
-                        <label key={`${inspectorNode.id}_${parameter.id}`} className="vst-param-row">
-                          <div className="vst-param-head">
-                            <span>{parameter.name}</span>
-                            <span>{normalizedValue.toFixed(2)}</span>
+                inspectorTracktionEqUi ? (
+                  <div className="inspector-plugin-mode-shell">
+                    <div className="inspector-plugin-mode-tabs" role="tablist" aria-label="EQ Inspector Modus">
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={inspectorEqViewMode === 'easy'}
+                        className={inspectorEqViewMode === 'easy' ? 'active' : ''}
+                        onClick={() => setInspectorEqViewMode('easy')}
+                        disabled={!inspectorTracktionEqUi.gainParams}
+                      >
+                        Easy
+                      </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={inspectorEqViewMode === 'pro'}
+                        className={inspectorEqViewMode === 'pro' ? 'active' : ''}
+                        onClick={() => setInspectorEqViewMode('pro')}
+                      >
+                        Pro
+                      </button>
+                    </div>
+
+                    {inspectorEqViewMode === 'easy' && inspectorTracktionEqUi.gainParams ? (
+                      <div className="inspector-eq-easy">
+                        <p className="inspector-eq-hint">
+                          Schnellstart fuer den Tracktion EQ: Preset klicken, dann mit 3 Reglern nach Gehoer anpassen.
+                        </p>
+
+                        {inspectorTracktionEqUi.curve ? (
+                          <div className="inspector-eq-mini-curve" aria-label="EQ Verlauf Vorschau">
+                            <div className="inspector-eq-mini-curve-head">
+                              <span>{`EQ Verlauf + Analyzer (${inspectorTracktionEqAnalyzerStatusText})`}</span>
+                              <div className="inspector-eq-mini-curve-head-actions">
+                                <span className={inspectorTracktionEqCurveReadout ? 'is-active' : ''}>
+                                  {inspectorTracktionEqCurveReadout
+                                    ? `${inspectorEqPinnedReadout ? 'PIN · ' : ''}${inspectorTracktionEqCurveReadout.label ? `${inspectorTracktionEqCurveReadout.label}: ` : ''}${formatTracktionEqInspectorReadoutFreq(inspectorTracktionEqCurveReadout.freqHz)} · ${formatTracktionEqInspectorReadoutDb(inspectorTracktionEqCurveReadout.gainDb)}`
+                                    : 'ca. ±18 dB'}
+                                </span>
+                                <button
+                                  type="button"
+                                  className={`inspector-eq-mini-curve-pin ${inspectorEqAnalyzerFrozen ? 'active' : ''}`}
+                                  onClick={toggleInspectorEqAnalyzerFreeze}
+                                  aria-pressed={inspectorEqAnalyzerFrozen}
+                                  title={inspectorEqAnalyzerFrozen ? 'Analyzer weiterlaufen lassen' : 'Analyzer einfrieren'}
+                                >
+                                  {inspectorEqAnalyzerFrozen ? 'Frozen' : 'Freeze'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`inspector-eq-mini-curve-pin ${inspectorEqPinnedReadout ? 'active' : ''}`}
+                                  onClick={toggleInspectorTracktionEqReadoutPin}
+                                  aria-pressed={Boolean(inspectorEqPinnedReadout)}
+                                  disabled={!inspectorTracktionEqCurveReadout && !inspectorEqPinnedReadout}
+                                  title={inspectorEqPinnedReadout ? 'Readout loesen' : 'Aktuelles Readout pinnen'}
+                                >
+                                  {inspectorEqPinnedReadout ? 'Unpin' : 'Pin'}
+                                </button>
+                              </div>
+                            </div>
+                            <svg
+                              className="inspector-eq-mini-curve-svg"
+                              viewBox={`0 0 ${inspectorTracktionEqUi.curve.width} ${inspectorTracktionEqUi.curve.height}`}
+                              preserveAspectRatio="none"
+                              role="img"
+                              aria-hidden="true"
+                              onPointerMove={handleInspectorTracktionEqCurvePointerMove}
+                              onPointerLeave={clearInspectorTracktionEqCurveHover}
+                            >
+                              {inspectorTracktionEqUi.curve.dbLines.map((line) => (
+                                <line
+                                  key={`${inspectorNode.id}_db_${line.db}`}
+                                  x1="0"
+                                  x2={inspectorTracktionEqUi.curve.width}
+                                  y1={line.y}
+                                  y2={line.y}
+                                  className={line.db === 0 ? 'eq-zero' : 'eq-grid'}
+                                />
+                              ))}
+
+                              {inspectorTracktionEqUi.curve.ticks.map((tick) => (
+                                <line
+                                  key={`${inspectorNode.id}_tick_${tick.freqHz}`}
+                                  x1={tick.x}
+                                  x2={tick.x}
+                                  y1="0"
+                                  y2={inspectorTracktionEqUi.curve.height}
+                                  className="eq-grid"
+                                />
+                              ))}
+
+                              {inspectorTracktionEqAnalyzerOverlay?.pre ? (
+                                <path
+                                  d={inspectorTracktionEqAnalyzerOverlay.pre.fillPath}
+                                  className={`eq-analyzer-fill-pre ${inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'is-mirrored' : ''}`}
+                                />
+                              ) : null}
+                              {inspectorTracktionEqAnalyzerOverlay?.post ? (
+                                <path
+                                  d={inspectorTracktionEqAnalyzerOverlay.post.fillPath}
+                                  className="eq-analyzer-fill-post"
+                                />
+                              ) : null}
+                              {inspectorTracktionEqAnalyzerOverlay?.pre ? (
+                                <path
+                                  d={inspectorTracktionEqAnalyzerOverlay.pre.linePath}
+                                  className={`eq-analyzer-line-pre ${inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'is-mirrored' : ''}`}
+                                />
+                              ) : null}
+                              {inspectorTracktionEqAnalyzerOverlay?.post ? (
+                                <path
+                                  d={inspectorTracktionEqAnalyzerOverlay.post.linePath}
+                                  className="eq-analyzer-line-post"
+                                />
+                              ) : null}
+
+                              <path d={inspectorTracktionEqUi.curve.fillPath} className="eq-fill" />
+                              <path d={inspectorTracktionEqUi.curve.strokePath} className="eq-line" />
+
+                              {inspectorTracktionEqUi.curve.nodePoints.map((point) => (
+                                <g
+                                  key={`${inspectorNode.id}_node_${point.id}`}
+                                  className={`eq-node ${inspectorTracktionEqMiniCurveHighlightBandId === point.id ? 'is-selected' : ''}`}
+                                  onClick={() => selectInspectorTracktionEqBand(point.id)}
+                                >
+                                  <circle
+                                    cx={point.x}
+                                    cy={point.y}
+                                    r={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '6.3' : '4.5'}
+                                    fill={point.color}
+                                    fillOpacity={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '0.26' : '0.18'}
+                                  />
+                                  <circle
+                                    cx={point.x}
+                                    cy={point.y}
+                                    r={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '3.2' : '2.6'}
+                                    fill={point.color}
+                                    stroke="rgba(255,255,255,0.82)"
+                                    strokeWidth={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '1.1' : '0.8'}
+                                  />
+                                </g>
+                              ))}
+                            </svg>
+                            {!inspectorEqAnalyzerAvailable ? (
+                              <p className="inspector-eq-analyzer-note">Analyzer nur mit laufender Native-Engine verfügbar.</p>
+                            ) : null}
+
+                            <div className="inspector-eq-mini-curve-ticks" aria-hidden="true">
+                              {inspectorTracktionEqUi.curve.ticks.filter((tick) => (
+                                tick.freqHz === 50
+                                || tick.freqHz === 200
+                                || tick.freqHz === 1000
+                                || tick.freqHz === 5000
+                                || tick.freqHz === 10000
+                              )).map((tick) => (
+                                <span key={`${inspectorNode.id}_tick_label_${tick.freqHz}`}>{tick.label}</span>
+                              ))}
+                            </div>
+
+                            <div className="inspector-eq-mini-band-buttons" role="group" aria-label="EQ Baender">
+                              {inspectorTracktionEqUi.curve.nodePoints.map((point) => (
+                                <button
+                                  key={`${inspectorNode.id}_band_btn_${point.id}`}
+                                  type="button"
+                                  className={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? 'active' : ''}
+                                  onClick={() => selectInspectorTracktionEqBand(point.id)}
+                                  title={`${point.label}: ${formatTracktionEqInspectorReadoutFreq(point.freqHz)} · ${formatTracktionEqInspectorReadoutDb(point.gainDb)}`}
+                                >
+                                  <span className="dot" style={{ backgroundColor: point.color }} aria-hidden="true" />
+                                  <span>{point.label}</span>
+                                </button>
+                              ))}
+                            </div>
                           </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={1}
-                            step={0.01}
-                            value={normalizedValue}
-                            onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
-                          />
-                        </label>
-                      );
-                    })
-                  ) : (
-                    <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
-                  )}
-                </div>
+                        ) : null}
+
+                        <div className="inspector-eq-preset-grid" role="group" aria-label="EQ Easy Presets">
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('clean_up')}>Clean Up</button>
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('vocal_clarity')}>Vocal Klarheit</button>
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('bass_tight')}>Bass Tight</button>
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('air_brilliance')}>Air / Brillanz</button>
+                        </div>
+
+                        <button
+                          type="button"
+                          className="inspector-eq-reset-button"
+                          disabled={Boolean(inspectorTracktionEqUi?.isEffectivelyFlat)}
+                          onClick={() => applyInspectorTracktionEqPreset('flat')}
+                          title={
+                            inspectorTracktionEqUi?.isEffectivelyFlat
+                              ? 'EQ ist bereits praktisch flat'
+                              : 'Alle EQ-Gains auf 0 dB setzen'
+                          }
+                        >
+                          Reset EQ (Flat)
+                        </button>
+
+                        {[
+                          { id: 'mud', label: 'Weniger dumpf', value: inspectorTracktionEqUi.easyMacros.mud },
+                          { id: 'presence', label: 'Mehr Praesenz', value: inspectorTracktionEqUi.easyMacros.presence },
+                          { id: 'softness', label: 'Weicher', value: inspectorTracktionEqUi.easyMacros.softness },
+                        ].map((macro) => (
+                          <label key={`${inspectorNode.id}_${macro.id}`} className="inspector-eq-macro-row">
+                            <div className="inspector-eq-macro-row-head">
+                              <span>{macro.label}</span>
+                              <span>{formatInspectorEqMacroPercent(macro.value)}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={clamp(Number(macro.value) || 0, 0, 1)}
+                              onChange={(event) => setInspectorTracktionEqEasyMacro(macro.id, Number(event.target.value))}
+                            />
+                          </label>
+                        ))}
+
+                        <p className="muted inspector-eq-footnote">
+                          Easy im Inspector arbeitet mit schnellen Gain-Makros. Fuer Frequenz/Q direkt auf Pro wechseln oder das Plugin-Fenster oeffnen.
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        {inspectorEqViewMode === 'easy' && !inspectorTracktionEqUi.gainParams ? (
+                          <p className="muted inspector-eq-footnote">
+                            Easy-Mapping fuer diesen EQ wurde nicht erkannt. Pro zeigt alle Parameter.
+                          </p>
+                        ) : null}
+                        {inspectorEqViewMode === 'pro' && inspectorTracktionEqSelectedBand ? (
+                          <div className="inspector-eq-pro-focus">
+                            <strong>{`Band Fokus: ${inspectorTracktionEqSelectedBand.label}`}</strong>
+                            <span>
+                              {`${formatTracktionEqInspectorReadoutFreq(inspectorTracktionEqSelectedBand.freqHz)} · ${formatTracktionEqInspectorReadoutDb(inspectorTracktionEqSelectedBand.gainDb)} · ${formatTracktionEqInspectorReadoutQ(inspectorTracktionEqSelectedBand.qValue)}`}
+                            </span>
+                            <small>Freq / Gain / Q dieses Bands sind unten hervorgehoben.</small>
+                          </div>
+                        ) : null}
+                        <div className="vst-param-list">
+                          {inspectorNodeParameters.length > 0 ? (
+                            inspectorNodeParameters.map((parameter) => {
+                              const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
+                              const linkedBand = inspectorEqViewMode === 'pro'
+                                ? (inspectorTracktionEqBandByParamId.get(parameter.id) || null)
+                                : null;
+                              const isLinkedBandParam = Boolean(linkedBand);
+                              const isSelectedBandParam = inspectorEqViewMode === 'pro'
+                                && inspectorTracktionEqSelectedBandParamIdSet.has(parameter.id);
+                              return (
+                                <label
+                                  key={`${inspectorNode.id}_${parameter.id}`}
+                                  className={`vst-param-row ${isLinkedBandParam ? 'band-linked-param' : ''} ${isSelectedBandParam ? 'selected-band-param' : ''}`}
+                                  ref={(element) => registerInspectorEqProParamRowRef(parameter.id, element)}
+                                  onClick={() => {
+                                    if (linkedBand?.id) {
+                                      selectInspectorTracktionEqBand(linkedBand.id);
+                                    }
+                                  }}
+                                  onPointerEnter={() => {
+                                    if (linkedBand) {
+                                      previewInspectorTracktionEqBandHover(linkedBand);
+                                    }
+                                  }}
+                                  onPointerLeave={() => {
+                                    if (linkedBand) {
+                                      clearInspectorTracktionEqCurveHover();
+                                    }
+                                  }}
+                                  onFocus={() => {
+                                    if (linkedBand) {
+                                      previewInspectorTracktionEqBandHover(linkedBand);
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    if (linkedBand) {
+                                      clearInspectorTracktionEqCurveHover();
+                                    }
+                                  }}
+                                  title={linkedBand?.label ? `Band ${linkedBand.label}` : undefined}
+                                >
+                                  <div className="vst-param-head">
+                                    <span className="vst-param-head-name">
+                                      <span>{parameter.name}</span>
+                                      {linkedBand ? (
+                                        <em className={`vst-param-band-chip ${isSelectedBandParam ? 'active' : ''}`}>{linkedBand.label}</em>
+                                      ) : null}
+                                    </span>
+                                    <span>{normalizedValue.toFixed(2)}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={1}
+                                    step={0.01}
+                                    value={normalizedValue}
+                                    onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
+                                  />
+                                </label>
+                              );
+                            })
+                          ) : (
+                            <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className="vst-param-list">
+                    {inspectorNodeParameters.length > 0 ? (
+                      inspectorNodeParameters.map((parameter) => {
+                        const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
+                        return (
+                          <label key={`${inspectorNode.id}_${parameter.id}`} className="vst-param-row">
+                            <div className="vst-param-head">
+                              <span>{parameter.name}</span>
+                              <span>{normalizedValue.toFixed(2)}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={normalizedValue}
+                              onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
+                            />
+                          </label>
+                        );
+                      })
+                    ) : (
+                      <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
+                    )}
+                  </div>
+                )
               ) : (
                 <pre>{JSON.stringify(inspectorNode, null, 2)}</pre>
               )}
@@ -7320,6 +9793,40 @@ export default function StuuShell() {
         </aside>
       </div>
     </div>
+    {(() => {
+      const minimizedWindowIds = ['trackChain', 'settings', 'recordMic', 'importTrackRename']
+        .filter((windowId) => isFloatingWindowOpen(windowId) && isFloatingWindowMinimized(windowId))
+        .sort((left, right) => getFloatingWindowLayout(left).zIndex - getFloatingWindowLayout(right).zIndex);
+      if (minimizedWindowIds.length === 0) {
+        return null;
+      }
+      return createPortal(
+        <div className="floating-window-dock" role="toolbar" aria-label="Minimierte Fenster">
+          {minimizedWindowIds.map((windowId) => (
+            <div key={`dock_${windowId}`} className="floating-window-dock-item">
+              <button
+                type="button"
+                className="floating-window-dock-item-main"
+                onClick={() => restoreFloatingWindow(windowId)}
+                title={`${getFloatingWindowTitle(windowId)} wiederherstellen`}
+              >
+                <span className="floating-window-dock-item-name">{getFloatingWindowTitle(windowId)}</span>
+              </button>
+              <button
+                type="button"
+                className="floating-window-dock-item-close"
+                onClick={() => closeFloatingWindow(windowId)}
+                aria-label={`${getFloatingWindowTitle(windowId)} schließen`}
+                title="Schließen"
+              >
+                <X size={12} strokeWidth={2} aria-hidden="true" />
+              </button>
+            </div>
+          ))}
+        </div>,
+        document.body,
+      );
+    })()}
     {openTrackMenuId != null && trackAddMenuAnchor != null && (() => {
       const track = arrangementTrackMap.get(openTrackMenuId);
       if (!track) return null;

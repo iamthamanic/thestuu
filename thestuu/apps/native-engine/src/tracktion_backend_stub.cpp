@@ -62,12 +62,27 @@ bool importClipFile(const ClipImportRequest& request, ClipImportResult& result, 
   return false;
 }
 
+bool getEditAudioClips(std::vector<EditClipInfo>& out, std::string& error) {
+  (void)out;
+  error = "edit:get-audio-clips requires STUU_ENABLE_TRACKTION=ON";
+  return false;
+}
+bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::string& error) {
+  return getEditAudioClips(out, error);
+}
+
+bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
+  out = {};
+  return false;
+}
+
 bool getTransportSnapshot(TransportSnapshot& out) {
   (void)out;
   return false;
 }
 
 void transportPlay() {}
+void transportRecord() {}
 void transportPause() {}
 void transportStop() {}
 void transportSeek(double positionBeats) { (void)positionBeats; }

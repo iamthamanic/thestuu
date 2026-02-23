@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { constants as fsConstants, createReadStream, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { format as formatLogArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import decode from 'audio-decode';
@@ -14,6 +15,7 @@ const engineHost = process.env.ENGINE_HOST || '127.0.0.1';
 const stuuHome = process.env.STUU_HOME || path.join(os.homedir(), '.thestuu');
 const projectsDir = path.join(stuuHome, 'projects');
 const defaultProjectPath = path.join(projectsDir, 'welcome.stu');
+const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
 const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
 
@@ -54,13 +56,142 @@ const DEFAULT_IMPORTED_CLIP_LENGTH = 8;
 const MAX_WAVEFORM_PEAKS = 2048;
 const UPLOAD_WAVEFORM_SAMPLES = 1024;
 const PROJECT_HISTORY_LIMIT = 128;
+const DEFAULT_APP_PREFERENCES = Object.freeze({
+  record_count_in_enabled: true,
+  record_use_standard_mic: false,
+});
 
 const mediaDir = path.join(stuuHome, 'media');
 
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
+const ENGINE_LOG_BUFFER_LIMIT = 600;
+
+const engineLogBuffer = [];
+let engineLogSeq = 0;
+let engineLogIo = null;
+let consoleLogMirrorInstalled = false;
+
+function normalizeEngineLogLevel(level) {
+  if (level === 'error' || level === 'warn' || level === 'info') {
+    return level;
+  }
+  return 'log';
+}
+
+function pushEngineLogLine(text, level = 'log') {
+  const message = String(text ?? '').replace(/\r/g, '');
+  if (!message) {
+    return;
+  }
+  const lines = message.split('\n').filter(Boolean);
+  if (lines.length === 0) {
+    return;
+  }
+  const normalizedLevel = normalizeEngineLogLevel(level);
+  const timestamp = Date.now();
+  for (const line of lines) {
+    const entry = {
+      id: `log_${timestamp}_${engineLogSeq++}`,
+      ts: timestamp,
+      level: normalizedLevel,
+      text: line,
+    };
+    engineLogBuffer.push(entry);
+    if (engineLogBuffer.length > ENGINE_LOG_BUFFER_LIMIT) {
+      engineLogBuffer.splice(0, engineLogBuffer.length - ENGINE_LOG_BUFFER_LIMIT);
+    }
+    if (engineLogIo) {
+      engineLogIo.emit('engine:log', entry);
+    }
+  }
+}
+
+function parseNativeStructuredLogLine(line) {
+  if (!line || line[0] !== '{') {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(line);
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+    const message = typeof parsed.message === 'string' ? parsed.message.trim() : '';
+    if (!message) {
+      return null;
+    }
+    const type = typeof parsed.type === 'string' ? parsed.type.trim().toLowerCase() : 'info';
+    return {
+      level: type === 'error' ? 'error' : type === 'warn' || type === 'warning' ? 'warn' : 'info',
+      text: `[thestuu-native:${type || 'info'}] ${message}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function attachChildProcessLogStream(stream, level = 'info') {
+  if (!stream) {
+    return;
+  }
+  let pending = '';
+  stream.setEncoding('utf8');
+  const flushPendingLine = (rawLine) => {
+    const line = String(rawLine ?? '').replace(/\r/g, '').trimEnd();
+    if (!line) {
+      return;
+    }
+    const structured = parseNativeStructuredLogLine(line);
+    if (structured) {
+      pushEngineLogLine(structured.text, structured.level);
+      return;
+    }
+    pushEngineLogLine(line, level);
+  };
+  stream.on('data', (chunk) => {
+    pending += chunk;
+    let nl = pending.indexOf('\n');
+    while (nl >= 0) {
+      const line = pending.slice(0, nl);
+      pending = pending.slice(nl + 1);
+      flushPendingLine(line);
+      nl = pending.indexOf('\n');
+    }
+  });
+  stream.on('end', () => {
+    if (pending) {
+      flushPendingLine(pending);
+      pending = '';
+    }
+  });
+}
+
+function installConsoleLogMirror() {
+  if (consoleLogMirrorInstalled) {
+    return;
+  }
+  consoleLogMirrorInstalled = true;
+  const originals = {
+    log: console.log.bind(console),
+    info: console.info.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+  for (const level of ['log', 'info', 'warn', 'error']) {
+    console[level] = (...args) => {
+      originals[level](...args);
+      try {
+        pushEngineLogLine(formatLogArgs(...args), level);
+      } catch {
+        // ignore log-mirror errors
+      }
+    };
+  }
+}
 
 const state = {
   playing: false,
+  recording: false,
+  appPreferences: { ...DEFAULT_APP_PREFERENCES },
   project: {
     ...createDefaultProject('Welcome to TheStuu'),
     metronome_enabled: DEFAULT_METRONOME_ENABLED,
@@ -118,6 +249,7 @@ let nativeTransportActive = false;
 /** True only when native is connected and reports Tracktion backend (not stub). UI "online" = this. */
 let nativeTracktionActive = false;
 let cachedNativePluginsByUid = new Map();
+let latestEqAnalyzerFrame = null;
 
 function isObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -125,6 +257,47 @@ function isObject(value) {
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '';
+}
+
+function toFiniteNumber(value, fallback = null) {
+  if (typeof value === 'bigint') {
+    const converted = Number(value);
+    return Number.isFinite(converted) ? converted : fallback;
+  }
+  const converted = Number(value);
+  return Number.isFinite(converted) ? converted : fallback;
+}
+
+function normalizeEqAnalyzerFrameForSocket(frame) {
+  if (!isObject(frame)) {
+    return null;
+  }
+
+  const normalizeNumberArray = (values) => (
+    Array.isArray(values)
+      ? values.map((value) => toFiniteNumber(value, NaN)).filter((value) => Number.isFinite(value))
+      : []
+  );
+
+  const freqsHz = normalizeNumberArray(frame.freqsHz);
+  const preDb = normalizeNumberArray(frame.preDb);
+  const postDb = normalizeNumberArray(frame.postDb);
+  const count = Math.min(freqsHz.length, preDb.length, postDb.length);
+
+  return {
+    available: frame.available !== false,
+    preMirrorsPost: Boolean(frame.preMirrorsPost),
+    scope: isNonEmptyString(frame.scope) ? frame.scope.trim() : 'master',
+    channels: isNonEmptyString(frame.channels) ? frame.channels.trim() : 'mono',
+    sampleRate: toFiniteNumber(frame.sampleRate, 0),
+    fftSize: Math.max(0, Math.round(toFiniteNumber(frame.fftSize, 0))),
+    minDb: toFiniteNumber(frame.minDb, -96),
+    maxDb: toFiniteNumber(frame.maxDb, 6),
+    timestamp: toFiniteNumber(frame.timestamp, Date.now()),
+    freqsHz: freqsHz.slice(0, count),
+    preDb: preDb.slice(0, count),
+    postDb: postDb.slice(0, count),
+  };
 }
 
 function getFileExtension(filename) {
@@ -321,6 +494,13 @@ function ensureProjectArrays() {
   if (typeof state.project.metronome_enabled !== 'boolean') {
     state.project.metronome_enabled = DEFAULT_METRONOME_ENABLED;
   }
+  if (typeof state.project.record_auto_metronome !== 'boolean') {
+    state.project.record_auto_metronome = false;
+  }
+  const countIn = Number(state.project.record_count_in_beats);
+  if (!Number.isInteger(countIn) || countIn < 1 || countIn > 10) {
+    state.project.record_count_in_beats = 4;
+  }
 }
 
 function normalizeBool(value) {
@@ -354,6 +534,49 @@ function parseOptionalBool(value) {
     }
   }
   return null;
+}
+
+function normalizeAppPreferences(value) {
+  const source = isObject(value) ? value : {};
+  const recordCountInEnabled = parseOptionalBool(source.record_count_in_enabled ?? source.recordCountInEnabled);
+  const recordUseStandardMic = parseOptionalBool(source.record_use_standard_mic ?? source.recordUseStandardMic);
+  return {
+    record_count_in_enabled: typeof recordCountInEnabled === 'boolean'
+      ? recordCountInEnabled
+      : DEFAULT_APP_PREFERENCES.record_count_in_enabled,
+    record_use_standard_mic: typeof recordUseStandardMic === 'boolean'
+      ? recordUseStandardMic
+      : DEFAULT_APP_PREFERENCES.record_use_standard_mic,
+  };
+}
+
+function normalizeAppPreferencesPatch(payload = {}) {
+  const patch = {};
+  let hasAny = false;
+
+  const hasRecordCountInEnabled = Object.prototype.hasOwnProperty.call(payload, 'record_count_in_enabled')
+    || Object.prototype.hasOwnProperty.call(payload, 'recordCountInEnabled');
+  if (hasRecordCountInEnabled) {
+    patch.record_count_in_enabled = normalizeBool(payload.record_count_in_enabled ?? payload.recordCountInEnabled);
+    hasAny = true;
+  }
+
+  const hasRecordUseStandardMic = Object.prototype.hasOwnProperty.call(payload, 'record_use_standard_mic')
+    || Object.prototype.hasOwnProperty.call(payload, 'recordUseStandardMic');
+  if (hasRecordUseStandardMic) {
+    patch.record_use_standard_mic = normalizeBool(payload.record_use_standard_mic ?? payload.recordUseStandardMic);
+    hasAny = true;
+  }
+
+  return { hasAny, patch };
+}
+
+async function saveAppPreferences(preferences = state.appPreferences) {
+  const normalized = normalizeAppPreferences(preferences);
+  await fs.mkdir(stuuHome, { recursive: true });
+  await fs.writeFile(appPreferencesPath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+  state.appPreferences = normalized;
+  return normalized;
 }
 
 function normalizePluginKind(value, fallbackIsInstrument = null) {
@@ -454,6 +677,12 @@ function getOrCreateMixerEntry(trackId) {
     entry.mute = normalizeBool(entry.mute);
     entry.solo = normalizeBool(entry.solo);
     entry.record_armed = normalizeBool(entry.record_armed);
+    if (entry.record_input_device_id !== undefined && entry.record_input_device_id !== null && typeof entry.record_input_device_id !== 'string') {
+      entry.record_input_device_id = null;
+    }
+    if (entry.record_input_device_name !== undefined && entry.record_input_device_name !== null && typeof entry.record_input_device_name !== 'string') {
+      entry.record_input_device_name = null;
+    }
   }
   return entry;
 }
@@ -479,6 +708,8 @@ function createDefaultMixerEntry(trackId) {
     mute: false,
     solo: false,
     record_armed: false,
+    record_input_device_id: null,
+    record_input_device_name: null,
   };
 }
 
@@ -663,6 +894,8 @@ function reindexTracksRemovingIds(removeTrackIds) {
       mute: normalizeBool(existing.mute),
       solo: normalizeBool(existing.solo),
       record_armed: normalizeBool(existing.record_armed),
+      record_input_device_id: typeof existing.record_input_device_id === 'string' ? existing.record_input_device_id : null,
+      record_input_device_name: typeof existing.record_input_device_name === 'string' ? existing.record_input_device_name : null,
     };
   });
 
@@ -741,6 +974,8 @@ function reorderTrackInPlaylist(trackId, toIndex) {
       mute: normalizeBool(existing.mute),
       solo: normalizeBool(existing.solo),
       record_armed: normalizeBool(existing.record_armed),
+      record_input_device_id: typeof existing.record_input_device_id === 'string' ? existing.record_input_device_id : null,
+      record_input_device_name: typeof existing.record_input_device_name === 'string' ? existing.record_input_device_name : null,
     };
   });
 
@@ -862,6 +1097,9 @@ function applyTransportSnapshot(snapshot = {}, options = {}) {
   if (allowBpmFromSnapshot && snapshot.bpm !== undefined) {
     state.project.bpm = normalizeTransportBpm(snapshot.bpm);
   }
+  if (snapshot.recording !== undefined) {
+    state.recording = Boolean(snapshot.recording);
+  }
 }
 
 function emitTransport(timestamp = Date.now()) {
@@ -872,6 +1110,7 @@ function emitTransport(timestamp = Date.now()) {
   const transport = state.transport;
   io.emit('engine:transport', {
     playing: state.playing,
+    recording: state.recording,
     bpm: normalizeTransportBpm(state.project.bpm),
     beatsPerBar: BEATS_PER_BAR,
     ...transport,
@@ -907,6 +1146,11 @@ function resetTransportClock() {
 
 let lastTickLogMs = 0;
 let tickCountAfterPlay = 0;
+let liveRecordMergeIntervalId = null;
+let liveRecordStartBeats = null;
+const LIVE_RECORD_MERGE_MS = 800;
+/** Placeholder source_path for the clip shown while recording (before native exposes the real clip). */
+const LIVE_RECORDING_SOURCE_PATH = '__live_recording__';
 let nativeTickEstimator = {
   hasLast: false,
   lastMs: 0,
@@ -916,11 +1160,42 @@ function handleNativeTransportEvent(eventName, payload = {}) {
   if (eventName !== 'transport.tick' && eventName !== 'transport.state') {
     return;
   }
+  if (isObject(payload.analyzer)) {
+    const normalizedAnalyzer = normalizeEqAnalyzerFrameForSocket(payload.analyzer);
+    if (normalizedAnalyzer) {
+      latestEqAnalyzerFrame = normalizedAnalyzer;
+      io.emit('engine:analyzer', latestEqAnalyzerFrame);
+    }
+  }
   if (tickCountAfterPlay > 0 && tickCountAfterPlay <= 8) {
     console.log(`[thestuu-engine] tick #${tickCountAfterPlay}: playing=${payload.playing}, positionBeats=${payload.positionBeats}`);
     tickCountAfterPlay++;
   }
   applyTransportSnapshot(payload);
+  // Live recording: poll native edit so waveform appears and grows during record
+  const recording = Boolean(payload.recording);
+  const playing = Boolean(payload.playing);
+  if (playing && recording) {
+    if (liveRecordMergeIntervalId == null) {
+      liveRecordStartBeats = Number.isFinite(payload.positionBeats) ? payload.positionBeats : (state.transport?.positionBeats ?? 0);
+      mergeNativeClipsIntoPlaylist(); // show live clip immediately, then grow
+      liveRecordMergeIntervalId = setInterval(() => {
+        if (!nativeTransportActive) {
+          if (liveRecordMergeIntervalId != null) clearInterval(liveRecordMergeIntervalId);
+          liveRecordMergeIntervalId = null;
+          liveRecordStartBeats = null;
+          return;
+        }
+        mergeNativeClipsIntoPlaylist();
+      }, LIVE_RECORD_MERGE_MS);
+    }
+  } else {
+    if (liveRecordMergeIntervalId != null) {
+      clearInterval(liveRecordMergeIntervalId);
+      liveRecordMergeIntervalId = null;
+    }
+    liveRecordStartBeats = null;
+  }
   const now = Date.now();
   const payloadBeats = Number(payload.positionBeats);
   const payloadBpm = Number(payload.bpm);
@@ -1487,8 +1762,12 @@ async function syncPlaylistClipsToNative() {
       const fade_in = Number.isFinite(fadeIn) && fadeIn >= 0 ? fadeIn : 0;
       const fade_out = Number.isFinite(fadeOut) && fadeOut >= 0 ? fadeOut : 0;
       let source_offset_seconds = getLeadingSilenceOffsetSeconds(waveform_peaks, length_seconds);
-      // Fallback: when peak-based offset is 0 (e.g. WAV with low/normalized peaks or no peaks), detect from file
-      if (source_offset_seconds === 0) {
+      // Fallback: when peak-based offset is 0, detect from file for non-WAV formats only.
+      // For WAV we do not use file-based leading-silence detection: it can mis-detect and set a
+      // large offset, causing playback to start late (playhead ahead of audio). Use peak-based only.
+      const ext = path.extname(pathToSend).toLowerCase();
+      const isWav = ext === '.wav' || ext === '.wave';
+      if (source_offset_seconds === 0 && !isWav) {
         source_offset_seconds = await computeLeadingSilenceFromFile(pathToSend);
       }
       const payload = {
@@ -1573,6 +1852,125 @@ async function syncNativeArrangementFromPlaylist() {
     }
   } catch (error) {
     console.warn('[thestuu-engine] native arrangement sync failed:', error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
+ * Pull current audio clips from the native edit (including newly recorded) and merge into
+ * state.project.playlist so the UI shows them. Call after transport stop so recorded clips appear.
+ */
+async function mergeNativeClipsIntoPlaylist() {
+  if (!nativeTransportActive) return;
+  let response;
+  try {
+    response = await requestNativeTransport('edit:get-audio-clips');
+  } catch (e) {
+    console.warn('[thestuu-engine] edit:get-audio-clips failed:', e instanceof Error ? e.message : String(e));
+    return;
+  }
+  const clips = Array.isArray(response?.clips) ? response.clips : [];
+  const trackIds = [...new Set(clips.map((c) => Number(c.track_id ?? c.trackId)).filter(Number.isInteger))];
+  console.log(`[thestuu-engine] edit:get-audio-clips returned ${clips.length} clip(s) (tracks: ${trackIds.join(', ') || 'none'})`);
+  ensureProjectArrays();
+  const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
+  let merged = 0;
+  for (const c of clips) {
+    const trackId = Number(c.track_id ?? c.trackId);
+    if (!Number.isInteger(trackId) || trackId < 1) continue;
+    const startSeconds = Number(c.start_seconds ?? c.startSeconds);
+    const lengthSeconds = Number(c.length_seconds ?? c.lengthSeconds);
+    const sourcePath = isNonEmptyString(c.source_path) ? c.source_path.trim() : (isNonEmptyString(c.sourcePath) ? c.sourcePath.trim() : '');
+    if (!sourcePath || !Number.isFinite(startSeconds) || !Number.isFinite(lengthSeconds) || lengthSeconds <= 0) continue;
+    const startBars = Number(((startSeconds * bpm) / (60 * BEATS_PER_BAR)).toFixed(6));
+    const lengthBars = Number(((lengthSeconds * bpm) / (60 * BEATS_PER_BAR)).toFixed(6));
+    let track = getTrack(trackId);
+    if (!track) {
+      state.project.playlist.push(createDefaultTrackEntry(trackId));
+      const hasMixer = Array.isArray(state.project.mixer) && state.project.mixer.some((m) => Number(m?.track_id) === trackId);
+      if (!hasMixer) {
+        state.project.mixer = Array.isArray(state.project.mixer) ? state.project.mixer : [];
+        state.project.mixer.push(createDefaultMixerEntry(trackId));
+      }
+      sortProjectTrackCollections();
+      track = getTrack(trackId);
+    }
+    if (!track || !Array.isArray(track.clips)) continue;
+    // When adding a real clip from native, remove any live-recording placeholder on this track
+    const hadLive = track.clips.some((cl) => (cl.source_path || cl.sourcePath) === LIVE_RECORDING_SOURCE_PATH);
+    if (hadLive) track.clips = track.clips.filter((cl) => (cl.source_path || cl.sourcePath) !== LIVE_RECORDING_SOURCE_PATH);
+    const existingClip = track.clips.find(
+      (existing) =>
+        (existing.source_path === sourcePath || existing.sourcePath === sourcePath) &&
+        Math.abs(Number(existing.start) - startBars) < 0.01,
+    );
+    if (existingClip) {
+      // Live recording: update length so waveform grows during record
+      const existingLength = Number(existingClip.length) || 0;
+      if (lengthBars > existingLength) {
+        existingClip.length = lengthBars;
+        sortClips(track);
+        merged += 1;
+      }
+      continue;
+    }
+    const name = isNonEmptyString(c.name) ? c.name.trim() : path.basename(sourcePath, path.extname(sourcePath)) || path.basename(sourcePath);
+    track.clips.push({
+      id: makeId('clip'),
+      source_path: sourcePath,
+      start: startBars,
+      length: lengthBars,
+      source_name: name,
+      type: 'audio',
+    });
+    sortClips(track);
+    merged += 1;
+    console.log(`[thestuu-engine] mergeNativeClipsIntoPlaylist: added clip on track ${trackId} "${name}" (${lengthBars.toFixed(2)} bars)`);
+  }
+  // While recording, native often doesn't expose the clip until stop. Show a growing placeholder on armed tracks.
+  const nowRecording = Boolean(state.recording && state.playing && nativeTransportActive);
+  const startBeats = liveRecordStartBeats != null && Number.isFinite(liveRecordStartBeats) ? liveRecordStartBeats : 0;
+  const currentBeats = Number(state.transport?.positionBeats);
+  const positionValid = Number.isFinite(currentBeats);
+  const lengthBeatsLive = positionValid ? Math.max(0, currentBeats - startBeats) : 0;
+  if (nowRecording && startBeats >= 0 && lengthBeatsLive > 0.01) {
+    const startBarsLiveCorrect = Number((startBeats / BEATS_PER_BAR).toFixed(6));
+    const lengthBarsLiveCorrect = Number((lengthBeatsLive / BEATS_PER_BAR).toFixed(6));
+    const armedTrackIds = (state.project.mixer || []).filter((e) => normalizeBool(e?.record_armed)).map((e) => Number(e?.track_id)).filter((id) => Number.isInteger(id) && id >= 1);
+    for (const trackId of armedTrackIds) {
+      const fromNative = trackIds.includes(trackId);
+      if (fromNative) continue;
+      let track = getTrack(trackId);
+      if (!track) {
+        state.project.playlist.push(createDefaultTrackEntry(trackId));
+        sortProjectTrackCollections();
+        track = getTrack(trackId);
+      }
+      if (!track || !Array.isArray(track.clips)) continue;
+      let liveClip = track.clips.find((cl) => (cl.source_path || cl.sourcePath) === LIVE_RECORDING_SOURCE_PATH);
+      if (!liveClip) {
+        liveClip = {
+          id: `live-recording-${trackId}`,
+          source_path: LIVE_RECORDING_SOURCE_PATH,
+          start: startBarsLiveCorrect,
+          length: lengthBarsLiveCorrect,
+          source_name: 'Recording…',
+          type: 'audio',
+        };
+        track.clips.push(liveClip);
+        merged += 1;
+      } else {
+        if (lengthBarsLiveCorrect > Number(liveClip.length || 0)) {
+          liveClip.length = lengthBarsLiveCorrect;
+          liveClip.start = startBarsLiveCorrect;
+          merged += 1;
+        }
+      }
+      sortClips(track);
+    }
+  }
+  if (merged > 0) {
+    console.log(`[thestuu-engine] mergeNativeClipsIntoPlaylist: merged ${merged} clip(s) from native edit.`);
+    emitState();
   }
 }
 
@@ -2163,6 +2561,22 @@ async function ensureProjectFile() {
   resetProjectHistory();
 }
 
+async function ensureAppPreferencesFile() {
+  await fs.mkdir(stuuHome, { recursive: true });
+  try {
+    const raw = await fs.readFile(appPreferencesPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeAppPreferences(parsed);
+    state.appPreferences = normalized;
+    if (JSON.stringify(normalized) !== JSON.stringify(parsed)) {
+      await saveAppPreferences(normalized);
+    }
+  } catch {
+    state.appPreferences = normalizeAppPreferences(state.appPreferences);
+    await saveAppPreferences(state.appPreferences);
+  }
+}
+
 async function saveProject(targetPath, projectData) {
   const normalizedProject = normalizeProject(projectData);
   const validation = validateProject(normalizedProject);
@@ -2229,9 +2643,11 @@ async function trySpawnNativeEngine() {
   return new Promise((resolve) => {
     const child = spawn(binPath, ['--socket', nativeSocketPath], {
       cwd,
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
     });
+    attachChildProcessLogStream(child.stdout, 'info');
+    attachChildProcessLogStream(child.stderr, 'log');
     child.unref();
     child.on('error', () => resolve(false));
     child.on('spawn', () => {
@@ -2285,10 +2701,12 @@ async function startNativeTransportBridge() {
     nativeTransportActive = false;
     nativeTracktionActive = false;
     cachedNativePluginsByUid.clear();
+    latestEqAnalyzerFrame = null;
     transportClock.offsetBeats = Number(state.transport?.positionBeats) || 0;
     transportClock.startedAtMs = state.playing ? Date.now() : null;
     console.warn('[thestuu-engine] native transport disconnected; using JS fallback transport clock.');
     emitState();
+    io.emit('engine:analyzer', { available: false, reason: 'native-disconnected' });
   });
 
   nativeTransportClient.on('event', handleNativeTransportEvent);
@@ -2524,6 +2942,8 @@ const io = new Server(httpServer, {
     origin: '*',
   },
 });
+engineLogIo = io;
+installConsoleLogMirror();
 
 function bindMutation(socket, eventName, handler) {
   socket.on(eventName, async (payload = {}, callback = () => {}) => {
@@ -2549,14 +2969,23 @@ io.on('connection', (socket) => {
     nativeTransport: nativeTransportActive,
     nativeSocketPath: nativeTransportEnabled ? nativeSocketPath : null,
   });
+  socket.emit('engine:logs:init', {
+    entries: engineLogBuffer,
+  });
   syncProjectHistory({ record: false });
   socket.emit('engine:state', getStatePayload());
   socket.emit('engine:transport', {
     playing: state.playing,
+    recording: state.recording,
     bpm: normalizeTransportBpm(state.project.bpm),
     beatsPerBar: BEATS_PER_BAR,
     ...state.transport,
   });
+  if (latestEqAnalyzerFrame) {
+    socket.emit('engine:analyzer', latestEqAnalyzerFrame);
+  } else if (!nativeTransportActive) {
+    socket.emit('engine:analyzer', { available: false, reason: 'native-offline' });
+  }
 
   socket.on('transport:play', async (payload = {}, callback = () => {}) => {
     const requestedBpmRaw = Number(payload?.bpm);
@@ -2579,13 +3008,16 @@ io.on('connection', (socket) => {
     };
     try {
       if (nativeTransportActive) {
-        console.log('[thestuu-engine] transport:play → sending to native...');
+        const anyRecordArmed = (Array.isArray(state.project.mixer) && state.project.mixer.some((e) => normalizeBool(e?.record_armed)));
+        const nativeCmd = anyRecordArmed ? 'transport.record' : 'transport.play';
+        const armedTracks = anyRecordArmed ? (state.project.mixer || []).filter((e) => normalizeBool(e?.record_armed)).map((e) => e?.track_id).filter((id) => Number.isInteger(id)) : [];
+        console.log('[thestuu-engine] transport:play → sending to native:', nativeCmd, anyRecordArmed ? `(record armed tracks: ${armedTracks.join(',')})` : '');
         tickCountAfterPlay = 1;
         // Native backends can reset tempo on play; enforce desired BPM around the play command.
         await requestNativeTransport('transport.set_bpm', { bpm: desiredBpm }).catch((error) => {
           console.warn('[thestuu-engine] transport:play pre-set_bpm failed:', error instanceof Error ? error.message : String(error));
         });
-        await requestNativeTransport('transport.play', {}, { fromPlayResponse: true });
+        await requestNativeTransport(nativeCmd, {}, { fromPlayResponse: true });
         await requestNativeTransport('transport.set_bpm', { bpm: desiredBpm }).catch((error) => {
           console.warn('[thestuu-engine] transport:play post-set_bpm failed:', error instanceof Error ? error.message : String(error));
         });
@@ -2622,12 +3054,20 @@ io.on('connection', (socket) => {
   socket.on('transport:pause', async (_payload = {}, callback = () => {}) => {
     try {
       if (nativeTransportActive) {
+        if (liveRecordMergeIntervalId != null) {
+          clearInterval(liveRecordMergeIntervalId);
+          liveRecordMergeIntervalId = null;
+          liveRecordStartBeats = null;
+        }
         await requestNativeTransport('transport.pause');
         state.playing = false;
+        state.recording = false;
         if (state.transport && typeof state.transport.positionBeats === 'number') {
           transportClock.offsetBeats = state.transport.positionBeats;
           transportClock.startedAtMs = null;
         }
+        // So user sees recorded clip up to pause; play can continue from this position
+        await mergeNativeClipsIntoPlaylist();
       } else if (state.playing) {
         pauseTransportClock();
       }
@@ -2642,10 +3082,18 @@ io.on('connection', (socket) => {
   socket.on('transport:stop', async (_payload = {}, callback = () => {}) => {
     try {
       if (nativeTransportActive) {
+        if (liveRecordMergeIntervalId != null) {
+          clearInterval(liveRecordMergeIntervalId);
+          liveRecordMergeIntervalId = null;
+          liveRecordStartBeats = null;
+        }
+        state.recording = false;
         await requestNativeTransport('transport.stop');
         state.playing = false;
         transportClock.offsetBeats = 0;
         transportClock.startedAtMs = null;
+        await new Promise((r) => setTimeout(r, 150));
+        await mergeNativeClipsIntoPlaylist();
       } else {
         state.playing = false;
         resetTransportClock();
@@ -2799,6 +3247,10 @@ io.on('connection', (socket) => {
     const recordArmed = normalizeBool(payload.recordArmed ?? payload.record_armed);
     const entry = getOrCreateMixerEntry(trackId);
     entry.record_armed = recordArmed;
+    const deviceId = typeof payload.record_input_device_id === 'string' ? payload.record_input_device_id : (payload.recordInputDeviceId ?? null);
+    const deviceName = typeof payload.record_input_device_name === 'string' ? payload.record_input_device_name : (payload.recordInputDeviceName ?? null);
+    if (deviceId !== undefined) entry.record_input_device_id = deviceId || null;
+    if (deviceName !== undefined) entry.record_input_device_name = deviceName || null;
 
     requestNativeTransport('track:set-record-arm', { track_id: trackId, record_armed: recordArmed })
       .catch((err) => console.warn('[thestuu-engine] track:set-record-arm native:', err instanceof Error ? err.message : String(err)));
@@ -2989,6 +3441,8 @@ io.on('connection', (socket) => {
           mute: normalizeBool(sourceMixerEntry.mute),
           solo: normalizeBool(sourceMixerEntry.solo),
           record_armed: normalizeBool(sourceMixerEntry.record_armed),
+          record_input_device_id: typeof sourceMixerEntry.record_input_device_id === 'string' ? sourceMixerEntry.record_input_device_id : null,
+          record_input_device_name: typeof sourceMixerEntry.record_input_device_name === 'string' ? sourceMixerEntry.record_input_device_name : null,
         }
         : createDefaultMixerEntry(duplicateTrackId);
       state.project.mixer.push(normalizedSourceMixer);
@@ -3098,8 +3552,12 @@ io.on('connection', (socket) => {
       || Object.prototype.hasOwnProperty.call(payload, 'playlist_show_track_nodes');
     const hasMetronomeEnabled = Object.prototype.hasOwnProperty.call(payload, 'metronomeEnabled')
       || Object.prototype.hasOwnProperty.call(payload, 'metronome_enabled');
-    if (!Number.isFinite(nextBarsRaw) && !Number.isFinite(nextBarWidthRaw) && !hasShowTrackNodes && !hasMetronomeEnabled) {
-      respond(callback, { ok: false, error: 'playlistViewBars, playlistBarWidth, playlistShowTrackNodes, or metronomeEnabled must be provided' });
+    const hasRecordAutoMetronome = Object.prototype.hasOwnProperty.call(payload, 'recordAutoMetronome')
+      || Object.prototype.hasOwnProperty.call(payload, 'record_auto_metronome');
+    const hasRecordCountInBeats = Object.prototype.hasOwnProperty.call(payload, 'recordCountInBeats')
+      || Object.prototype.hasOwnProperty.call(payload, 'record_count_in_beats');
+    if (!Number.isFinite(nextBarsRaw) && !Number.isFinite(nextBarWidthRaw) && !hasShowTrackNodes && !hasMetronomeEnabled && !hasRecordAutoMetronome && !hasRecordCountInBeats) {
+      respond(callback, { ok: false, error: 'playlistViewBars, playlistBarWidth, playlistShowTrackNodes, metronomeEnabled, recordAutoMetronome, or recordCountInBeats must be provided' });
       return;
     }
 
@@ -3127,6 +3585,19 @@ io.on('connection', (socket) => {
       state.project.metronome_enabled = DEFAULT_METRONOME_ENABLED;
     }
 
+    if (hasRecordAutoMetronome) {
+      state.project.record_auto_metronome = normalizeBool(payload.recordAutoMetronome ?? payload.record_auto_metronome);
+    } else if (typeof state.project.record_auto_metronome !== 'boolean') {
+      state.project.record_auto_metronome = false;
+    }
+
+    if (hasRecordCountInBeats) {
+      const raw = Number(payload.recordCountInBeats ?? payload.record_count_in_beats);
+      state.project.record_count_in_beats = Number.isInteger(raw) && raw >= 1 && raw <= 10 ? raw : 4;
+    } else if (!Number.isInteger(state.project.record_count_in_beats) || state.project.record_count_in_beats < 1 || state.project.record_count_in_beats > 10) {
+      state.project.record_count_in_beats = 4;
+    }
+
     emitState();
     respond(callback, {
       ok: true,
@@ -3134,7 +3605,33 @@ io.on('connection', (socket) => {
       playlist_bar_width: state.project.playlist_bar_width,
       playlist_show_track_nodes: state.project.playlist_show_track_nodes,
       metronome_enabled: state.project.metronome_enabled,
+      record_auto_metronome: state.project.record_auto_metronome,
+      record_count_in_beats: state.project.record_count_in_beats,
     });
+  });
+
+  socket.on('app-preferences:update', async (payload = {}, callback = () => {}) => {
+    try {
+      const { hasAny, patch } = normalizeAppPreferencesPatch(payload);
+      if (!hasAny) {
+        respond(callback, { ok: false, error: 'recordCountInEnabled or recordUseStandardMic must be provided' });
+        return;
+      }
+
+      const nextPreferences = normalizeAppPreferences({
+        ...(isObject(state.appPreferences) ? state.appPreferences : DEFAULT_APP_PREFERENCES),
+        ...patch,
+      });
+      await saveAppPreferences(nextPreferences);
+
+      emitState({ recordHistory: false });
+      respond(callback, {
+        ok: true,
+        app_preferences: state.appPreferences,
+      });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'app-preferences:update failed' });
+    }
   });
 
   socket.on('audio:get-outputs', async (_payload = {}, callback = () => {}) => {
@@ -3789,6 +4286,7 @@ const engineTickTimer = setInterval(() => {
 }, 120);
 
 async function boot() {
+  await ensureAppPreferencesFile();
   await ensureProjectFile();
   await startNativeTransportBridge();
   if (!nativeTransportActive) {

@@ -561,6 +561,7 @@ struct TransportCore {
 
     return MsgValue::Object{
       {"playing", MsgValue(playing)},
+      {"recording", MsgValue(false)},
       {"bpm", MsgValue(bpm)},
       {"bar", MsgValue(bar)},
       {"beat", MsgValue(beat)},
@@ -690,6 +691,7 @@ MsgValue makeErrorResponse(int64_t id, const std::string& error) {
 MsgValue::Object snapshotToMsgObject(const thestuu::native::TransportSnapshot& s) {
   return MsgValue::Object{
     {"playing", MsgValue(s.playing)},
+    {"recording", MsgValue(s.isRecording)},
     {"bpm", MsgValue(s.bpm)},
     {"bar", MsgValue(s.bar)},
     {"beat", MsgValue(s.beat)},
@@ -698,6 +700,32 @@ MsgValue::Object snapshotToMsgObject(const thestuu::native::TransportSnapshot& s
     {"positionBars", MsgValue(s.positionBars)},
     {"positionBeats", MsgValue(s.positionBeats)},
     {"timestamp", MsgValue(s.timestamp)},
+  };
+}
+
+MsgValue::Object spectrumAnalyzerSnapshotToMsgObject(const thestuu::native::SpectrumAnalyzerSnapshot& s) {
+  auto toNumberArray = [](const std::vector<float>& values) {
+    MsgValue::Array arr;
+    arr.reserve(values.size());
+    for (float value : values) {
+      arr.push_back(MsgValue(static_cast<double>(value)));
+    }
+    return arr;
+  };
+
+  return MsgValue::Object{
+    {"available", MsgValue(s.available)},
+    {"preMirrorsPost", MsgValue(s.preMirrorsPost)},
+    {"scope", MsgValue(s.scope)},
+    {"channels", MsgValue(s.channels)},
+    {"sampleRate", MsgValue(s.sampleRate)},
+    {"fftSize", MsgValue(static_cast<int64_t>(s.fftSize))},
+    {"minDb", MsgValue(s.minDb)},
+    {"maxDb", MsgValue(s.maxDb)},
+    {"timestamp", MsgValue(s.timestamp)},
+    {"freqsHz", MsgValue(toNumberArray(s.freqsHz))},
+    {"preDb", MsgValue(toNumberArray(s.preDb))},
+    {"postDb", MsgValue(toNumberArray(s.postDb))},
   };
 }
 
@@ -717,10 +745,15 @@ MsgValue makeTickEvent(const TransportCore& transport) {
         backendSnap.bpm
       );
     }
+    auto payload = snapshotToMsgObject(backendSnap);
+    thestuu::native::SpectrumAnalyzerSnapshot analyzerSnapshot;
+    if (thestuu::native::getSpectrumAnalyzerSnapshot(analyzerSnapshot) && analyzerSnapshot.available) {
+      payload["analyzer"] = MsgValue(spectrumAnalyzerSnapshotToMsgObject(analyzerSnapshot));
+    }
     return MsgValue(MsgValue::Object{
       {"type", MsgValue("event")},
       {"event", MsgValue("transport.tick")},
-      {"payload", MsgValue(snapshotToMsgObject(backendSnap))},
+      {"payload", MsgValue(std::move(payload))},
     });
   }
   return MsgValue(MsgValue::Object{
@@ -761,6 +794,19 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
         std::fprintf(stderr, "[thestuu-native] after transportPlay: isPlaying=%d positionBeats=%.4f\n",
                      backendSnap.playing ? 1 : 0, backendSnap.positionBeats);
         backendSnap.playing = true;  // Tracktion may set isPlaying() async; ensure response reflects play request
+        return makeResponse(id, MsgValue::Object{{"transport", MsgValue(snapshotToMsgObject(backendSnap))}});
+      }
+    } else {
+      transport.play();
+    }
+    return makeResponse(id, MsgValue::Object{{"transport", MsgValue(transport.snapshot())}});
+  }
+  if (cmd == "transport.record") {
+    if (g_useTracktionTransport) {
+      thestuu::native::transportRecord();
+      thestuu::native::TransportSnapshot backendSnap;
+      if (thestuu::native::getTransportSnapshot(backendSnap)) {
+        backendSnap.playing = true;
         return makeResponse(id, MsgValue::Object{{"transport", MsgValue(snapshotToMsgObject(backendSnap))}});
       }
     } else {
@@ -856,6 +902,28 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       return makeErrorResponse(id, error);
     }
     return makeResponse(id, MsgValue::Object{});
+  }
+  if (cmd == "edit:get-audio-clips") {
+    if (!g_useTracktionTransport) {
+      return makeResponse(id, MsgValue::Object{{"clips", MsgValue(MsgValue::Array{})}});
+    }
+    std::vector<thestuu::native::EditClipInfo> clips;
+    std::string error;
+    if (!thestuu::native::getEditAudioClipsOnMessageThread(clips, error)) {
+      return makeErrorResponse(id, error);
+    }
+    MsgValue::Array arr;
+    arr.reserve(clips.size());
+    for (const auto& c : clips) {
+      arr.push_back(MsgValue(MsgValue::Object{
+        {"track_id", MsgValue(static_cast<int64_t>(c.trackId))},
+        {"source_path", MsgValue(c.sourcePath)},
+        {"start_seconds", MsgValue(c.startSeconds)},
+        {"length_seconds", MsgValue(c.lengthSeconds)},
+        {"name", MsgValue(c.name)},
+      }));
+    }
+    return makeResponse(id, MsgValue::Object{{"clips", MsgValue(std::move(arr))}});
   }
   if (cmd == "backend.info") {
     return makeResponse(id, MsgValue::Object{{"tracktion", MsgValue(g_useTracktionTransport)}});
