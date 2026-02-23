@@ -4047,6 +4047,47 @@ tracktion::engine::AudioTrack* getAudioTrackByIndex(int32_t trackId) {
   return tracks[index];
 }
 
+/** Physical wave input to use for recording (default or first non-track). Ensures mic is routed even when no default is set. */
+static tracktion::engine::WaveInputDevice* getPhysicalWaveInForRecording() {
+  if (!gState || !gState->engine) return nullptr;
+  auto& dm = gState->engine->getDeviceManager();
+  tracktion::engine::WaveInputDevice* w = dm.getDefaultWaveInDevice();
+  if (w != nullptr && !w->isTrackDevice()) return w;
+  for (tracktion::engine::WaveInputDevice* dev : dm.getWaveInputDevices()) {
+    if (dev != nullptr && !dev->isTrackDevice()) return dev;
+  }
+  return nullptr;
+}
+
+/** Route the physical wave input so only this track receives it (armed). Used when arming and right before record. */
+static void routePhysicalWaveInToTrack(tracktion::engine::WaveInputDevice& phys, tracktion::engine::AudioTrack& track) {
+  if (!gState || !gState->edit) return;
+  using namespace tracktion::engine;
+  juce::ValueTree physState = gState->edit->getEditInputDevices().getInstanceStateForInputDevice(phys);
+  if (!physState.isValid()) return;
+  for (int i = physState.getNumChildren(); --i >= 0;) {
+    const auto& c = physState.getChild(i);
+    if (c.hasType(IDs::INPUTDEVICEDESTINATION) && EditItemID::fromProperty(c, IDs::targetID) != track.itemID)
+      physState.removeChild(i, nullptr);
+  }
+  juce::ValueTree destState;
+  for (int i = 0; i < physState.getNumChildren(); ++i) {
+    const auto& c = physState.getChild(i);
+    if (c.hasType(IDs::INPUTDEVICEDESTINATION) && EditItemID::fromProperty(c, IDs::targetID) == track.itemID) {
+      destState = c;
+      break;
+    }
+  }
+  if (!destState.isValid()) {
+    destState = juce::ValueTree(IDs::INPUTDEVICEDESTINATION);
+    destState.setProperty(IDs::targetID, track.itemID.toVar(), nullptr);
+    destState.setProperty(IDs::armed, true, nullptr);
+    physState.addChild(destState, -1, nullptr);
+  } else {
+    destState.setProperty(IDs::armed, true, nullptr);
+  }
+}
+
 bool setTrackMute(int32_t trackId, bool mute, std::string& error) {
   if (!gState || !gState->engine) {
     error = "backend not initialised";
@@ -4144,45 +4185,19 @@ bool setTrackRecordArm(int32_t trackId, bool armed, std::string& error) {
       destState.setProperty(IDs::armed, armed, nullptr);
     }
   }
-  // Route the physical default wave input (mic) to this track so recording actually goes here.
-  if (tracktion::engine::WaveInputDevice* defaultWaveIn = gState->engine->getDeviceManager().getDefaultWaveInDevice()) {
-    if (!defaultWaveIn->isTrackDevice()) {
-      // Live/low-latency recording: shift recorded audio earlier so it lines up with the beat (like FL Studio).
-      // Positive recordAdjustMs increases getAdjustmentSeconds(), which makes adjust more negative → clip starts earlier.
-      if (armed)
-        defaultWaveIn->setRecordAdjustmentMs(12.0);
-      juce::ValueTree physState = gState->edit->getEditInputDevices().getInstanceStateForInputDevice(*defaultWaveIn);
+  // Route the physical wave input (mic) to this track so recording actually goes here.
+  if (tracktion::engine::WaveInputDevice* physIn = getPhysicalWaveInForRecording()) {
+    if (armed) {
+      physIn->setRecordAdjustmentMs(12.0);
+      routePhysicalWaveInToTrack(*physIn, *track);
+    } else {
+      juce::ValueTree physState = gState->edit->getEditInputDevices().getInstanceStateForInputDevice(*physIn);
       if (physState.isValid()) {
-        if (armed) {
-          // Exclusive arm: remove other destinations so only this track receives the mic.
-          for (int i = physState.getNumChildren(); --i >= 0;) {
-            const auto& c = physState.getChild(i);
-            if (c.hasType(IDs::INPUTDEVICEDESTINATION) && EditItemID::fromProperty(c, IDs::targetID) != track->itemID)
-              physState.removeChild(i, nullptr);
-          }
-          juce::ValueTree destState;
-          for (int i = 0; i < physState.getNumChildren(); ++i) {
-            const auto& c = physState.getChild(i);
-            if (c.hasType(IDs::INPUTDEVICEDESTINATION) && EditItemID::fromProperty(c, IDs::targetID) == track->itemID) {
-              destState = c;
-              break;
-            }
-          }
-          if (!destState.isValid()) {
-            destState = juce::ValueTree(IDs::INPUTDEVICEDESTINATION);
-            destState.setProperty(IDs::targetID, track->itemID.toVar(), nullptr);
-            destState.setProperty(IDs::armed, true, nullptr);
-            physState.addChild(destState, -1, nullptr);
-          } else {
-            destState.setProperty(IDs::armed, true, nullptr);
-          }
-        } else {
-          for (int i = physState.getNumChildren(); --i >= 0;) {
-            const auto& c = physState.getChild(i);
-            if (c.hasType(IDs::INPUTDEVICEDESTINATION) && EditItemID::fromProperty(c, IDs::targetID) == track->itemID) {
-              physState.removeChild(i, nullptr);
-              break;
-            }
+        for (int i = physState.getNumChildren(); --i >= 0;) {
+          const auto& c = physState.getChild(i);
+          if (c.hasType(IDs::INPUTDEVICEDESTINATION) && EditItemID::fromProperty(c, IDs::targetID) == track->itemID) {
+            physState.removeChild(i, nullptr);
+            break;
           }
         }
       }
@@ -4867,16 +4882,23 @@ static void transportRecordImpl() {
   }
   const auto tracks = tracktion::engine::getAudioTracks(*gState->edit);
   int armedCount = 0;
+  tracktion::engine::AudioTrack* firstArmedTrack = nullptr;
   std::string armedTrackIds;
   for (size_t i = 0; i < tracks.size(); ++i) {
     if (tracks[i] && tracks[i]->getWaveInputDevice().isEnabled()) {
       ++armedCount;
+      if (firstArmedTrack == nullptr) firstArmedTrack = tracks[i];
       if (!armedTrackIds.empty()) armedTrackIds += ',';
       armedTrackIds += std::to_string(static_cast<int>(i) + 1);
     }
   }
   std::fprintf(stderr, "[thestuu-native] transportRecordImpl: starting record (tracks with wave input enabled=%d: %s)\n",
                armedCount, armedTrackIds.empty() ? "none" : armedTrackIds.c_str());
+  // Re-apply physical mic → armed track so recording goes to the right track (e.g. after edit:reset).
+  if (firstArmedTrack) {
+    if (tracktion::engine::WaveInputDevice* physIn = getPhysicalWaveInForRecording())
+      routePhysicalWaveInToTrack(*physIn, *firstArmedTrack);
+  }
   transport.freePlaybackContext();
   transport.ensureContextAllocated(true);
   transport.record(false, true);
