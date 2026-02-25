@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="96" viewBox="0 0 320 96" fill="none">
+  <defs>
+    <linearGradient id="bg_phaser" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b4049"/>
+      <stop offset="100%" stop-color="#242933"/>
+    </linearGradient>
+    <linearGradient id="shine_phaser" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="319" height="95" rx="10" fill="url(#bg_phaser)" stroke="#dbe2ee" stroke-opacity="0.18"/>
+  <rect x="1" y="1" width="318" height="18" rx="9" fill="url(#shine_phaser)"/>
+  <rect x="8" y="8" width="7" height="7" rx="3.5" fill="#ef4444" fill-opacity="0.85"/>
+  <rect x="18" y="8" width="7" height="7" rx="3.5" fill="#f59e0b" fill-opacity="0.75"/>
+  <rect x="28" y="8" width="7" height="7" rx="3.5" fill="#22c55e" fill-opacity="0.75"/>
+  <g opacity="0.96">
+    
+    <circle cx="74" cy="46" r="24" fill="none" stroke="#c084fc" stroke-width="4" stroke-dasharray="10 8"/>
+    <circle cx="74" cy="46" r="12" fill="#c084fc" fill-opacity="0.18" stroke="#c084fc" stroke-opacity="0.44"/>
+    <path d="M122 26 C146 18, 174 74, 198 46 C222 18, 246 74, 270 46 C282 32, 294 30, 306 36" fill="none" stroke="#60a5fa" stroke-width="3" stroke-linecap="round"/>
+    <path d="M122 60 C146 52, 174 52, 198 60 C222 68, 246 68, 270 60 C282 56, 294 54, 306 58" fill="none" stroke="#f8fafc" stroke-width="2" stroke-opacity="0.32" stroke-linecap="round"/>
+    
+  </g>
+  <rect x="10" y="76" width="300" height="10" rx="5" fill="#0f131a" fill-opacity="0.42"/>
+  <text x="16" y="84" fill="#f3f4f6" fill-opacity="0.92" font-size="8.6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">Tracktion Phaser</text>
+</svg>

@@ -62,9 +62,12 @@ const DEFAULT_APP_PREFERENCES = Object.freeze({
 });
 
 const mediaDir = path.join(stuuHome, 'media');
+const pluginPreviewCacheDir = path.join(stuuHome, 'cache', 'plugin-previews');
 
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
 const ENGINE_LOG_BUFFER_LIMIT = 600;
+const PLUGIN_PREVIEW_MAX_DIM = 640;
+const pendingPluginPreviewRenders = new Map();
 
 const engineLogBuffer = [];
 let engineLogSeq = 0;
@@ -250,6 +253,7 @@ let nativeTransportActive = false;
 let nativeTracktionActive = false;
 let cachedNativePluginsByUid = new Map();
 let latestEqAnalyzerFrame = null;
+let desiredEqAnalyzerTarget = { mode: 'master', trackId: 0, pluginIndex: -1 };
 
 function isObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -298,6 +302,53 @@ function normalizeEqAnalyzerFrameForSocket(frame) {
     preDb: preDb.slice(0, count),
     postDb: postDb.slice(0, count),
   };
+}
+
+function normalizeAnalyzerTargetPayload(payload) {
+  const modeRaw = typeof payload?.mode === 'string' ? payload.mode.trim().toLowerCase() : '';
+  const trackIdRaw = Number(payload?.track_id ?? payload?.trackId);
+  const pluginIndexRaw = Number(payload?.plugin_index ?? payload?.pluginIndex);
+
+  if (modeRaw === 'master') {
+    return { mode: 'master', trackId: 0, pluginIndex: -1 };
+  }
+
+  if (modeRaw === 'track') {
+    if (!Number.isInteger(trackIdRaw) || trackIdRaw <= 0) {
+      return null;
+    }
+    return {
+      mode: 'track',
+      trackId: trackIdRaw,
+      pluginIndex: Number.isInteger(pluginIndexRaw) ? pluginIndexRaw : -1,
+    };
+  }
+
+  if (Number.isInteger(trackIdRaw) && trackIdRaw > 0) {
+    return {
+      mode: 'track',
+      trackId: trackIdRaw,
+      pluginIndex: Number.isInteger(pluginIndexRaw) ? pluginIndexRaw : -1,
+    };
+  }
+
+  return { mode: 'master', trackId: 0, pluginIndex: -1 };
+}
+
+async function applyNativeAnalyzerTarget(target = desiredEqAnalyzerTarget) {
+  if (!nativeTransportActive) {
+    throw new Error('native transport is not active');
+  }
+  const normalizedTarget = normalizeAnalyzerTargetPayload(target);
+  if (!normalizedTarget) {
+    throw new Error('invalid analyzer target');
+  }
+  desiredEqAnalyzerTarget = normalizedTarget;
+  return requestNativeTransport('analyzer:set-target', {
+    mode: normalizedTarget.mode,
+    track_id: normalizedTarget.trackId,
+    plugin_index: normalizedTarget.pluginIndex,
+  });
 }
 
 function getFileExtension(filename) {
@@ -408,6 +459,429 @@ function normalizeWaveformPeaks(value) {
     downsampled.push(Number(peak.toFixed(4)));
   }
   return downsampled;
+}
+
+function estimateBpmFromWaveformPeaks(peaks, durationSeconds) {
+  const waveformPeaks = normalizeWaveformPeaks(peaks);
+  const durationSec = Number(durationSeconds);
+  if (!Array.isArray(waveformPeaks) || waveformPeaks.length < 48 || !Number.isFinite(durationSec) || durationSec <= 0.5) {
+    return null;
+  }
+
+  const sampleRate = waveformPeaks.length / durationSec;
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0) {
+    return null;
+  }
+
+  const smoothed = new Array(waveformPeaks.length);
+  for (let index = 0; index < waveformPeaks.length; index += 1) {
+    const prev = waveformPeaks[Math.max(0, index - 1)] ?? waveformPeaks[index] ?? 0;
+    const curr = waveformPeaks[index] ?? 0;
+    const next = waveformPeaks[Math.min(waveformPeaks.length - 1, index + 1)] ?? curr;
+    smoothed[index] = (prev + curr + next) / 3;
+  }
+
+  const onset = new Array(smoothed.length).fill(0);
+  for (let index = 1; index < smoothed.length; index += 1) {
+    const diff = smoothed[index] - smoothed[index - 1];
+    onset[index] = diff > 0 ? diff : 0;
+  }
+
+  const minBpm = 60;
+  const maxBpm = 200;
+  const minLag = Math.max(1, Math.floor((60 * sampleRate) / maxBpm));
+  const maxLag = Math.min(onset.length - 2, Math.ceil((60 * sampleRate) / minBpm));
+  if (maxLag <= minLag) {
+    return null;
+  }
+
+  let bestLag = -1;
+  let bestScore = 0;
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let score = 0;
+    for (let index = lag; index < onset.length; index += 1) {
+      score += onset[index] * onset[index - lag];
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestLag = lag;
+    }
+  }
+
+  if (bestLag <= 0 || bestScore <= 0) {
+    return null;
+  }
+
+  let bpm = (60 * sampleRate) / bestLag;
+  while (bpm < 70) bpm *= 2;
+  while (bpm > 180) bpm /= 2;
+  if (!Number.isFinite(bpm) || bpm < 40 || bpm > 240) {
+    return null;
+  }
+  return Number(bpm.toFixed(1));
+}
+
+function extractBpmHintFromText(value) {
+  if (!isNonEmptyString(value)) {
+    return null;
+  }
+  const text = value.trim();
+  const patterns = [
+    /\bbpm[\s_\-]*([4-9]\d|1\d\d|2[0-4]\d)\b/i,
+    /\b([4-9]\d|1\d\d|2[0-4]\d)[\s_\-]*bpm\b/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const candidate = Number(match[1]);
+    if (Number.isFinite(candidate) && candidate >= 40 && candidate <= 240) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function normalizeDetectedKeyText(noteLetter, accidental = '', qualityToken = '') {
+  if (!isNonEmptyString(noteLetter)) {
+    return null;
+  }
+  const noteBase = noteLetter.trim().toUpperCase();
+  const accidentalNormalized = accidental === 'b' ? 'b' : accidental === '#' ? '#' : '';
+  const note = `${noteBase}${accidentalNormalized}`;
+  const validNotes = new Set(['C', 'C#', 'Db', 'D', 'D#', 'Eb', 'E', 'F', 'F#', 'Gb', 'G', 'G#', 'Ab', 'A', 'A#', 'Bb', 'B']);
+  if (!validNotes.has(note)) {
+    return null;
+  }
+  const q = String(qualityToken || '').trim().toLowerCase();
+  const quality = q.startsWith('min') || q === 'm'
+    ? 'minor'
+    : 'major';
+  return `${note} ${quality}`;
+}
+
+function extractKeyHintFromText(value) {
+  if (!isNonEmptyString(value)) {
+    return null;
+  }
+  const text = value.trim();
+  const patterns = [
+    /(?:^|[^a-zA-Z])([A-Ga-g])([#b]?)(maj(?:or)?|min(?:or)?|m)(?=$|[^a-zA-Z])/,
+    /(?:^|[^a-zA-Z])([A-Ga-g])([#b]?)\s*(major|minor)(?=$|[^a-zA-Z])/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const normalized = normalizeDetectedKeyText(match[1], match[2], match[3]);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+const AUDIO_KEY_NOTE_NAMES = Object.freeze(['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']);
+const KRUMHANSL_MAJOR_PROFILE = Object.freeze([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]);
+const KRUMHANSL_MINOR_PROFILE = Object.freeze([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]);
+
+function midiNoteToFrequency(noteNumber) {
+  return 440 * (2 ** ((noteNumber - 69) / 12));
+}
+
+function buildRotatedKeyProfile(profile, rootIndex) {
+  const rotated = new Array(12);
+  for (let index = 0; index < 12; index += 1) {
+    rotated[index] = profile[(index - rootIndex + 12) % 12];
+  }
+  return rotated;
+}
+
+function centeredNormalizedVector(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return [];
+  }
+  const mean = values.reduce((sum, value) => sum + Number(value || 0), 0) / values.length;
+  const centered = values.map((value) => Number(value || 0) - mean);
+  const norm = Math.sqrt(centered.reduce((sum, value) => sum + (value * value), 0));
+  if (!Number.isFinite(norm) || norm <= 0) {
+    return centered.map(() => 0);
+  }
+  return centered.map((value) => value / norm);
+}
+
+function dotProduct(left, right) {
+  const count = Math.min(Array.isArray(left) ? left.length : 0, Array.isArray(right) ? right.length : 0);
+  let sum = 0;
+  for (let index = 0; index < count; index += 1) {
+    sum += Number(left[index] || 0) * Number(right[index] || 0);
+  }
+  return sum;
+}
+
+function goertzelPower(samples, sampleRate, targetHz) {
+  if (!(samples instanceof Float32Array) || samples.length < 16) {
+    return 0;
+  }
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || !Number.isFinite(targetHz) || targetHz <= 0 || targetHz >= (sampleRate / 2)) {
+    return 0;
+  }
+  const omega = (2 * Math.PI * targetHz) / sampleRate;
+  const coeff = 2 * Math.cos(omega);
+  let s0 = 0;
+  let s1 = 0;
+  let s2 = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    s0 = samples[index] + (coeff * s1) - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  const power = (s1 * s1) + (s2 * s2) - (coeff * s1 * s2);
+  return Number.isFinite(power) && power > 0 ? power : 0;
+}
+
+function detectKeyFromDecodedAudioBuffer(audioBuffer) {
+  if (!audioBuffer || typeof audioBuffer.getChannelData !== 'function') {
+    return null;
+  }
+  const sampleRate = Number(audioBuffer.sampleRate);
+  const frameLength = Math.floor(Number(audioBuffer.length));
+  const channelCount = Math.floor(Number(audioBuffer.numberOfChannels) || 0);
+  if (!Number.isFinite(sampleRate) || sampleRate <= 2000 || frameLength < 2048 || channelCount <= 0) {
+    return null;
+  }
+
+  const maxDurationFrames = Math.floor(sampleRate * 90);
+  const usableFrames = Math.min(frameLength, maxDurationFrames);
+  const windowSize = Math.min(8192, Math.max(4096, 2 ** Math.floor(Math.log2(Math.max(4096, sampleRate * 0.12)))));
+  if (!Number.isFinite(windowSize) || usableFrames < windowSize) {
+    return null;
+  }
+
+  const maxWindows = 72;
+  const defaultHop = Math.floor(windowSize / 2);
+  const spreadHop = maxWindows > 1 ? Math.floor((usableFrames - windowSize) / (maxWindows - 1)) : defaultHop;
+  const hopSize = Math.max(defaultHop, spreadHop || defaultHop);
+
+  const channelData = [];
+  for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+    const data = audioBuffer.getChannelData(channelIndex);
+    if (data) {
+      channelData.push(data);
+    }
+  }
+  if (channelData.length === 0) {
+    return null;
+  }
+
+  const noteBins = [];
+  for (let midi = 36; midi <= 95; midi += 1) {
+    const frequency = midiNoteToFrequency(midi);
+    if (frequency < 55 || frequency >= (sampleRate / 2)) {
+      continue;
+    }
+    const octaveCenterWeight = 1 - Math.min(0.65, Math.abs(midi - 64) / 72);
+    noteBins.push({
+      pitchClass: ((midi % 12) + 12) % 12,
+      frequency,
+      weight: Math.max(0.35, octaveCenterWeight),
+    });
+  }
+  if (noteBins.length === 0) {
+    return null;
+  }
+
+  const hann = new Float32Array(windowSize);
+  for (let i = 0; i < windowSize; i += 1) {
+    hann[i] = 0.5 - (0.5 * Math.cos((2 * Math.PI * i) / (windowSize - 1)));
+  }
+  const monoWindow = new Float32Array(windowSize);
+  const chroma = new Array(12).fill(0);
+  let analyzedWindows = 0;
+
+  for (let start = 0; start + windowSize <= usableFrames; start += hopSize) {
+    let rmsSum = 0;
+    let mean = 0;
+    for (let i = 0; i < windowSize; i += 1) {
+      let sample = 0;
+      for (let ch = 0; ch < channelData.length; ch += 1) {
+        sample += channelData[ch][start + i] ?? 0;
+      }
+      sample /= channelData.length;
+      monoWindow[i] = sample;
+      mean += sample;
+    }
+    mean /= windowSize;
+    for (let i = 0; i < windowSize; i += 1) {
+      const centered = (monoWindow[i] - mean) * hann[i];
+      monoWindow[i] = centered;
+      rmsSum += centered * centered;
+    }
+    const rms = Math.sqrt(rmsSum / windowSize);
+    if (!Number.isFinite(rms) || rms < 0.008) {
+      continue;
+    }
+
+    analyzedWindows += 1;
+    for (const bin of noteBins) {
+      const power = goertzelPower(monoWindow, sampleRate, bin.frequency);
+      if (power <= 0) {
+        continue;
+      }
+      chroma[bin.pitchClass] += Math.sqrt(power) * bin.weight;
+    }
+    if (analyzedWindows >= maxWindows) {
+      break;
+    }
+  }
+
+  if (analyzedWindows < 3) {
+    return null;
+  }
+
+  const chromaSum = chroma.reduce((sum, value) => sum + value, 0);
+  if (!Number.isFinite(chromaSum) || chromaSum <= 0) {
+    return null;
+  }
+
+  const chromaNormalized = chroma.map((value) => value / chromaSum);
+  const chromaVector = centeredNormalizedVector(chromaNormalized);
+
+  let best = { score: -Infinity, root: 0, quality: 'major' };
+  let secondBestScore = -Infinity;
+
+  for (let root = 0; root < 12; root += 1) {
+    const majorScore = dotProduct(chromaVector, centeredNormalizedVector(buildRotatedKeyProfile(KRUMHANSL_MAJOR_PROFILE, root)));
+    const minorScore = dotProduct(chromaVector, centeredNormalizedVector(buildRotatedKeyProfile(KRUMHANSL_MINOR_PROFILE, root)));
+    for (const candidate of [
+      { score: majorScore, root, quality: 'major' },
+      { score: minorScore, root, quality: 'minor' },
+    ]) {
+      if (candidate.score > best.score) {
+        secondBestScore = best.score;
+        best = candidate;
+      } else if (candidate.score > secondBestScore) {
+        secondBestScore = candidate.score;
+      }
+    }
+  }
+
+  if (!Number.isFinite(best.score) || best.score < 0.12) {
+    return null;
+  }
+
+  const note = AUDIO_KEY_NOTE_NAMES[best.root] || 'C';
+  const key = `${note} ${best.quality}`;
+  const confidence = Number((best.score - (Number.isFinite(secondBestScore) ? secondBestScore : 0)).toFixed(3));
+  return { key, confidence, analyzedWindows };
+}
+
+async function analyzeClipBpmKey(payload = {}) {
+  const trackId = assertTrackId(payload);
+  const clipId = assertClipId(payload);
+  const track = getTrack(trackId);
+  if (!track) {
+    throw new Error(`track "${trackId}" not found`);
+  }
+
+  const { clip } = findClip(track, clipId);
+  if (!clip) {
+    throw new Error(`clip "${clipId}" not found on track ${trackId}`);
+  }
+
+  const clipType = (clip.type || clip.clip_type || 'audio').toString().toLowerCase();
+  if (clipType !== 'audio') {
+    throw new Error('Analyze BPM & Key is only available for audio clips');
+  }
+
+  const sourcePathRaw = isNonEmptyString(clip.source_path ?? clip.sourcePath)
+    ? String(clip.source_path ?? clip.sourcePath).trim()
+    : '';
+  const sourceName = isNonEmptyString(clip.source_name) ? clip.source_name.trim() : '';
+  const displayName = isNonEmptyString(clip.name) ? clip.name.trim() : '';
+  const basenameHint = sourcePathRaw ? path.basename(sourcePathRaw) : '';
+  const hintText = [displayName, sourceName, basenameHint].filter(Boolean).join(' ');
+
+  let detectedBpm = extractBpmHintFromText(hintText);
+  let detectedKey = extractKeyHintFromText(hintText);
+  let bpmMethod = detectedBpm != null ? 'filename_hint' : null;
+  let keyMethod = detectedKey != null ? 'filename_hint' : null;
+
+  let durationSec = Number(clip.source_duration_seconds ?? clip.sourceDurationSeconds);
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    durationSec = null;
+  }
+  let waveformPeaks = normalizeWaveformPeaks(clip.waveform_peaks ?? clip.waveformPeaks);
+
+  if (detectedBpm == null) {
+    detectedBpm = estimateBpmFromWaveformPeaks(waveformPeaks, durationSec);
+    if (detectedBpm != null) {
+      bpmMethod = 'waveform_peaks';
+    }
+  }
+
+  let decodeUsed = false;
+  if ((detectedBpm == null || detectedKey == null || waveformPeaks.length === 0 || durationSec == null) && sourcePathRaw) {
+    const sourcePath = path.isAbsolute(sourcePathRaw)
+      ? sourcePathRaw
+      : path.join(mediaDir, path.basename(sourcePathRaw));
+    try {
+      const fileBuffer = await fs.readFile(sourcePath);
+      const decoded = await decode(fileBuffer);
+      if (decoded) {
+        decodeUsed = true;
+        if (durationSec == null && Number.isFinite(decoded.duration) && decoded.duration > 0) {
+          durationSec = Number(decoded.duration.toFixed(6));
+        }
+        if (waveformPeaks.length === 0) {
+          waveformPeaks = extractWaveformPeaksFromDecoded(decoded, UPLOAD_WAVEFORM_SAMPLES);
+        }
+        if (detectedBpm == null) {
+          detectedBpm = estimateBpmFromWaveformPeaks(waveformPeaks, durationSec);
+          if (detectedBpm != null) {
+            bpmMethod = 'waveform_decode_fallback';
+          }
+        }
+        if (detectedKey == null) {
+          const detectedFromAudio = detectKeyFromDecodedAudioBuffer(decoded);
+          if (isNonEmptyString(detectedFromAudio?.key)) {
+            detectedKey = detectedFromAudio.key.trim();
+            keyMethod = 'audio_chroma_goertzel';
+          }
+        }
+      }
+    } catch (error) {
+      if (detectedBpm == null && detectedKey == null) {
+        throw new Error(`audio analysis failed: ${error instanceof Error ? error.message : 'decode/read failed'}`);
+      }
+    }
+  }
+
+  if (detectedBpm == null && detectedKey == null) {
+    throw new Error('could not detect BPM or Key (missing hints/audio data)');
+  }
+
+  if (detectedBpm != null) {
+    clip.bpm = Number(detectedBpm.toFixed(1));
+  } else {
+    delete clip.bpm;
+  }
+  if (isNonEmptyString(detectedKey)) {
+    clip.key = detectedKey;
+  } else {
+    delete clip.key;
+  }
+  clip.analyzed_at = new Date().toISOString();
+
+  return {
+    clipId,
+    trackId,
+    bpm: detectedBpm ?? null,
+    key: detectedKey ?? null,
+    analyzed_at: clip.analyzed_at,
+    method: {
+      bpm: bpmMethod || (decodeUsed ? 'waveform_decode_fallback' : 'unknown'),
+      key: keyMethod,
+    },
+  };
 }
 
 function inferImportedFormatFromMime(mime) {
@@ -1227,9 +1701,19 @@ function handleNativeTransportEvent(eventName, payload = {}) {
     const nativeBpmText = Number.isFinite(payloadBpm) ? payloadBpm.toFixed(3) : 'n/a';
     const estimatedBpmText = Number.isFinite(estimatedBpm) ? estimatedBpm.toFixed(3) : 'n/a';
     const projectBpmText = Number.isFinite(Number(state.project.bpm)) ? Number(state.project.bpm).toFixed(3) : 'n/a';
+    let analyzerPeakDbText = 'n/a';
+    const analyzerPost = Array.isArray(payload?.analyzer?.postDb) ? payload.analyzer.postDb : null;
+    if (analyzerPost && analyzerPost.length > 0) {
+      let peakDb = -Infinity;
+      for (const raw of analyzerPost) {
+        const v = Number(raw);
+        if (Number.isFinite(v) && v > peakDb) peakDb = v;
+      }
+      if (Number.isFinite(peakDb)) analyzerPeakDbText = peakDb.toFixed(1);
+    }
     console.log(
       `[thestuu-engine] native tick: playing=true positionBeats=${Number.isFinite(payloadBeats) ? payloadBeats.toFixed(6) : 'n/a'} `
-      + `nativeBpm=${nativeBpmText} estBpm=${estimatedBpmText} projectBpm=${projectBpmText}`,
+      + `nativeBpm=${nativeBpmText} estBpm=${estimatedBpmText} projectBpm=${projectBpmText} analyzerPeakDb=${analyzerPeakDbText}`,
     );
     lastTickLogMs = now;
   }
@@ -1282,6 +1766,18 @@ function assertClipId(payload) {
     return payload.clip_id.trim();
   }
   throw new Error('clipId is required');
+}
+
+function normalizeClipDisplayColor(value) {
+  if (!isNonEmptyString(value)) {
+    return null;
+  }
+  const trimmed = value.trim();
+  const match = /^#?([0-9a-fA-F]{6})$/.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  return `#${match[1].toLowerCase()}`;
 }
 
 function assertPatternId(payload) {
@@ -1731,23 +2227,18 @@ async function syncPlaylistClipsToNative() {
       try {
         pathToSend = await fs.realpath(sourcePath);
       } catch (e) {
-        const msg = `source file not found (engine): ${sourcePath}`;
-        errors.push(`track ${trackId} clip ${clipName || clipId}: ${msg}`);
-        summary.failed += 1;
-        if (summary.lastErrors.length < 10) summary.lastErrors.push(msg);
-        console.warn(`[thestuu-engine]   Track ${trackId} clip "${clipName || clipId}": FAILED - ${msg}`);
-        continue;
+        // Keep original path so native can still open it (e.g. freshly recorded file)
+        pathToSend = sourcePath;
+        console.warn(`[thestuu-engine]   Track ${trackId} clip "${clipName || clipId}": using path as-is (realpath failed)`);
       }
     }
+    let fileReadable = true;
     try {
       await fs.access(pathToSend, fsConstants.R_OK);
     } catch (e) {
-      const msg = `file not readable: ${pathToSend}`;
-      errors.push(`track ${trackId} clip ${clipName || clipId}: ${msg}`);
-      summary.failed += 1;
-      if (summary.lastErrors.length < 10) summary.lastErrors.push(msg);
-      console.warn(`[thestuu-engine]   Track ${trackId} clip "${clipName || clipId}": FAILED - ${msg}`);
-      continue;
+      fileReadable = false;
+      // Still attempt sync so native can use the file (e.g. recording written by native process)
+      console.warn(`[thestuu-engine]   Track ${trackId} clip "${clipName || clipId}": file not readable from engine, syncing anyway for native`);
     }
     try {
       // Playlist stores start/length in bars (UI convention); convert to seconds for native.
@@ -1767,7 +2258,7 @@ async function syncPlaylistClipsToNative() {
       // large offset, causing playback to start late (playhead ahead of audio). Use peak-based only.
       const ext = path.extname(pathToSend).toLowerCase();
       const isWav = ext === '.wav' || ext === '.wave';
-      if (source_offset_seconds === 0 && !isWav) {
+      if (source_offset_seconds === 0 && !isWav && fileReadable) {
         source_offset_seconds = await computeLeadingSilenceFromFile(pathToSend);
       }
       const payload = {
@@ -1821,24 +2312,43 @@ async function syncNativeArrangementFromPlaylist() {
     // ignore; we simply won't restore
   }
   try {
+    // Merge native edit into playlist first so we don't wipe freshly recorded clips
+    await mergeNativeClipsIntoPlaylist();
     await requestNativeTransport('edit:clear-audio-clips');
     await syncPlaylistClipsToNative();
+    // Ensure every playlist track has a mixer entry so we apply mute/solo/volume to all (Track 1 must not be left unmapped).
+    ensureProjectArrays();
+    const playlist = Array.isArray(state.project.playlist) ? state.project.playlist : [];
+    let mixer = Array.isArray(state.project.mixer) ? state.project.mixer : [];
+    for (const track of playlist) {
+      const trackId = Number(track?.track_id);
+      if (!Number.isInteger(trackId) || trackId < 1) continue;
+      const hasMixer = mixer.some((m) => Number(m?.track_id) === trackId);
+      if (!hasMixer) {
+        mixer.push(createDefaultMixerEntry(trackId));
+      }
+    }
+    if (mixer.length !== state.project.mixer?.length) {
+      state.project.mixer = mixer;
+    }
     // Apply current mixer (mute, solo, volume, pan, record arm) to native so playback reflects UI state.
-    const mixer = Array.isArray(state.project.mixer) ? state.project.mixer : [];
+    // Always set volume/pan so no track is left at 0 or stale native state (fixes Track 1 silent after sync).
     for (const entry of mixer) {
       const trackId = Number(entry?.track_id);
       if (!Number.isInteger(trackId) || trackId < 1) continue;
       await requestNativeTransport('track:set-mute', { track_id: trackId, mute: normalizeBool(entry.mute) }).catch(() => {});
       await requestNativeTransport('track:set-solo', { track_id: trackId, solo: normalizeBool(entry.solo) }).catch(() => {});
-      const vol = Number(entry?.volume);
-      if (Number.isFinite(vol)) {
-        await requestNativeTransport('track:set-volume', { track_id: trackId, volume: Math.max(0, Math.min(1.2, vol)) }).catch(() => {});
-      }
-      const p = Number(entry?.pan);
-      if (Number.isFinite(p)) {
-        await requestNativeTransport('track:set-pan', { track_id: trackId, pan: Math.max(-1, Math.min(1, p)) }).catch(() => {});
-      }
+      const vol = Number.isFinite(Number(entry?.volume)) ? Number(entry.volume) : 0.85;
+      await requestNativeTransport('track:set-volume', { track_id: trackId, volume: Math.max(0, Math.min(1.2, vol)) }).catch(() => {});
+      const p = Number.isFinite(Number(entry?.pan)) ? Number(entry.pan) : 0;
+      await requestNativeTransport('track:set-pan', { track_id: trackId, pan: Math.max(-1, Math.min(1, p)) }).catch(() => {});
       await requestNativeTransport('track:set-record-arm', { track_id: trackId, record_armed: normalizeBool(entry.record_armed) }).catch(() => {});
+    }
+    // Ensure Track 1 is audible when it has clips (workaround for sync leaving it silent).
+    const track1 = playlist.find((t) => Number(t?.track_id) === 1);
+    if (track1 && Array.isArray(track1.clips) && track1.clips.length > 0) {
+      await requestNativeTransport('track:set-mute', { track_id: 1, mute: false }).catch(() => {});
+      await requestNativeTransport('track:set-volume', { track_id: 1, volume: 0.85 }).catch(() => {});
     }
     // Rebuild playback graph immediately so play works instantly (no timer wait).
     await requestNativeTransport('transport:ensure-context', {});
@@ -2477,6 +2987,53 @@ async function setClipFade(payload = {}) {
   return { clipId, trackId };
 }
 
+function setClipProperties(payload = {}) {
+  const trackId = assertTrackId(payload);
+  const clipId = assertClipId(payload);
+  const track = getTrack(trackId);
+  if (!track) {
+    throw new Error(`track "${trackId}" not found`);
+  }
+
+  const { clip } = findClip(track, clipId);
+  if (!clip) {
+    throw new Error(`clip "${clipId}" not found on track ${trackId}`);
+  }
+
+  const hasNamePatch = Object.prototype.hasOwnProperty.call(payload, 'name')
+    || Object.prototype.hasOwnProperty.call(payload, 'clip_name')
+    || Object.prototype.hasOwnProperty.call(payload, 'clipName');
+  if (hasNamePatch) {
+    const rawName = payload.name ?? payload.clip_name ?? payload.clipName;
+    const normalizedName = isNonEmptyString(rawName) ? rawName.trim().slice(0, 255) : '';
+    if (normalizedName) {
+      clip.name = normalizedName;
+    } else {
+      delete clip.name;
+    }
+  }
+
+  const hasColorPatch = Object.prototype.hasOwnProperty.call(payload, 'color')
+    || Object.prototype.hasOwnProperty.call(payload, 'clip_color')
+    || Object.prototype.hasOwnProperty.call(payload, 'clipColor');
+  if (hasColorPatch) {
+    const rawColor = payload.color ?? payload.clip_color ?? payload.clipColor;
+    const normalizedColor = normalizeClipDisplayColor(rawColor);
+    if (normalizedColor) {
+      clip.color = normalizedColor;
+    } else {
+      delete clip.color;
+    }
+  }
+
+  return {
+    clipId,
+    trackId,
+    name: isNonEmptyString(clip.name) ? clip.name.trim() : null,
+    color: normalizeClipDisplayColor(clip.color),
+  };
+}
+
 async function deleteClip(payload = {}) {
   const trackId = assertTrackId(payload);
   const clipId = assertClipId(payload);
@@ -2689,6 +3246,9 @@ async function startNativeTransportBridge() {
         if (restoreResult.failed > 0 || restoreResult.errors.length > 0) {
           console.warn('[thestuu-engine] native VST restore issues:', restoreResult.errors.join(' | '));
         }
+        await applyNativeAnalyzerTarget().catch((error) => {
+          console.warn('[thestuu-engine] analyzer target sync failed:', error instanceof Error ? error.message : String(error));
+        });
         emitState();
         emitTransport(Date.now());
       } catch (error) {
@@ -2775,6 +3335,63 @@ function getRequestPath(request) {
   } catch {
     const [pathname] = rawUrl.split('?');
     return pathname || '/';
+  }
+}
+
+function sanitizePluginPreviewUid(uid) {
+  return String(uid || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._:-]+/g, '_')
+    .slice(0, 160);
+}
+
+function buildPluginPreviewFilename(uid, width, height) {
+  const base = sanitizePluginPreviewUid(uid).replace(/[:/\\]+/g, '_') || 'plugin';
+  return `${base}_${width}x${height}.png`;
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureNativePluginPreviewFile({ pluginUid, width, height, outputPath }) {
+  const cacheKey = `${pluginUid}::${width}x${height}`;
+  const existing = pendingPluginPreviewRenders.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const renderPromise = (async () => {
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    if (await fileExists(outputPath)) {
+      return { path: outputPath, generated: false };
+    }
+
+    const response = await requestNativeTransport('vst:preview:get', {
+      plugin_uid: pluginUid,
+      width,
+      height,
+      output_path: outputPath,
+    });
+    const resolvedPath = typeof response?.path === 'string' && response.path.trim() ? response.path : outputPath;
+    return {
+      path: resolvedPath,
+      generated: Boolean(response?.generated),
+      width: Number(response?.width) || width,
+      height: Number(response?.height) || height,
+    };
+  })();
+
+  pendingPluginPreviewRenders.set(cacheKey, renderPromise);
+  try {
+    return await renderPromise;
+  } finally {
+    pendingPluginPreviewRenders.delete(cacheKey);
   }
 }
 
@@ -2899,6 +3516,58 @@ const httpServer = createServer(async (request, response) => {
       return;
     }
 
+    if (method === 'GET' && requestPath === '/plugin-preview') {
+      try {
+        const parsedUrl = new URL(request?.url ?? '', `http://${request?.headers?.host || 'localhost'}`);
+        const pluginUid = String(parsedUrl.searchParams.get('uid') || '').trim();
+        if (!pluginUid) {
+          safeSendJson(400, { ok: false, error: 'uid required' });
+          return;
+        }
+        if (!pluginUid.startsWith('internal:tracktion:')) {
+          safeSendJson(400, { ok: false, error: 'only internal:tracktion:* previews are supported' });
+          return;
+        }
+        if (!nativeTransportActive) {
+          safeSendJson(503, { ok: false, error: 'native transport is not active' });
+          return;
+        }
+
+        const widthRaw = Number(parsedUrl.searchParams.get('w') ?? parsedUrl.searchParams.get('width') ?? 320);
+        const heightRaw = Number(parsedUrl.searchParams.get('h') ?? parsedUrl.searchParams.get('height') ?? 96);
+        const width = Math.max(48, Math.min(PLUGIN_PREVIEW_MAX_DIM, Math.round(Number.isFinite(widthRaw) ? widthRaw : 320)));
+        const height = Math.max(32, Math.min(PLUGIN_PREVIEW_MAX_DIM, Math.round(Number.isFinite(heightRaw) ? heightRaw : 96)));
+
+        const filename = buildPluginPreviewFilename(pluginUid, width, height);
+        const outputPath = path.join(pluginPreviewCacheDir, filename);
+        const renderResult = await ensureNativePluginPreviewFile({ pluginUid, width, height, outputPath });
+        const resolvedPath = path.resolve(renderResult?.path || outputPath);
+        const cacheRoot = path.resolve(pluginPreviewCacheDir);
+        if (!resolvedPath.startsWith(cacheRoot)) {
+          safeSendJson(500, { ok: false, error: 'invalid preview cache path' });
+          return;
+        }
+        const stat = await fs.stat(resolvedPath).catch(() => null);
+        if (!stat || !stat.isFile()) {
+          safeSendJson(404, { ok: false, error: 'preview_not_found' });
+          return;
+        }
+
+        response.writeHead(200, {
+          ...CORS_HEADERS,
+          'Content-Type': 'image/png',
+          'Content-Length': String(stat.size),
+          'Cache-Control': 'public, max-age=31536000, immutable',
+        });
+        createReadStream(resolvedPath).pipe(response);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[thestuu-engine] GET /plugin-preview error:', message);
+        safeSendJson(500, { ok: false, error: message });
+      }
+      return;
+    }
+
     if (method === 'GET' && requestPath === '/health') {
       safeSendJson(200, {
         ok: true,
@@ -2987,6 +3656,27 @@ io.on('connection', (socket) => {
     socket.emit('engine:analyzer', { available: false, reason: 'native-offline' });
   }
 
+  socket.on('analyzer:set-target', async (payload = {}, callback = () => {}) => {
+    try {
+      const normalizedTarget = normalizeAnalyzerTargetPayload(payload);
+      if (!normalizedTarget) {
+        respond(callback, { ok: false, error: 'invalid analyzer target payload' });
+        return;
+      }
+      desiredEqAnalyzerTarget = normalizedTarget;
+
+      if (!nativeTransportActive) {
+        respond(callback, { ok: false, error: 'native transport is not active', target: normalizedTarget });
+        return;
+      }
+
+      await applyNativeAnalyzerTarget(normalizedTarget);
+      respond(callback, { ok: true, target: normalizedTarget });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'analyzer:set-target failed' });
+    }
+  });
+
   socket.on('transport:play', async (payload = {}, callback = () => {}) => {
     const requestedBpmRaw = Number(payload?.bpm);
     const requestedBpm = Number.isFinite(requestedBpmRaw) ? normalizeTransportBpm(requestedBpmRaw) : null;
@@ -3009,9 +3699,14 @@ io.on('connection', (socket) => {
     try {
       if (nativeTransportActive) {
         const anyRecordArmed = (Array.isArray(state.project.mixer) && state.project.mixer.some((e) => normalizeBool(e?.record_armed)));
-        const nativeCmd = anyRecordArmed ? 'transport.record' : 'transport.play';
         const armedTracks = anyRecordArmed ? (state.project.mixer || []).filter((e) => normalizeBool(e?.record_armed)).map((e) => e?.track_id).filter((id) => Number.isInteger(id)) : [];
-        console.log('[thestuu-engine] transport:play → sending to native:', nativeCmd, anyRecordArmed ? `(record armed tracks: ${armedTracks.join(',')})` : '');
+        const modeRaw = typeof payload?.mode === 'string' ? payload.mode.trim().toLowerCase() : '';
+        const explicitRecord = normalizeBool(payload?.record ?? payload?.recording) || modeRaw === 'record';
+        const nativeCmd = explicitRecord ? 'transport.record' : 'transport.play';
+        if (anyRecordArmed && !explicitRecord) {
+          console.log('[thestuu-engine] transport:play → armed tracks present, but using normal playback:', armedTracks.join(','));
+        }
+        console.log('[thestuu-engine] transport:play → sending to native:', nativeCmd, explicitRecord && anyRecordArmed ? `(record armed tracks: ${armedTracks.join(',')})` : '');
         tickCountAfterPlay = 1;
         // Native backends can reset tempo on play; enforce desired BPM around the play command.
         await requestNativeTransport('transport.set_bpm', { bpm: desiredBpm }).catch((error) => {
@@ -4245,6 +4940,8 @@ io.on('connection', (socket) => {
   bindMutation(socket, 'clip:move', moveClip);
   bindMutation(socket, 'clip:resize', resizeClip);
   bindMutation(socket, 'clip:set-fade', setClipFade);
+  bindMutation(socket, 'clip:set-properties', setClipProperties);
+  bindMutation(socket, 'clip:analyze-bpm-key', analyzeClipBpmKey);
   bindMutation(socket, 'clip:delete', deleteClip);
 
   bindMutation(socket, 'move_midi_note', moveMidiNote);
@@ -4259,6 +4956,8 @@ io.on('connection', (socket) => {
   bindMutation(socket, 'move_clip', moveClip);
   bindMutation(socket, 'resize_clip', resizeClip);
   bindMutation(socket, 'set_clip_fade', setClipFade);
+  bindMutation(socket, 'set_clip_properties', setClipProperties);
+  bindMutation(socket, 'analyze_clip_bpm_key', analyzeClipBpmKey);
   bindMutation(socket, 'delete_clip', deleteClip);
 });
 

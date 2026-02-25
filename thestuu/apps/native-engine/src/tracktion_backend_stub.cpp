@@ -38,6 +38,23 @@ bool loadPlugin(const std::string& pluginUid, int32_t trackId, LoadPluginResult&
   return false;
 }
 
+bool getPluginPreviewImage(
+  const std::string& pluginUid,
+  int32_t width,
+  int32_t height,
+  const std::string& outputPath,
+  bool& generated,
+  std::string& error
+) {
+  (void)pluginUid;
+  (void)width;
+  (void)height;
+  (void)outputPath;
+  generated = false;
+  error = "vst:preview:get requires STUU_ENABLE_TRACKTION=ON";
+  return false;
+}
+
 bool setPluginParameter(
   int32_t trackId,
   int32_t pluginIndex,
@@ -73,6 +90,13 @@ bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::strin
 
 bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
   out = {};
+  return false;
+}
+
+bool setSpectrumAnalyzerTarget(int32_t trackId, int32_t pluginIndex, std::string& error) {
+  (void)trackId;
+  (void)pluginIndex;
+  error = "analyzer:set-target requires STUU_ENABLE_TRACKTION=ON";
   return false;
 }
 

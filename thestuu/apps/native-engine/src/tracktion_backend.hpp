@@ -79,6 +79,14 @@ bool resetDefaultEdit(int32_t trackCount, std::string& error);
 bool scanPlugins(std::vector<PluginInfo>& plugins, std::string& error);
 bool loadPlugin(const std::string& pluginUid, int32_t trackId, LoadPluginResult& result, std::string& error);
 bool openPluginEditor(int32_t trackId, int32_t pluginIndex, std::string& error);
+bool getPluginPreviewImage(
+  const std::string& pluginUid,
+  int32_t width,
+  int32_t height,
+  const std::string& outputPath,
+  bool& generated,
+  std::string& error
+);
 bool setPluginParameter(
   int32_t trackId,
   int32_t pluginIndex,
@@ -126,7 +134,8 @@ bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::strin
 
 /**
  * Live spectrum analyzer frame from the native audio path.
- * Current MVP source is the global post-output (master) and mirrors pre/post until track/plugin taps are added.
+ * Source is either the selected track post-FX level meter tap or the global output fallback.
+ * Pre/Post may still mirror until dedicated per-plugin taps are added.
  */
 struct SpectrumAnalyzerSnapshot {
   bool available = false;
@@ -143,6 +152,8 @@ struct SpectrumAnalyzerSnapshot {
   std::vector<float> postDb;
 };
 bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out);
+/** Set analyzer target to a track (1-based audio track id). Pass trackId <= 0 to use master fallback. */
+bool setSpectrumAnalyzerTarget(int32_t trackId, int32_t pluginIndex, std::string& error);
 
 struct TransportSnapshot {
   bool playing = false;

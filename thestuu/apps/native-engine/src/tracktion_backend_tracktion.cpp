@@ -38,6 +38,8 @@ struct BackendState {
   std::unordered_map<std::string, juce::PluginDescription> pluginByUid;
   std::unordered_map<std::string, std::vector<PluginParameterInfo>> parameterCacheByUid;
   std::unique_ptr<GlobalSpectrumAnalyzerTap> spectrumAnalyzerTap;
+  std::atomic<int32_t> spectrumAnalyzerTargetTrackId{0};
+  std::atomic<int32_t> spectrumAnalyzerTargetPluginIndex{-1};
 };
 
 std::unique_ptr<BackendState> gState;
@@ -3271,6 +3273,1291 @@ class ReverbFallbackEditor final : public tracktion::engine::Plugin::EditorCompo
   bool ignorePresetButtonSync = false;
 };
 
+class DelayFallbackEditor final : public tracktion::engine::Plugin::EditorComponent,
+                                  private juce::Timer,
+                                  private juce::AsyncUpdater,
+                                  private tracktion::engine::AutomatableParameter::Listener {
+  enum class DelayPreset {
+    vocalSlap,
+    popEighth,
+    wideThrow,
+    darkDub,
+  };
+
+  struct DelayTuningTarget {
+    bool useSync = false;
+    int syncDivisionIndex = 2;
+    int freeDelayMs = 150;
+    float mix = 0.3F;
+    int repeats = 3;
+    float tone = 0.5F;
+    juce::String hint;
+  };
+
+ public:
+  explicit DelayFallbackEditor(tracktion::engine::DelayPlugin& pluginToControl)
+    : delay(pluginToControl),
+      feedbackParam(delay.feedbackDb),
+      mixParam(delay.mixProportion),
+      toneParam(delay.toneAmount) {
+    setupHeaderLabel(titleLabel, "delayday");
+    titleLabel.setFont(juce::Font(juce::FontOptions(24.0F, juce::Font::bold)));
+    titleLabel.setJustificationType(juce::Justification::centred);
+    titleLabel.setColour(juce::Label::textColourId, juce::Colour(0xFF6B4EE4));
+    addAndMakeVisible(titleLabel);
+
+    setupBodyLabel(subtitleLabel);
+    subtitleLabel.setText(
+      "TheStuu Delay Hero UI: Distanz = Zeit, Figuren = Repeats (Tracktion Delay Fallback).",
+      juce::dontSendNotification
+    );
+    subtitleLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(subtitleLabel);
+
+    setupPanelTitle(stageTitleLabel, "VISUAL STAGE");
+    addAndMakeVisible(stageTitleLabel);
+    setupPanelTitle(timeTitleLabel, "TIME");
+    addAndMakeVisible(timeTitleLabel);
+    setupPanelTitle(mixTitleLabel, "MIX");
+    addAndMakeVisible(mixTitleLabel);
+    setupPanelTitle(feedbackTitleLabel, "FEEDBACK");
+    addAndMakeVisible(feedbackTitleLabel);
+    setupPanelTitle(repeatsTitleLabel, "REPEATS");
+    addAndMakeVisible(repeatsTitleLabel);
+    setupPanelTitle(toneTitleLabel, "TONE");
+    addAndMakeVisible(toneTitleLabel);
+
+    timeReadoutLabel.setJustificationType(juce::Justification::centred);
+    timeReadoutLabel.setColour(juce::Label::backgroundColourId, juce::Colour(0xFF6F45E8));
+    timeReadoutLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.96F));
+    timeReadoutLabel.setColour(juce::Label::outlineColourId, juce::Colour(0x665B31D5));
+    timeReadoutLabel.setFont(juce::Font(juce::FontOptions(18.0F, juce::Font::bold)));
+    addAndMakeVisible(timeReadoutLabel);
+
+    bpmLabel.setJustificationType(juce::Justification::centredRight);
+    bpmLabel.setColour(juce::Label::textColourId, juce::Colour(0xCC453A6A));
+    bpmLabel.setFont(juce::Font(juce::FontOptions(12.0F, juce::Font::bold)));
+    addAndMakeVisible(bpmLabel);
+
+    syncDivisionLabel.setJustificationType(juce::Justification::centredRight);
+    syncDivisionLabel.setColour(juce::Label::textColourId, juce::Colour(0xFF5A517F));
+    syncDivisionLabel.setFont(juce::Font(juce::FontOptions(12.0F)));
+    addAndMakeVisible(syncDivisionLabel);
+
+    configureToggleButton(syncToggleButton, "Sync");
+    syncToggleButton.setClickingTogglesState(true);
+    syncToggleButton.onClick = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)] {
+      if (safe != nullptr) {
+        safe->setSyncEnabled(safe->syncToggleButton.getToggleState(), true);
+      }
+    };
+    addAndMakeVisible(syncToggleButton);
+
+    setupPanelTitle(presetTitleLabel, "PRESETS");
+    addAndMakeVisible(presetTitleLabel);
+    setupMetricLabel(presetHintLabel);
+    presetHintLabel.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(presetHintLabel);
+
+    setupPresetButton(presetVocalSlapButton, "Vocal Slap", DelayPreset::vocalSlap);
+    setupPresetButton(presetPopEighthButton, "1/8 Pop", DelayPreset::popEighth);
+    setupPresetButton(presetWideThrowButton, "Wide Throw", DelayPreset::wideThrow);
+    setupPresetButton(presetDarkDubButton, "Dark Dub", DelayPreset::darkDub);
+
+    setupUtilityActionButton(randomThrowButton, "Random");
+    randomThrowButton.onClick = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)] {
+      if (safe != nullptr) {
+        safe->applyRandomThrow();
+      }
+    };
+    addAndMakeVisible(randomThrowButton);
+
+    setupUtilityActionButton(morphThrowButton, "Morph");
+    morphThrowButton.onClick = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)] {
+      if (safe != nullptr) {
+        safe->applyMorphThrow();
+      }
+    };
+    addAndMakeVisible(morphThrowButton);
+
+    setupMetricLabel(mixValueLabel);
+    setupMetricLabel(feedbackValueLabel);
+    setupMetricLabel(repeatsValueLabel);
+    setupMetricLabel(toneValueLabel);
+    setupMetricLabel(mixRangeLabel);
+    setupMetricLabel(feedbackRangeLabel);
+    setupMetricLabel(repeatsRangeLabel);
+    setupMetricLabel(toneLeftLabel);
+    setupMetricLabel(toneRightLabel);
+    toneLeftLabel.setText("Dark", juce::dontSendNotification);
+    toneRightLabel.setText("Bright", juce::dontSendNotification);
+    toneLeftLabel.setJustificationType(juce::Justification::centredLeft);
+    toneRightLabel.setJustificationType(juce::Justification::centredRight);
+
+    addAndMakeVisible(mixValueLabel);
+    addAndMakeVisible(feedbackValueLabel);
+    addAndMakeVisible(repeatsValueLabel);
+    addAndMakeVisible(toneValueLabel);
+    addAndMakeVisible(mixRangeLabel);
+    addAndMakeVisible(feedbackRangeLabel);
+    addAndMakeVisible(repeatsRangeLabel);
+    addAndMakeVisible(toneLeftLabel);
+    addAndMakeVisible(toneRightLabel);
+
+    infoLabel.setJustificationType(juce::Justification::centredLeft);
+    infoLabel.setColour(juce::Label::textColourId, juce::Colour(0xCC564D79));
+    infoLabel.setFont(juce::Font(juce::FontOptions(12.0F)));
+    addAndMakeVisible(infoLabel);
+
+    setupTimeSlider(timeSlider);
+    timeSlider.onValueChange = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)] {
+      if (safe == nullptr || safe->ignoreControlCallbacks) return;
+      safe->applyTimeControlValue(static_cast<int>(juce::roundToInt(safe->timeSlider.getValue())));
+    };
+    addAndMakeVisible(timeSlider);
+
+    setupLinearSlider(mixSlider, juce::Colour(0xFF7448EC));
+    setupLinearSlider(feedbackSlider, juce::Colour(0xFF6B39E2));
+    setupLinearSlider(repeatsSlider, juce::Colour(0xFF8452F5));
+    setupLinearSlider(toneSlider, juce::Colour(0xFF8C6DFF));
+
+    mixSlider.setRange(0.0, 1.0, 0.001);
+    feedbackSlider.setRange(-30.0, 0.0, 0.01);
+    repeatsSlider.setRange(1.0, 8.0, 1.0);
+    toneSlider.setRange(0.0, 1.0, 0.001);
+
+    connectParamSlider(mixSlider, mixParam, [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)](double value) {
+      if (safe != nullptr) safe->setParamActual(safe->mixParam, static_cast<float>(value));
+    });
+    connectParamSlider(feedbackSlider, feedbackParam, [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)](double value) {
+      if (safe != nullptr) safe->setParamActual(safe->feedbackParam, static_cast<float>(value));
+    });
+    connectParamSlider(toneSlider, toneParam, [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)](double value) {
+      if (safe != nullptr && safe->toneParam != nullptr) {
+        safe->setParamActual(safe->toneParam, static_cast<float>(value));
+      }
+    });
+
+    repeatsSlider.onValueChange = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this)] {
+      if (safe == nullptr || safe->ignoreControlCallbacks) return;
+      const int repeats = juce::jlimit(1, 8, juce::roundToInt(safe->repeatsSlider.getValue()));
+      safe->applyRepeatCount(repeats, true);
+    };
+
+    addAndMakeVisible(mixSlider);
+    addAndMakeVisible(feedbackSlider);
+    addAndMakeVisible(repeatsSlider);
+    addAndMakeVisible(toneSlider);
+
+    if (feedbackParam != nullptr) addParamListener(feedbackParam);
+    if (mixParam != nullptr) addParamListener(mixParam);
+    if (toneParam != nullptr) addParamListener(toneParam);
+
+    ensureLevelMeterClientAttachment();
+    loadUiState();
+
+    setSize(980, 808);
+    syncControlsFromState();
+    startTimerHz(30);
+  }
+
+  ~DelayFallbackEditor() override {
+    stopTimer();
+    detachLevelMeterClient();
+    if (feedbackParam != nullptr) removeParamListener(feedbackParam);
+    if (mixParam != nullptr) removeParamListener(mixParam);
+    if (toneParam != nullptr) removeParamListener(toneParam);
+  }
+
+  bool allowWindowResizing() override { return false; }
+  juce::ComponentBoundsConstrainer* getBoundsConstrainer() override { return {}; }
+
+  void resized() override {
+    auto area = getLocalBounds().reduced(18);
+
+    titleLabel.setBounds(area.removeFromTop(30));
+    subtitleLabel.setBounds(area.removeFromTop(18));
+    area.removeFromTop(10);
+
+    heroPanelBounds = area.removeFromTop(300);
+    area.removeFromTop(10);
+    controlPanelBounds = area.removeFromTop(136);
+    area.removeFromTop(10);
+    tonePanelBounds = area.removeFromTop(96);
+    area.removeFromTop(10);
+    presetPanelBounds = area.removeFromTop(96);
+    area.removeFromTop(8);
+    infoLabel.setBounds(area.removeFromTop(22));
+
+    auto heroInner = heroPanelBounds.reduced(16);
+    auto heroHeader = heroInner.removeFromTop(22);
+    stageTitleLabel.setBounds(heroHeader.removeFromLeft(140));
+    bpmLabel.setBounds(heroHeader.removeFromRight(86));
+    heroHeader.removeFromRight(8);
+    syncDivisionLabel.setBounds(heroHeader.removeFromRight(110));
+    heroHeader.removeFromRight(8);
+    syncToggleButton.setBounds(heroHeader.removeFromRight(78));
+    heroInner.removeFromTop(8);
+
+    auto stageBlock = heroInner.removeFromTop(182);
+    heroStageBounds = stageBlock.toFloat();
+    heroInner.removeFromTop(6);
+    auto timeHeader = heroInner.removeFromTop(18);
+    timeTitleLabel.setBounds(timeHeader.removeFromLeft(70));
+    heroInner.removeFromTop(4);
+
+    auto timelineArea = heroInner.removeFromTop(54);
+    timeSlider.setBounds(timelineArea.reduced(22, 8));
+    timelineBounds = timelineArea.toFloat();
+    timelineTrackBounds = timeSlider.getBounds().toFloat().reduced(14.0F, 14.0F);
+    updateTimeReadoutBounds();
+
+    auto controlsInner = controlPanelBounds.reduced(12);
+    const int gap = 10;
+    const int cardWidth = (controlsInner.getWidth() - (gap * 2)) / 3;
+    mixCardBounds = controlsInner.removeFromLeft(cardWidth);
+    controlsInner.removeFromLeft(gap);
+    feedbackCardBounds = controlsInner.removeFromLeft(cardWidth);
+    controlsInner.removeFromLeft(gap);
+    repeatsCardBounds = controlsInner;
+
+    layoutControlCard(mixCardBounds, mixTitleLabel, mixSlider, mixValueLabel, mixRangeLabel);
+    layoutControlCard(feedbackCardBounds, feedbackTitleLabel, feedbackSlider, feedbackValueLabel, feedbackRangeLabel);
+    layoutControlCard(repeatsCardBounds, repeatsTitleLabel, repeatsSlider, repeatsValueLabel, repeatsRangeLabel);
+
+    auto toneInner = tonePanelBounds.reduced(12);
+    toneTitleLabel.setBounds(toneInner.removeFromTop(20));
+    toneInner.removeFromTop(8);
+    toneValueLabel.setBounds(toneInner.removeFromTop(18));
+    toneInner.removeFromTop(4);
+    toneSlider.setBounds(toneInner.removeFromTop(28).reduced(18, 4));
+    toneInner.removeFromTop(2);
+    auto toneLabelsRow = toneInner.removeFromTop(18);
+    toneLeftLabel.setBounds(toneLabelsRow.removeFromLeft(90));
+    toneRightLabel.setBounds(toneLabelsRow.removeFromRight(90));
+
+    auto presetInner = presetPanelBounds.reduced(12);
+    auto presetHeader = presetInner.removeFromTop(18);
+    presetTitleLabel.setBounds(presetHeader.removeFromLeft(90));
+    auto utilRight = presetHeader.removeFromRight(150);
+    auto morphArea = utilRight.removeFromRight(72);
+    utilRight.removeFromRight(6);
+    auto randomArea = utilRight.removeFromRight(72);
+    randomThrowButton.setBounds(randomArea);
+    morphThrowButton.setBounds(morphArea);
+    presetHintLabel.setBounds(presetHeader);
+    presetInner.removeFromTop(6);
+    layoutFourButtons(
+      presetInner.removeFromTop(30),
+      presetVocalSlapButton,
+      presetPopEighthButton,
+      presetWideThrowButton,
+      presetDarkDubButton
+    );
+  }
+
+  void paint(juce::Graphics& g) override {
+    const auto bounds = getLocalBounds().toFloat();
+    g.setGradientFill(juce::ColourGradient(
+      juce::Colour(0xFFF2EEFF), bounds.getTopLeft(),
+      juce::Colour(0xFFECE6FF), bounds.getBottomRight(),
+      false
+    ));
+    g.fillAll();
+
+    drawBackdrop(g, bounds);
+    drawPanel(g, heroPanelBounds.toFloat(), 18.0F, juce::Colour(0xEFFFFFFF), juce::Colour(0x18A58FFF));
+    drawPanel(g, controlPanelBounds.toFloat(), 14.0F, juce::Colour(0xF9FFFFFF), juce::Colour(0x12A08CFF));
+    drawPanel(g, tonePanelBounds.toFloat(), 14.0F, juce::Colour(0xF9FFFFFF), juce::Colour(0x12A08CFF));
+    drawPanel(g, presetPanelBounds.toFloat(), 14.0F, juce::Colour(0xF9FFFFFF), juce::Colour(0x12A08CFF));
+
+    drawControlCard(g, mixCardBounds.toFloat());
+    drawControlCard(g, feedbackCardBounds.toFloat());
+    drawControlCard(g, repeatsCardBounds.toFloat());
+    drawStage(g, heroStageBounds);
+    drawTimeline(g, timelineBounds);
+    drawToneTrackOverlay(g, toneSlider.getBounds().toFloat());
+  }
+
+ private:
+  struct SyncDivision {
+    const char* label;
+    double beats;
+  };
+
+  static constexpr int kMinDelayMs = 10;
+  static constexpr int kMaxDelayMs = 2000;
+  static constexpr std::array<SyncDivision, 8> kSyncDivisions{{
+    {"1/16", 0.25},
+    {"1/8T", 1.0 / 3.0},
+    {"1/8", 0.5},
+    {"1/4T", 2.0 / 3.0},
+    {"1/4", 1.0},
+    {"1/2T", 4.0 / 3.0},
+    {"1/2", 2.0},
+    {"1/1", 4.0},
+  }};
+
+  static constexpr auto kSyncEnabledProperty = "thestuuDelaySyncEnabled";
+  static constexpr auto kSyncDivisionProperty = "thestuuDelaySyncDivision";
+
+  static float clamp01(float value) {
+    return juce::jlimit(0.0F, 1.0F, value);
+  }
+
+  static float lerp(float a, float b, float t) {
+    return a + ((b - a) * t);
+  }
+
+  static juce::String percentString(float value) {
+    return juce::String(juce::roundToInt(clamp01(value) * 100.0F)) + "%";
+  }
+
+  static void drawPanel(juce::Graphics& g, juce::Rectangle<float> r, float radius, juce::Colour fill, juce::Colour stroke) {
+    if (r.isEmpty()) return;
+    g.setGradientFill(juce::ColourGradient(fill, r.getTopLeft(), fill.darker(0.02F), r.getBottomLeft(), false));
+    g.fillRoundedRectangle(r, radius);
+    g.setColour(stroke);
+    g.drawRoundedRectangle(r, radius, 1.0F);
+  }
+
+  static void setupHeaderLabel(juce::Label& label, const juce::String& text) {
+    label.setText(text, juce::dontSendNotification);
+    label.setJustificationType(juce::Justification::centredLeft);
+  }
+
+  static void setupBodyLabel(juce::Label& label) {
+    label.setColour(juce::Label::textColourId, juce::Colour(0xB44A4568));
+    label.setFont(juce::Font(juce::FontOptions(12.0F)));
+  }
+
+  static void setupPanelTitle(juce::Label& label, const juce::String& text) {
+    label.setText(text, juce::dontSendNotification);
+    label.setJustificationType(juce::Justification::centredLeft);
+    label.setColour(juce::Label::textColourId, juce::Colour(0xFF4E4874));
+    label.setFont(juce::Font(juce::FontOptions(12.0F, juce::Font::bold)));
+  }
+
+  static void setupMetricLabel(juce::Label& label) {
+    label.setColour(juce::Label::textColourId, juce::Colour(0xCC5C5682));
+    label.setFont(juce::Font(juce::FontOptions(11.6F)));
+    label.setJustificationType(juce::Justification::centred);
+  }
+
+  void configureToggleButton(juce::TextButton& button, const juce::String& text) {
+    button.setButtonText(text);
+    button.setColour(juce::TextButton::buttonColourId, juce::Colour(0x12FFFFFF));
+    button.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xFF724BEB));
+    button.setColour(juce::TextButton::textColourOffId, juce::Colour(0xE34E4874));
+    button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+  }
+
+  void setupUtilityActionButton(juce::TextButton& button, const juce::String& text) {
+    button.setButtonText(text);
+    button.setColour(juce::TextButton::buttonColourId, juce::Colour(0x10FFFFFF));
+    button.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xFF5E43C8));
+    button.setColour(juce::TextButton::textColourOffId, juce::Colour(0xDD4A456E));
+    button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+  }
+
+  void setupPresetButton(juce::TextButton& button, const juce::String& text, DelayPreset preset) {
+    button.setButtonText(text);
+    button.setClickingTogglesState(true);
+    button.setRadioGroupId(94821);
+    button.setColour(juce::TextButton::buttonColourId, juce::Colour(0x14FFFFFF));
+    button.setColour(juce::TextButton::buttonOnColourId, juce::Colour(0xFF714AE9));
+    button.setColour(juce::TextButton::textColourOffId, juce::Colour(0xE04F4876));
+    button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+    button.onClick = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this), preset] {
+      if (safe != nullptr) {
+        safe->applyPreset(preset);
+      }
+    };
+    addAndMakeVisible(button);
+  }
+
+  void setupLinearSlider(juce::Slider& slider, juce::Colour accent) {
+    slider.setSliderStyle(juce::Slider::LinearHorizontal);
+    slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    slider.setColour(juce::Slider::trackColourId, accent);
+    slider.setColour(juce::Slider::backgroundColourId, juce::Colour(0x18FFFFFF));
+    slider.setColour(juce::Slider::thumbColourId, juce::Colours::white.withAlpha(0.95F));
+    slider.setColour(juce::Slider::rotarySliderFillColourId, accent);
+    slider.setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+  }
+
+  void setupTimeSlider(juce::Slider& slider) {
+    slider.setSliderStyle(juce::Slider::LinearHorizontal);
+    slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    slider.setRange(kMinDelayMs, kMaxDelayMs, 1.0);
+    slider.setColour(juce::Slider::trackColourId, juce::Colours::transparentBlack);
+    slider.setColour(juce::Slider::backgroundColourId, juce::Colours::transparentBlack);
+    slider.setColour(juce::Slider::thumbColourId, juce::Colours::transparentBlack);
+    slider.setAlpha(0.03F);
+  }
+
+  template <typename Setter>
+  void connectParamSlider(juce::Slider& slider, tracktion::engine::AutomatableParameter::Ptr& param, Setter setter) {
+    slider.onDragStart = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this), ptr = &param]() {
+      if (safe != nullptr && ptr != nullptr && *ptr != nullptr) {
+        (*ptr)->parameterChangeGestureBegin();
+      }
+    };
+    slider.onDragEnd = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this), ptr = &param]() {
+      if (safe != nullptr && ptr != nullptr && *ptr != nullptr) {
+        (*ptr)->parameterChangeGestureEnd();
+      }
+    };
+    slider.onValueChange = [safe = juce::Component::SafePointer<DelayFallbackEditor>(this), ptr = &param, sliderPtr = &slider, setter]() {
+      if (safe == nullptr || safe->ignoreControlCallbacks || ptr == nullptr || *ptr == nullptr || sliderPtr == nullptr) {
+        return;
+      }
+      setter(sliderPtr->getValue());
+      safe->syncControlsFromState();
+      safe->repaint();
+    };
+  }
+
+  void layoutControlCard(
+    juce::Rectangle<int> card,
+    juce::Label& title,
+    juce::Slider& slider,
+    juce::Label& value,
+    juce::Label& footer
+  ) {
+    auto area = card.reduced(12);
+    title.setBounds(area.removeFromTop(18));
+    area.removeFromTop(10);
+    value.setBounds(area.removeFromTop(20));
+    area.removeFromTop(6);
+    slider.setBounds(area.removeFromTop(28));
+    area.removeFromTop(6);
+    footer.setBounds(area.removeFromTop(18));
+  }
+
+  void layoutFourButtons(
+    juce::Rectangle<int> row,
+    juce::TextButton& a,
+    juce::TextButton& b,
+    juce::TextButton& c,
+    juce::TextButton& d
+  ) {
+    const int gap = 6;
+    const int width = (row.getWidth() - (gap * 3)) / 4;
+    a.setBounds(row.removeFromLeft(width));
+    row.removeFromLeft(gap);
+    b.setBounds(row.removeFromLeft(width));
+    row.removeFromLeft(gap);
+    c.setBounds(row.removeFromLeft(width));
+    row.removeFromLeft(gap);
+    d.setBounds(row);
+  }
+
+  void drawBackdrop(juce::Graphics& g, juce::Rectangle<float> bounds) {
+    juce::ColourGradient glow(
+      juce::Colour(0x40A58DFF), bounds.getCentreX(), bounds.getY() - 60.0F,
+      juce::Colour(0x00FFFFFF), bounds.getCentreX(), bounds.getBottom(),
+      false
+    );
+    g.setGradientFill(glow);
+    g.fillEllipse(bounds.withTrimmedBottom(bounds.getHeight() * 0.35F).expanded(60.0F, 0.0F));
+  }
+
+  void drawControlCard(juce::Graphics& g, juce::Rectangle<float> r) {
+    drawPanel(g, r, 12.0F, juce::Colour(0xFCFFFFFF), juce::Colour(0x14A08CFF));
+  }
+
+  void drawStage(juce::Graphics& g, juce::Rectangle<float> bounds) {
+    if (bounds.isEmpty()) return;
+
+    auto panel = bounds;
+    g.setGradientFill(juce::ColourGradient(
+      juce::Colour(0xFFF8F6FF), panel.getTopLeft(),
+      juce::Colour(0xFFF3EEFF), panel.getBottomLeft(),
+      false
+    ));
+    g.fillRoundedRectangle(panel, 14.0F);
+    g.setColour(juce::Colour(0x16A08CFF));
+    g.drawRoundedRectangle(panel, 14.0F, 1.0F);
+
+    const float mix = getParamNorm(mixParam, 0.3F);
+    const float feedbackNorm = getParamNorm(feedbackParam, 0.5F);
+    const float tone = getParamNorm(toneParam, 0.5F);
+    const float inputEnergy = reactiveEnergy;
+    const float transient = reactiveTransient;
+    const float timeNorm = getTimeNorm();
+    const int repeatCount = getVisualRepeatCount();
+
+    const juce::Colour toneA = juce::Colour(0xFF7A4AF0).interpolatedWith(juce::Colour(0xFF7E91FF), clamp01((tone - 0.5F) * 2.0F));
+    const juce::Colour toneB = juce::Colour(0xFFC6B6FF).interpolatedWith(juce::Colour(0xFFB8CCFF), clamp01((tone - 0.45F) * 1.8F));
+    const float horizonY = panel.getBottom() - 42.0F;
+    const float mouthX = panel.getX() + 118.0F;
+
+    // Soft arc background
+    g.setColour(juce::Colour(0x18A085FF));
+    for (int i = 0; i < 7; ++i) {
+      const float inset = static_cast<float>(i) * 18.0F;
+      auto arcRect = panel.reduced(90.0F + inset, 16.0F + inset * 0.35F);
+      if (arcRect.getWidth() <= 20.0F) break;
+      g.drawEllipse(arcRect, 1.0F);
+    }
+
+    // Waveform from mouth into space
+    juce::Path wavePath;
+    const float waveLeft = mouthX + 6.0F;
+    const float waveRight = panel.getRight() - 28.0F;
+    const float waveCenterY = panel.getY() + 92.0F;
+    const int waveSteps = juce::jmax(120, juce::roundToInt(panel.getWidth()));
+    for (int i = 0; i <= waveSteps; ++i) {
+      const float t = static_cast<float>(i) / static_cast<float>(waveSteps);
+      const float x = lerp(waveLeft, waveRight, t);
+      const float env = std::exp(-t * lerp(1.3F, 3.2F, 1.0F - feedbackNorm));
+      const float baseAmp = (18.0F + timeNorm * 18.0F) * (0.45F + mix * 0.75F + inputEnergy * 0.40F);
+      const float amp = baseAmp * env;
+      const float mod = std::sin((t * 38.0F) + animationPhase * (0.8F + feedbackNorm))
+        + (0.35F * std::sin((t * 86.0F) + animationPhase * 1.45F + 0.9F));
+      const float y = waveCenterY + mod * amp;
+      if (i == 0) wavePath.startNewSubPath(x, y);
+      else wavePath.lineTo(x, y);
+    }
+    g.setColour(toneB.withAlpha(0.18F + mix * 0.20F + transient * 0.18F));
+    g.strokePath(wavePath, juce::PathStrokeType(6.0F, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    g.setColour(toneA.withAlpha(0.42F + mix * 0.30F + transient * 0.15F));
+    g.strokePath(wavePath, juce::PathStrokeType(2.0F, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    // Original silhouette
+    drawVoiceSilhouette(
+      g,
+      {panel.getX() + 98.0F, panel.getY() + 126.0F},
+      1.0F,
+      juce::Colour(0xFF7B58F6),
+      0.70F + inputEnergy * 0.18F,
+      0.0F
+    );
+
+    // Delay clones
+    const float spacing = lerp(58.0F, 128.0F, timeNorm);
+    for (int i = 0; i < repeatCount; ++i) {
+      const float idx = static_cast<float>(i + 1);
+      const float decay = std::pow(lerp(0.82F, 0.93F, feedbackNorm), idx);
+      const float alpha = (0.10F + mix * 0.52F) * decay;
+      const float scale = lerp(0.78F, 0.40F, idx / 8.0F);
+      const float yJitter = std::sin(animationPhase * 0.75F + idx * 0.9F) * 2.0F * (0.2F + inputEnergy * 0.8F);
+      const float x = mouthX + (spacing * idx) + transient * 8.0F;
+      if (x > panel.getRight() - 26.0F) break;
+      drawVoiceSilhouette(
+        g,
+        {x, panel.getY() + 126.0F + yJitter},
+        scale,
+        toneA.interpolatedWith(juce::Colour(0xFF9FA8FF), idx / 8.0F),
+        alpha,
+        idx * 0.08F
+      );
+    }
+
+    // Mouth beam / causal line
+    g.setColour(toneA.withAlpha(0.22F + mix * 0.26F + transient * 0.18F));
+    g.fillRoundedRectangle(mouthX, waveCenterY - 2.0F, panel.getWidth() - 150.0F, 4.0F, 2.0F);
+    g.setColour(juce::Colour(0x40FFFFFF));
+    g.drawHorizontalLine(juce::roundToInt(horizonY), panel.getX() + 20.0F, panel.getRight() - 20.0F);
+
+    // Repeat tick marks
+    const float tickStartX = mouthX + spacing;
+    for (int i = 0; i < 8; ++i) {
+      const float x = tickStartX + spacing * i;
+      if (x > panel.getRight() - 12.0F) break;
+      const float h = (i < repeatCount ? 16.0F : 9.0F) + (i % 2 == 0 ? 4.0F : 0.0F);
+      g.setColour((i < repeatCount ? toneA : juce::Colour(0x665F5A89)).withAlpha(i < repeatCount ? 0.40F : 0.16F));
+      g.drawVerticalLine(juce::roundToInt(x), horizonY - h, horizonY + 4.0F);
+    }
+  }
+
+  void drawTimeline(juce::Graphics& g, juce::Rectangle<float> bounds) {
+    if (bounds.isEmpty() || timelineTrackBounds.isEmpty()) return;
+
+    const float centerY = timelineTrackBounds.getCentreY();
+    g.setColour(juce::Colour(0x18FFFFFF));
+    g.fillRoundedRectangle(
+      timelineTrackBounds.withHeight(10.0F).withCentre(juce::Point<float>(timelineTrackBounds.getCentreX(), centerY)),
+      5.0F
+    );
+
+    const float handleNorm = getTimeNorm();
+    auto fill = timelineTrackBounds;
+    fill.setWidth(timelineTrackBounds.getWidth() * handleNorm);
+    g.setGradientFill(juce::ColourGradient(
+      juce::Colour(0xCC6E47E9), fill.getTopLeft(),
+      juce::Colour(0xAA9A75FF), fill.getTopRight(),
+      false
+    ));
+    g.fillRoundedRectangle(fill.withHeight(6.0F).withCentre(juce::Point<float>(fill.getCentreX(), centerY)), 3.0F);
+
+    if (syncEnabled) {
+      g.setColour(juce::Colour(0x55645F8D));
+      for (size_t i = 0; i < kSyncDivisions.size(); ++i) {
+        const int ms = computeDelayMsForDivision(static_cast<int>(i));
+        if (ms < kMinDelayMs || ms > kMaxDelayMs) continue;
+        const float x = timelineTrackBounds.getX() + timelineTrackBounds.getWidth() * (static_cast<float>(ms - kMinDelayMs) / static_cast<float>(kMaxDelayMs - kMinDelayMs));
+        g.drawVerticalLine(juce::roundToInt(x), centerY - 10.0F, centerY + 10.0F);
+        g.setColour(i == static_cast<size_t>(selectedSyncDivisionIndex) ? juce::Colour(0xFF5F4ACF) : juce::Colour(0xAA67628F));
+        g.setFont(juce::Font(juce::FontOptions(10.5F)));
+        g.drawFittedText(kSyncDivisions[i].label, juce::Rectangle<int>(juce::roundToInt(x) - 24, juce::roundToInt(centerY + 12.0F), 48, 14), juce::Justification::centred, 1);
+        g.setColour(juce::Colour(0x55645F8D));
+      }
+    }
+
+    const float handleX = timelineTrackBounds.getX() + timelineTrackBounds.getWidth() * handleNorm;
+    g.setColour(juce::Colour(0x559B6FFF));
+    g.fillEllipse(handleX - 15.0F, centerY - 15.0F, 30.0F, 30.0F);
+    g.setColour(juce::Colour(0xFF7D56F4));
+    g.fillEllipse(handleX - 11.0F, centerY - 11.0F, 22.0F, 22.0F);
+    g.setColour(juce::Colour(0xFFDCCEFF));
+    g.drawEllipse(handleX - 11.0F, centerY - 11.0F, 22.0F, 22.0F, 1.4F);
+    g.setColour(juce::Colours::white.withAlpha(0.92F));
+    g.fillEllipse(handleX - 4.0F, centerY - 4.0F, 8.0F, 8.0F);
+  }
+
+  void drawToneTrackOverlay(juce::Graphics& g, juce::Rectangle<float> sliderBounds) {
+    if (sliderBounds.isEmpty()) return;
+    const float t = getParamNorm(toneParam, 0.5F);
+    auto inner = sliderBounds.reduced(8.0F, 8.0F);
+    inner = inner.withHeight(8.0F).withCentre(juce::Point<float>(inner.getCentreX(), sliderBounds.getCentreY()));
+    g.setColour(juce::Colour(0x14FFFFFF));
+    g.fillRoundedRectangle(inner, 4.0F);
+    auto fill = inner;
+    fill.setWidth(inner.getWidth() * t);
+    g.setGradientFill(juce::ColourGradient(
+      juce::Colour(0xAA6D52EF), fill.getTopLeft(),
+      juce::Colour(0xAA86A3FF), fill.getTopRight(),
+      false
+    ));
+    g.fillRoundedRectangle(fill, 4.0F);
+  }
+
+  void drawVoiceSilhouette(
+    juce::Graphics& g,
+    juce::Point<float> anchor,
+    float scale,
+    juce::Colour colour,
+    float alpha,
+    float hueShift
+  ) {
+    const juce::Colour c = colour.withRotatedHue(hueShift).withAlpha(alpha);
+    juce::Path p;
+    const float s = scale;
+    const float x = anchor.x;
+    const float y = anchor.y;
+
+    // Stylised profile/neck/shoulder shape for the delayday metaphor.
+    p.startNewSubPath(x - 56.0F * s, y + 58.0F * s);
+    p.cubicTo(x - 64.0F * s, y + 18.0F * s, x - 60.0F * s, y - 38.0F * s, x - 26.0F * s, y - 62.0F * s);
+    p.cubicTo(x - 8.0F * s, y - 76.0F * s, x + 24.0F * s, y - 70.0F * s, x + 30.0F * s, y - 40.0F * s);
+    p.cubicTo(x + 36.0F * s, y - 16.0F * s, x + 8.0F * s, y - 14.0F * s, x + 16.0F * s, y - 4.0F * s);
+    p.cubicTo(x + 30.0F * s, y + 8.0F * s, x + 36.0F * s, y + 20.0F * s, x + 22.0F * s, y + 26.0F * s);
+    p.cubicTo(x + 8.0F * s, y + 31.0F * s, x - 2.0F * s, y + 26.0F * s, x - 8.0F * s, y + 20.0F * s);
+    p.cubicTo(x - 13.0F * s, y + 28.0F * s, x - 14.0F * s, y + 41.0F * s, x - 10.0F * s, y + 58.0F * s);
+    p.closeSubPath();
+
+    g.setColour(c.withAlpha(alpha * 0.30F));
+    g.fillEllipse(x - 66.0F * s, y - 72.0F * s, 140.0F * s, 154.0F * s);
+    g.setColour(c);
+    g.fillPath(p);
+
+    g.setColour(juce::Colours::white.withAlpha(alpha * 0.22F));
+    g.strokePath(p, juce::PathStrokeType(1.0F));
+  }
+
+  void addParamListener(tracktion::engine::AutomatableParameter::Ptr& param) {
+    if (param != nullptr) param->addListener(this);
+  }
+
+  void removeParamListener(tracktion::engine::AutomatableParameter::Ptr& param) {
+    if (param != nullptr) param->removeListener(this);
+  }
+
+  void setParamActual(tracktion::engine::AutomatableParameter::Ptr& param, float value) {
+    if (param == nullptr) return;
+    const auto range = param->getValueRange();
+    param->setParameter(juce::jlimit(range.getStart(), range.getEnd(), value), juce::sendNotificationSync);
+  }
+
+  float getParamNorm(const tracktion::engine::AutomatableParameter::Ptr& param, float fallback = 0.0F) const {
+    return param != nullptr ? param->getCurrentNormalisedValue() : fallback;
+  }
+
+  float getParamActual(const tracktion::engine::AutomatableParameter::Ptr& param, float fallback = 0.0F) const {
+    return param != nullptr ? param->getCurrentValue() : fallback;
+  }
+
+  int getCurrentDelayMs() const {
+    return juce::jlimit(kMinDelayMs, kMaxDelayMs, static_cast<int>(delay.lengthMs));
+  }
+
+  double getCurrentBpm() const {
+    if (gState && gState->edit) {
+      const double bpm = gState->edit->tempoSequence.getBpmAt(tracktion::core::TimePosition::fromSeconds(0.0));
+      if (std::isfinite(bpm) && bpm > 1.0) return bpm;
+    }
+    return 120.0;
+  }
+
+  int computeDelayMsForDivision(int index) const {
+    const int clamped = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, index);
+    const double bpm = getCurrentBpm();
+    const double msPerBeat = 60000.0 / juce::jmax(1.0, bpm);
+    const double ms = msPerBeat * kSyncDivisions[static_cast<size_t>(clamped)].beats;
+    return juce::jlimit(kMinDelayMs, kMaxDelayMs, juce::roundToInt(ms));
+  }
+
+  int findNearestDivisionIndex(int delayMs) const {
+    int best = 0;
+    int bestDelta = std::numeric_limits<int>::max();
+    for (size_t i = 0; i < kSyncDivisions.size(); ++i) {
+      const int candidate = computeDelayMsForDivision(static_cast<int>(i));
+      const int delta = std::abs(candidate - delayMs);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        best = static_cast<int>(i);
+      }
+    }
+    return best;
+  }
+
+  void applyDelayMs(int ms, bool persistState = true) {
+    const int clamped = juce::jlimit(kMinDelayMs, kMaxDelayMs, ms);
+    if (static_cast<int>(delay.lengthMs) != clamped) {
+      delay.lengthMs = clamped;
+      delay.edit.pluginChanged(delay);
+    }
+    lastObservedDelayMs = clamped;
+    if (persistState) storeUiState();
+  }
+
+  void applyTimeControlValue(int requestedMs) {
+    if (syncEnabled) {
+      selectedSyncDivisionIndex = findNearestDivisionIndex(requestedMs);
+      applyDelayMs(computeDelayMsForDivision(selectedSyncDivisionIndex), true);
+    } else {
+      applyDelayMs(requestedMs, false);
+    }
+    syncControlsFromState();
+  }
+
+  void applyRepeatCount(int repeats, bool persist) {
+    const int clamped = juce::jlimit(1, 8, repeats);
+    selectedRepeatCountUi = clamped;
+    if (feedbackParam != nullptr) {
+      feedbackParam->parameterChangeGestureBegin();
+      setParamActual(feedbackParam, repeatCountToFeedbackDb(clamped));
+      feedbackParam->parameterChangeGestureEnd();
+    }
+    if (persist) syncControlsFromState();
+  }
+
+  DelayTuningTarget makePresetTarget(DelayPreset preset) const {
+    switch (preset) {
+      case DelayPreset::vocalSlap:
+        return {
+          false,
+          0,
+          95,
+          0.20F,
+          2,
+          0.68F,
+          "Trap/Rap Vocal Slap: kurzes Free-Delay fuer moderne Doubles und Adlibs."
+        };
+      case DelayPreset::popEighth:
+        return {
+          true,
+          2, // 1/8
+          0,
+          0.31F,
+          4,
+          0.72F,
+          "Pop Lead 1/8: tempo-synchron, bright und klar fuer Hook-Lines."
+        };
+      case DelayPreset::wideThrow:
+        return {
+          true,
+          3, // 1/4T
+          0,
+          0.40F,
+          5,
+          0.54F,
+          "Indie Throw: leicht off-grid (1/4T), organischer und etwas weicher."
+        };
+      case DelayPreset::darkDub:
+        return {
+          true,
+          6, // 1/2
+          0,
+          0.46F,
+          8,
+          0.12F,
+          "Dub Trail: dunkler, langer Tail mit mehr Wiederholungen fuer Throws."
+        };
+    }
+    return {};
+  }
+
+  DelayTuningTarget captureCurrentTuningTarget() const {
+    DelayTuningTarget target;
+    target.useSync = syncEnabled;
+    target.syncDivisionIndex = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, selectedSyncDivisionIndex);
+    target.freeDelayMs = getCurrentDelayMs();
+    target.mix = getParamActual(mixParam, 0.3F);
+    target.repeats = getVisualRepeatCount();
+    target.tone = getParamActual(toneParam, 0.5F);
+    target.hint = {};
+    return target;
+  }
+
+  void applyTuningTarget(const DelayTuningTarget& target) {
+    if (mixParam != nullptr) {
+      mixParam->parameterChangeGestureBegin();
+      setParamActual(mixParam, clamp01(target.mix));
+      mixParam->parameterChangeGestureEnd();
+    }
+
+    if (toneParam != nullptr) {
+      toneParam->parameterChangeGestureBegin();
+      setParamActual(toneParam, clamp01(target.tone));
+      toneParam->parameterChangeGestureEnd();
+    }
+
+    applyRepeatCount(juce::jlimit(1, 8, target.repeats), false);
+
+    syncEnabled = target.useSync;
+    selectedSyncDivisionIndex = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, target.syncDivisionIndex);
+    if (syncEnabled) {
+      applyDelayMs(computeDelayMsForDivision(selectedSyncDivisionIndex), false);
+    } else {
+      applyDelayMs(juce::jlimit(kMinDelayMs, kMaxDelayMs, target.freeDelayMs), false);
+    }
+
+    if (target.hint.isNotEmpty()) {
+      presetHintLabel.setText(target.hint, juce::dontSendNotification);
+    }
+
+    storeUiState();
+    syncControlsFromState();
+    syncPresetButtons();
+    repaint();
+  }
+
+  void applyPreset(DelayPreset preset) {
+    activePreset = preset;
+    applyTuningTarget(makePresetTarget(preset));
+  }
+
+  void applyRandomThrow() {
+    auto& rng = juce::Random::getSystemRandom();
+    DelayTuningTarget target = captureCurrentTuningTarget();
+
+    target.useSync = rng.nextFloat() < 0.82F;
+    if (target.useSync) {
+      static constexpr std::array<int, 14> weightedDivisions{{
+        2, 2, 2, 2, // 1/8
+        4, 4, 4,    // 1/4
+        3, 3,       // 1/4T
+        1,          // 1/8T
+        5,          // 1/2T
+        6, 6,       // 1/2
+        0           // 1/16
+      }};
+      target.syncDivisionIndex = weightedDivisions[static_cast<size_t>(rng.nextInt(static_cast<int>(weightedDivisions.size())))];
+    } else {
+      static constexpr std::array<int, 12> freeDelaysMs{{70, 85, 95, 110, 135, 160, 180, 220, 260, 320, 380, 460}};
+      target.freeDelayMs = freeDelaysMs[static_cast<size_t>(rng.nextInt(static_cast<int>(freeDelaysMs.size())))];
+      target.freeDelayMs = juce::jlimit(kMinDelayMs, kMaxDelayMs, target.freeDelayMs + rng.nextInt(21) - 10);
+    }
+
+    target.mix = juce::jlimit(0.12F, 0.68F, 0.18F + rng.nextFloat() * 0.50F);
+    target.repeats = juce::jlimit(2, 8, 2 + rng.nextInt(7));
+    target.tone = juce::jlimit(0.08F, 0.92F, 0.10F + rng.nextFloat() * 0.80F);
+
+    const bool dark = target.tone < 0.40F;
+    const bool longTail = target.repeats >= 6;
+    const juce::String timingLabel = target.useSync
+      ? juce::String(kSyncDivisions[static_cast<size_t>(juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, target.syncDivisionIndex))].label)
+      : (juce::String(target.freeDelayMs) + " ms");
+    target.hint =
+      "Random Throw: " + timingLabel
+      + ", Mix " + percentString(target.mix)
+      + ", " + juce::String(target.repeats) + "x repeats"
+      + ", " + (dark ? "darker" : "brighter")
+      + (longTail ? " long-tail" : " short-tail")
+      + ".";
+
+    applyTuningTarget(target);
+  }
+
+  void applyMorphThrow() {
+    auto& rng = juce::Random::getSystemRandom();
+    const auto current = captureCurrentTuningTarget();
+    auto base = makePresetTarget(activePreset);
+    DelayTuningTarget target = current;
+
+    const float morphAmount = 0.35F + (rng.nextFloat() * 0.35F);
+    const float jitterScale = 0.22F + (rng.nextFloat() * 0.18F);
+
+    const auto jitterUnit = [&rng]() {
+      return (rng.nextFloat() * 2.0F) - 1.0F;
+    };
+
+    // Blend behavior toward active preset while keeping a bit of the current throw.
+    target.useSync = (rng.nextFloat() < 0.7F) ? base.useSync : current.useSync;
+    if (target.useSync) {
+      int baseDiv = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, base.syncDivisionIndex);
+      int currentDiv = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, current.syncDivisionIndex);
+      int chosen = rng.nextFloat() < 0.55F ? baseDiv : currentDiv;
+      chosen += rng.nextInt(3) - 1;
+      target.syncDivisionIndex = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, chosen);
+    } else {
+      const float blendedMs = lerp(static_cast<float>(current.freeDelayMs), static_cast<float>(base.freeDelayMs), morphAmount);
+      target.freeDelayMs = juce::jlimit(kMinDelayMs, kMaxDelayMs, juce::roundToInt(blendedMs + (jitterUnit() * 18.0F)));
+    }
+
+    target.mix = juce::jlimit(0.10F, 0.75F, lerp(current.mix, base.mix, morphAmount) + (jitterUnit() * 0.06F * jitterScale));
+    target.tone = juce::jlimit(0.05F, 0.95F, lerp(current.tone, base.tone, morphAmount) + (jitterUnit() * 0.08F * jitterScale));
+    target.repeats = juce::jlimit(
+      1,
+      8,
+      juce::roundToInt(lerp(static_cast<float>(current.repeats), static_cast<float>(base.repeats), morphAmount) + (jitterUnit() * 1.2F * jitterScale))
+    );
+
+    const juce::String presetName = [this]() -> juce::String {
+      switch (activePreset) {
+        case DelayPreset::vocalSlap: return "Vocal Slap";
+        case DelayPreset::popEighth: return "1/8 Pop";
+        case DelayPreset::wideThrow: return "Wide Throw";
+        case DelayPreset::darkDub: return "Dark Dub";
+      }
+      return "Preset";
+    }();
+
+    target.hint =
+      "Morph Throw: " + presetName
+      + " x Current (" + juce::String(juce::roundToInt(morphAmount * 100.0F)) + "% towards preset).";
+
+    applyTuningTarget(target);
+  }
+
+  void syncPresetButtons() {
+    presetVocalSlapButton.setToggleState(activePreset == DelayPreset::vocalSlap, juce::dontSendNotification);
+    presetPopEighthButton.setToggleState(activePreset == DelayPreset::popEighth, juce::dontSendNotification);
+    presetWideThrowButton.setToggleState(activePreset == DelayPreset::wideThrow, juce::dontSendNotification);
+    presetDarkDubButton.setToggleState(activePreset == DelayPreset::darkDub, juce::dontSendNotification);
+  }
+
+  void updatePresetHintLabel() {
+    if (!presetHintLabel.getText().isNotEmpty()) {
+      presetHintLabel.setText("Trap/Pop/Indie/Dub starts + Random/Morph fuer kreative Throws.", juce::dontSendNotification);
+    }
+  }
+
+  float feedbackDbToGain(float db) const {
+    if (!std::isfinite(db)) return 0.0F;
+    return db <= tracktion::engine::DelayPlugin::getMinDelayFeedbackDb() ? 0.0F : std::pow(10.0F, db / 20.0F);
+  }
+
+  int feedbackDbToRepeatCount(float db) const {
+    const float gain = feedbackDbToGain(db);
+    if (gain <= 0.001F) return 1;
+    if (gain >= 0.995F) return 8;
+    constexpr float threshold = 0.12F;
+    const float n = std::log(threshold) / std::log(gain);
+    if (!std::isfinite(n)) return 8;
+    return juce::jlimit(1, 8, juce::roundToInt(n));
+  }
+
+  float repeatCountToFeedbackDb(int repeats) const {
+    constexpr float threshold = 0.12F;
+    const float n = static_cast<float>(juce::jlimit(1, 8, repeats));
+    const float gain = std::pow(threshold, 1.0F / n);
+    const float db = 20.0F * std::log10(juce::jmax(0.001F, gain));
+    return juce::jlimit(tracktion::engine::DelayPlugin::getMinDelayFeedbackDb(), 0.0F, db);
+  }
+
+  int getVisualRepeatCount() const {
+    return juce::jlimit(1, 8, feedbackDbToRepeatCount(getParamActual(feedbackParam, -9.0F)));
+  }
+
+  float getTimeNorm() const {
+    const float span = static_cast<float>(kMaxDelayMs - kMinDelayMs);
+    return clamp01((static_cast<float>(getCurrentDelayMs() - kMinDelayMs)) / juce::jmax(1.0F, span));
+  }
+
+  void setSyncEnabled(bool shouldEnable, bool applySnap) {
+    syncEnabled = shouldEnable;
+    syncToggleButton.setToggleState(syncEnabled, juce::dontSendNotification);
+    if (syncEnabled) {
+      selectedSyncDivisionIndex = findNearestDivisionIndex(getCurrentDelayMs());
+      if (applySnap) {
+        applyDelayMs(computeDelayMsForDivision(selectedSyncDivisionIndex), true);
+      }
+    }
+    storeUiState();
+    syncControlsFromState();
+    repaint();
+  }
+
+  void loadUiState() {
+    const auto syncEnabledVar = delay.state.getProperty(juce::Identifier(kSyncEnabledProperty), false);
+    syncEnabled = static_cast<bool>(syncEnabledVar);
+    const int storedIndex = static_cast<int>(delay.state.getProperty(juce::Identifier(kSyncDivisionProperty), 2));
+    selectedSyncDivisionIndex = juce::jlimit(0, static_cast<int>(kSyncDivisions.size()) - 1, storedIndex);
+    if (syncEnabled) {
+      selectedSyncDivisionIndex = findNearestDivisionIndex(getCurrentDelayMs());
+    }
+    lastObservedDelayMs = getCurrentDelayMs();
+  }
+
+  void storeUiState() {
+    auto* um = delay.getUndoManager();
+    delay.state.setProperty(juce::Identifier(kSyncEnabledProperty), syncEnabled, um);
+    delay.state.setProperty(juce::Identifier(kSyncDivisionProperty), selectedSyncDivisionIndex, um);
+    delay.edit.pluginChanged(delay);
+  }
+
+  void syncControlsFromState() {
+    const juce::ScopedValueSetter<bool> guard(ignoreControlCallbacks, true);
+
+    const int delayMs = getCurrentDelayMs();
+    if (syncEnabled) {
+      selectedSyncDivisionIndex = findNearestDivisionIndex(delayMs);
+    }
+    timeSlider.setValue(delayMs, juce::dontSendNotification);
+
+    if (mixParam != nullptr) mixSlider.setValue(mixParam->getCurrentValue(), juce::dontSendNotification);
+    if (feedbackParam != nullptr) feedbackSlider.setValue(feedbackParam->getCurrentValue(), juce::dontSendNotification);
+    if (toneParam != nullptr) {
+      toneSlider.setEnabled(true);
+      toneSlider.setValue(toneParam->getCurrentValue(), juce::dontSendNotification);
+    } else {
+      toneSlider.setEnabled(false);
+      toneSlider.setValue(0.5, juce::dontSendNotification);
+    }
+
+    const int repeats = getVisualRepeatCount();
+    selectedRepeatCountUi = repeats;
+    repeatsSlider.setValue(repeats, juce::dontSendNotification);
+
+    const float mix = getParamActual(mixParam, 0.3F);
+    const float feedbackDb = getParamActual(feedbackParam, -6.0F);
+    const float feedbackGain = feedbackDbToGain(feedbackDb);
+    const float tone = getParamActual(toneParam, 0.5F);
+
+    mixValueLabel.setText(percentString(mix), juce::dontSendNotification);
+    feedbackValueLabel.setText(percentString(feedbackGain), juce::dontSendNotification);
+    repeatsValueLabel.setText(juce::String(repeats) + "x", juce::dontSendNotification);
+    toneValueLabel.setText(percentString(tone), juce::dontSendNotification);
+
+    mixRangeLabel.setText("Dry/Wet blend", juce::dontSendNotification);
+    feedbackRangeLabel.setText(juce::String(juce::roundToInt(feedbackDb * 10.0F) / 10.0F) + " dB", juce::dontSendNotification);
+    repeatsRangeLabel.setText("Visual + stepped feedback", juce::dontSendNotification);
+
+    syncToggleButton.setToggleState(syncEnabled, juce::dontSendNotification);
+    bpmLabel.setText(juce::String(juce::roundToInt(getCurrentBpm())) + " BPM", juce::dontSendNotification);
+    if (syncEnabled) {
+      syncDivisionLabel.setText(juce::String(kSyncDivisions[static_cast<size_t>(selectedSyncDivisionIndex)].label), juce::dontSendNotification);
+      timeReadoutLabel.setText(
+        juce::String(kSyncDivisions[static_cast<size_t>(selectedSyncDivisionIndex)].label) + "  |  " + juce::String(delayMs) + " ms",
+        juce::dontSendNotification
+      );
+    } else {
+      syncDivisionLabel.setText("Free", juce::dontSendNotification);
+      timeReadoutLabel.setText(juce::String(delayMs) + " ms", juce::dontSendNotification);
+    }
+
+    updateTimeReadoutBounds();
+    syncPresetButtons();
+    updatePresetHintLabel();
+    updateInfoText();
+  }
+
+  void updateInfoText() {
+    const float mix = getParamActual(mixParam, 0.3F);
+    const float feedback = feedbackDbToGain(getParamActual(feedbackParam, -6.0F));
+    const float tone = getParamActual(toneParam, 0.5F);
+    infoLabel.setText(
+      "Distanz = Time (" + juce::String(getCurrentDelayMs()) + " ms)"
+      + "  |  Transparenz = Mix " + percentString(mix)
+      + "  |  Figuren = " + juce::String(getVisualRepeatCount()) + " Repeats"
+      + "  |  Tone " + (tone < 0.45F ? "Dark" : (tone > 0.55F ? "Bright" : "Neutral"))
+      + "  |  Feedback " + percentString(feedback),
+      juce::dontSendNotification
+    );
+  }
+
+  void updateTimeReadoutBounds() {
+    if (timeSlider.getBounds().isEmpty()) return;
+    const float t = getTimeNorm();
+    const auto sliderBounds = timeSlider.getBounds().toFloat();
+    const float x = sliderBounds.getX() + sliderBounds.getWidth() * t;
+    const int width = 160;
+    const int height = 32;
+    int y = juce::roundToInt(sliderBounds.getY() - 34.0F);
+    int left = juce::roundToInt(x - (width * 0.5F));
+    left = juce::jlimit(heroPanelBounds.getX() + 18, heroPanelBounds.getRight() - 18 - width, left);
+    timeReadoutLabel.setBounds(left, y, width, height);
+  }
+
+  tracktion::engine::LevelMeterPlugin* findTrackLevelMeterPlugin() const {
+    if (auto* ownerTrack = dynamic_cast<tracktion::engine::AudioTrack*>(delay.getOwnerTrack())) {
+      return ownerTrack->getLevelMeterPlugin();
+    }
+    return nullptr;
+  }
+
+  void ensureLevelMeterClientAttachment() {
+    auto* meterPlugin = findTrackLevelMeterPlugin();
+    auto* nextMeasurer = meterPlugin != nullptr ? &meterPlugin->measurer : nullptr;
+    if (attachedLevelMeasurer == nextMeasurer) return;
+    detachLevelMeterClient();
+    if (nextMeasurer != nullptr) {
+      nextMeasurer->addClient(levelMeterClient);
+      attachedLevelMeasurer = nextMeasurer;
+    }
+  }
+
+  void detachLevelMeterClient() {
+    if (attachedLevelMeasurer != nullptr) {
+      attachedLevelMeasurer->removeClient(levelMeterClient);
+      attachedLevelMeasurer = nullptr;
+    }
+  }
+
+  void updateReactiveEnvelopeFromMeter() {
+    ensureLevelMeterClientAttachment();
+
+    float targetEnergy = 0.0F;
+    if (attachedLevelMeasurer != nullptr) {
+      const auto left = levelMeterClient.getAndClearAudioLevel(0);
+      const auto right = levelMeterClient.getAndClearAudioLevel(1);
+      const auto dbToUnit = [](float dB) {
+        if (!std::isfinite(dB) || dB <= -90.0F) return 0.0F;
+        return juce::jlimit(0.0F, 1.0F, std::pow(10.0F, dB / 20.0F));
+      };
+      const float l = dbToUnit(left.dB);
+      const float r = dbToUnit(right.dB);
+      targetEnergy = juce::jlimit(0.0F, 1.0F, juce::jmax(l, r) * 1.8F);
+    }
+
+    const float previous = reactiveEnergy;
+    const float alpha = targetEnergy > reactiveEnergy ? 0.55F : 0.18F;
+    reactiveEnergy = lerp(reactiveEnergy, targetEnergy, alpha);
+    reactivePeak = juce::jmax(reactiveEnergy, reactivePeak * 0.94F);
+    reactiveTransient *= 0.80F;
+    const float delta = juce::jmax(0.0F, targetEnergy - previous);
+    if (delta > 0.03F) {
+      reactiveTransient = juce::jlimit(0.0F, 1.0F, juce::jmax(reactiveTransient, delta * 3.2F));
+    }
+  }
+
+  void timerCallback() override {
+    updateReactiveEnvelopeFromMeter();
+    animationPhase += 0.035F + getParamNorm(feedbackParam, 0.4F) * 0.05F + reactiveEnergy * 0.03F;
+    if (animationPhase > 10000.0F) {
+      animationPhase = std::fmod(animationPhase, juce::MathConstants<float>::twoPi);
+    }
+
+    const int delayMs = getCurrentDelayMs();
+    const int bpmRounded = juce::roundToInt(getCurrentBpm());
+    if (delayMs != lastObservedDelayMs || bpmRounded != lastObservedBpmRounded) {
+      lastObservedDelayMs = delayMs;
+      lastObservedBpmRounded = bpmRounded;
+      syncControlsFromState();
+    } else {
+      updateInfoText();
+      updateTimeReadoutBounds();
+    }
+
+    repaint(heroPanelBounds);
+    repaint(controlPanelBounds);
+    repaint(tonePanelBounds);
+    repaint(presetPanelBounds);
+  }
+
+  void handleAsyncUpdate() override {
+    syncControlsFromState();
+    repaint();
+  }
+
+  void curveHasChanged(tracktion::engine::AutomatableParameter&) override {}
+  void currentValueChanged(tracktion::engine::AutomatableParameter&) override { triggerAsyncUpdate(); }
+  void parameterChanged(tracktion::engine::AutomatableParameter&, float) override { triggerAsyncUpdate(); }
+
+  tracktion::engine::DelayPlugin& delay;
+  tracktion::engine::AutomatableParameter::Ptr feedbackParam;
+  tracktion::engine::AutomatableParameter::Ptr mixParam;
+  tracktion::engine::AutomatableParameter::Ptr toneParam;
+
+  juce::Label titleLabel;
+  juce::Label subtitleLabel;
+  juce::Label stageTitleLabel;
+  juce::Label timeTitleLabel;
+  juce::Label mixTitleLabel;
+  juce::Label feedbackTitleLabel;
+  juce::Label repeatsTitleLabel;
+  juce::Label toneTitleLabel;
+  juce::Label presetTitleLabel;
+  juce::Label timeReadoutLabel;
+  juce::Label bpmLabel;
+  juce::Label syncDivisionLabel;
+
+  juce::Label mixValueLabel;
+  juce::Label feedbackValueLabel;
+  juce::Label repeatsValueLabel;
+  juce::Label toneValueLabel;
+  juce::Label mixRangeLabel;
+  juce::Label feedbackRangeLabel;
+  juce::Label repeatsRangeLabel;
+  juce::Label toneLeftLabel;
+  juce::Label toneRightLabel;
+  juce::Label presetHintLabel;
+  juce::Label infoLabel;
+
+  juce::TextButton syncToggleButton;
+  juce::TextButton presetVocalSlapButton;
+  juce::TextButton presetPopEighthButton;
+  juce::TextButton presetWideThrowButton;
+  juce::TextButton presetDarkDubButton;
+  juce::TextButton randomThrowButton;
+  juce::TextButton morphThrowButton;
+  juce::Slider timeSlider;
+  juce::Slider mixSlider;
+  juce::Slider feedbackSlider;
+  juce::Slider repeatsSlider;
+  juce::Slider toneSlider;
+
+  juce::Rectangle<int> heroPanelBounds;
+  juce::Rectangle<int> controlPanelBounds;
+  juce::Rectangle<int> tonePanelBounds;
+  juce::Rectangle<int> presetPanelBounds;
+  juce::Rectangle<int> mixCardBounds;
+  juce::Rectangle<int> feedbackCardBounds;
+  juce::Rectangle<int> repeatsCardBounds;
+  juce::Rectangle<float> heroStageBounds;
+  juce::Rectangle<float> timelineBounds;
+  juce::Rectangle<float> timelineTrackBounds;
+
+  tracktion::engine::LevelMeasurer::Client levelMeterClient;
+  tracktion::engine::LevelMeasurer* attachedLevelMeasurer = nullptr;
+
+  float reactiveEnergy = 0.0F;
+  float reactivePeak = 0.0F;
+  float reactiveTransient = 0.0F;
+  float animationPhase = 0.0F;
+  DelayPreset activePreset = DelayPreset::vocalSlap;
+  bool syncEnabled = false;
+  int selectedSyncDivisionIndex = 2;
+  int selectedRepeatCountUi = 3;
+  int lastObservedDelayMs = -1;
+  int lastObservedBpmRounded = -1;
+  bool ignoreControlCallbacks = false;
+};
+
 class FallbackParameterRow final : public juce::Component,
                                    private tracktion::engine::AutomatableParameter::Listener {
  public:
@@ -3438,6 +4725,26 @@ class FallbackPluginEditor final : public tracktion::engine::Plugin::EditorCompo
   juce::Label emptyLabel;
 };
 
+static std::unique_ptr<tracktion::engine::Plugin::EditorComponent> createPluginEditorOrFallback(tracktion::engine::Plugin& plugin) {
+  auto editor = plugin.createEditor();
+  if (editor != nullptr) {
+    return editor;
+  }
+  if (auto* equaliserPlugin = dynamic_cast<tracktion::engine::EqualiserPlugin*>(&plugin)) {
+    return std::make_unique<EqualiserFallbackEditor>(*equaliserPlugin);
+  }
+  if (auto* reverbPlugin = dynamic_cast<tracktion::engine::ReverbPlugin*>(&plugin)) {
+    return std::make_unique<ReverbFallbackEditor>(*reverbPlugin);
+  }
+  if (auto* delayPlugin = dynamic_cast<tracktion::engine::DelayPlugin*>(&plugin)) {
+    return std::make_unique<DelayFallbackEditor>(*delayPlugin);
+  }
+  if (auto* chorusPlugin = dynamic_cast<tracktion::engine::ChorusPlugin*>(&plugin)) {
+    return std::make_unique<ChorusFallbackEditor>(*chorusPlugin);
+  }
+  return std::make_unique<FallbackPluginEditor>(plugin);
+}
+
 class NativePluginWindow final : public juce::DocumentWindow {
  public:
   explicit NativePluginWindow(tracktion::engine::Plugin& pluginToShow)
@@ -3483,19 +4790,7 @@ class NativePluginWindow final : public juce::DocumentWindow {
 
   void recreateEditor() {
     setEditor(nullptr);
-    auto nextEditor = plugin.createEditor();
-    if (nextEditor == nullptr) {
-      if (auto* equaliserPlugin = dynamic_cast<tracktion::engine::EqualiserPlugin*>(&plugin)) {
-        nextEditor = std::make_unique<EqualiserFallbackEditor>(*equaliserPlugin);
-      } else if (auto* reverbPlugin = dynamic_cast<tracktion::engine::ReverbPlugin*>(&plugin)) {
-        nextEditor = std::make_unique<ReverbFallbackEditor>(*reverbPlugin);
-      } else if (auto* chorusPlugin = dynamic_cast<tracktion::engine::ChorusPlugin*>(&plugin)) {
-        nextEditor = std::make_unique<ChorusFallbackEditor>(*chorusPlugin);
-      } else {
-        nextEditor = std::make_unique<FallbackPluginEditor>(plugin);
-      }
-    }
-    setEditor(std::move(nextEditor));
+    setEditor(createPluginEditorOrFallback(plugin));
   }
 
   void recreateEditorAsync() {
@@ -3759,6 +5054,142 @@ bool openPluginEditorImpl(int32_t trackId, int32_t pluginIndex, std::string& err
 
   error = "plugin editor window could not be opened";
   return false;
+}
+
+static tracktion::engine::Plugin::Ptr createPluginInstanceForPreview(const std::string& pluginUid, std::string& error) {
+  if (!gState || !gState->edit) {
+    error = "no edit (send edit:reset first)";
+    return {};
+  }
+
+  if (const auto* spec = findTracktionCorePluginSpecByUid(pluginUid)) {
+    const auto description = createTracktionCorePluginDescription(*spec);
+    auto plugin = gState->edit->getPluginCache().createNewPlugin(spec->xmlTypeName, description);
+    if (plugin != nullptr) {
+      error.clear();
+      return plugin;
+    }
+    error = "failed to create tracktion plugin preview instance";
+    return {};
+  }
+
+  error = "plugin preview only supports internal:tracktion:*";
+  return {};
+}
+
+static bool getPluginPreviewImageImpl(
+  const std::string& pluginUid,
+  int32_t width,
+  int32_t height,
+  const std::string& outputPath,
+  bool& generated,
+  std::string& error
+) {
+  generated = false;
+  error.clear();
+
+  if (pluginUid.empty()) {
+    error = "plugin_uid is required";
+    return false;
+  }
+  if (outputPath.empty()) {
+    error = "output_path is required";
+    return false;
+  }
+  if (!isInitialised(error)) {
+    return false;
+  }
+  if (!requireEdit(error)) {
+    return false;
+  }
+
+  const int safeWidth = juce::jlimit(48, 1024, static_cast<int>(width > 0 ? width : 320));
+  const int safeHeight = juce::jlimit(32, 1024, static_cast<int>(height > 0 ? height : 96));
+
+  juce::File outFile(juce::String::fromUTF8(outputPath.c_str()));
+  if (outFile.existsAsFile()) {
+    return true;
+  }
+  auto parentDir = outFile.getParentDirectory();
+  if (!parentDir.exists() && !parentDir.createDirectory()) {
+    error = "failed to create preview cache directory";
+    return false;
+  }
+
+  auto plugin = createPluginInstanceForPreview(pluginUid, error);
+  if (plugin == nullptr) {
+    return false;
+  }
+
+  auto editor = createPluginEditorOrFallback(*plugin);
+  if (editor == nullptr) {
+    error = "failed to create plugin preview editor";
+    return false;
+  }
+
+  int sourceWidth = std::max(1, editor->getWidth());
+  int sourceHeight = std::max(1, editor->getHeight());
+  if (sourceWidth < 8 || sourceHeight < 8) {
+    editor->setSize(640, 360);
+    sourceWidth = std::max(1, editor->getWidth());
+    sourceHeight = std::max(1, editor->getHeight());
+  }
+  if (sourceWidth < 8 || sourceHeight < 8) {
+    error = "plugin editor reported invalid size";
+    return false;
+  }
+
+  editor->setBounds(0, 0, sourceWidth, sourceHeight);
+
+  juce::Image sourceImage(juce::Image::ARGB, sourceWidth, sourceHeight, true);
+  {
+    juce::Graphics sourceGraphics(sourceImage);
+    sourceGraphics.fillAll(juce::Colours::transparentBlack);
+    editor->paintEntireComponent(sourceGraphics, true);
+  }
+
+  juce::Image thumbImage(juce::Image::ARGB, safeWidth, safeHeight, true);
+  {
+    juce::Graphics g(thumbImage);
+    g.fillAll(juce::Colour::fromRGBA(20, 22, 28, 0));
+
+    const float scale = std::min(
+      static_cast<float>(safeWidth) / static_cast<float>(sourceWidth),
+      static_cast<float>(safeHeight) / static_cast<float>(sourceHeight)
+    );
+    const int drawWidth = std::max(1, static_cast<int>(std::lround(static_cast<double>(sourceWidth) * scale)));
+    const int drawHeight = std::max(1, static_cast<int>(std::lround(static_cast<double>(sourceHeight) * scale)));
+    const int drawX = (safeWidth - drawWidth) / 2;
+    const int drawY = (safeHeight - drawHeight) / 2;
+
+    g.drawImage(
+      sourceImage,
+      drawX,
+      drawY,
+      drawWidth,
+      drawHeight,
+      0,
+      0,
+      sourceWidth,
+      sourceHeight,
+      false
+    );
+  }
+
+  juce::PNGImageFormat png;
+  auto stream = outFile.createOutputStream();
+  if (stream == nullptr) {
+    error = "failed to create preview output stream";
+    return false;
+  }
+  if (!png.writeImageToStream(thumbImage, *stream)) {
+    error = "failed to write plugin preview png";
+    return false;
+  }
+  stream->flush();
+
+  generated = true;
+  return true;
 }
 
 bool createDefaultEdit(int32_t trackCount, std::string& error) {
@@ -4047,16 +5478,60 @@ tracktion::engine::AudioTrack* getAudioTrackByIndex(int32_t trackId) {
   return tracks[index];
 }
 
-/** Physical wave input to use for recording (default or first non-track). Ensures mic is routed even when no default is set. */
+/** Prefer a wave input that looks like a built-in/mac mic (MacBook Pro Microphone etc.). */
+static bool isLikelyBuiltInMic(const juce::String& name) {
+  const juce::String lower = name.toLowerCase();
+  return lower.contains("macbook") || lower.contains("microphone") || lower.contains("mikrofon")
+         || lower.contains("built-in") || lower.contains("builtin") || lower.contains("internal");
+}
+
+/** Physical wave input to use for recording: prefer MacBook Pro Microphone / Built-in, else default, else first. */
 static tracktion::engine::WaveInputDevice* getPhysicalWaveInForRecording() {
   if (!gState || !gState->engine) return nullptr;
   auto& dm = gState->engine->getDeviceManager();
-  tracktion::engine::WaveInputDevice* w = dm.getDefaultWaveInDevice();
-  if (w != nullptr && !w->isTrackDevice()) return w;
+  tracktion::engine::WaveInputDevice* preferred = nullptr;
+  tracktion::engine::WaveInputDevice* fallbackDefault = nullptr;
+  tracktion::engine::WaveInputDevice* fallbackFirst = nullptr;
   for (tracktion::engine::WaveInputDevice* dev : dm.getWaveInputDevices()) {
-    if (dev != nullptr && !dev->isTrackDevice()) return dev;
+    if (dev == nullptr || dev->isTrackDevice()) continue;
+    if (fallbackFirst == nullptr) fallbackFirst = dev;
+    if (dm.getDefaultWaveInDevice() == dev) fallbackDefault = dev;
+    if (isLikelyBuiltInMic(dev->getName())) {
+      preferred = dev;
+      break;
+    }
   }
-  return nullptr;
+  tracktion::engine::WaveInputDevice* chosen = preferred ? preferred : (fallbackDefault ? fallbackDefault : fallbackFirst);
+  if (chosen != nullptr)
+    std::fprintf(stderr, "[thestuu-native] record input device: %s\n", chosen->getName().toRawUTF8());
+  return chosen;
+}
+
+/** Match RecordingDemo setup: enable physical wave inputs and set monitor mode so recording receives audio. */
+static void ensurePhysicalWaveInputsReadyForRecording() {
+  if (!gState || !gState->engine) return;
+  auto& dm = gState->engine->getDeviceManager();
+  for (int i = 0; i < dm.getNumWaveInDevices(); ++i) {
+    if (auto* wip = dm.getWaveInDevice(i)) {
+      if (wip->isTrackDevice()) continue;
+      wip->setStereoPair(false);
+      wip->setMonitorMode(tracktion::engine::InputDevice::MonitorMode::automatic);
+      wip->setEnabled(true);
+    }
+  }
+}
+
+/** Keep physical inputs silent during normal playback/editing to avoid accidental monitoring feedback. */
+static void disablePhysicalWaveInputsMonitoring() {
+  if (!gState || !gState->engine) return;
+  auto& dm = gState->engine->getDeviceManager();
+  for (int i = 0; i < dm.getNumWaveInDevices(); ++i) {
+    if (auto* wip = dm.getWaveInDevice(i)) {
+      if (wip->isTrackDevice()) continue;
+      wip->setMonitorMode(tracktion::engine::InputDevice::MonitorMode::off);
+      wip->setEnabled(false);
+    }
+  }
 }
 
 /** Route the physical wave input so only this track receives it (armed). Used when arming and right before record. */
@@ -4098,6 +5573,9 @@ bool setTrackMute(int32_t trackId, bool mute, std::string& error) {
     error = "track_id out of range";
     return false;
   }
+  if (track->isMuted(false) == mute) {
+    return true;
+  }
   track->setMute(mute);
   transportRebuildGraphOnly();
   return true;
@@ -4112,6 +5590,9 @@ bool setTrackSolo(int32_t trackId, bool solo, std::string& error) {
   if (track == nullptr) {
     error = "track_id out of range";
     return false;
+  }
+  if (track->isSolo(false) == solo) {
+    return true;
   }
   track->setSolo(solo);
   transportRebuildGraphOnly();
@@ -4130,8 +5611,13 @@ bool setTrackVolume(int32_t trackId, double volume, std::string& error) {
   }
   if (auto* volPan = track->getVolumePlugin()) {
     const float pos = static_cast<float>(std::max(0.0, std::min(1.0, volume)));
+    if (std::abs(volPan->getSliderPos() - pos) < 1.0e-4f) {
+      return true;
+    }
     volPan->setSliderPos(pos);
     transportRebuildGraphOnly();
+  } else {
+    std::fprintf(stderr, "[thestuu-native] setTrackVolume track=%d: no VolumePlugin (volume=%.2f not applied)\n", static_cast<int>(trackId), volume);
   }
   return true;
 }
@@ -4148,6 +5634,9 @@ bool setTrackPan(int32_t trackId, double pan, std::string& error) {
   }
   if (auto* volPan = track->getVolumePlugin()) {
     const float p = static_cast<float>(std::max(-1.0, std::min(1.0, pan)));
+    if (std::abs(volPan->getPan() - p) < 1.0e-4f) {
+      return true;
+    }
     volPan->setPan(p);
     transportRebuildGraphOnly();
   }
@@ -4163,6 +5652,9 @@ bool setTrackRecordArm(int32_t trackId, bool armed, std::string& error) {
   if (track == nullptr) {
     error = "track_id out of range";
     return false;
+  }
+  if (track->getWaveInputDevice().isEnabled() == armed) {
+    return true;
   }
   using namespace tracktion::engine;
   track->getWaveInputDevice().setEnabled(armed);
@@ -4188,6 +5680,9 @@ bool setTrackRecordArm(int32_t trackId, bool armed, std::string& error) {
   // Route the physical wave input (mic) to this track so recording actually goes here.
   if (tracktion::engine::WaveInputDevice* physIn = getPhysicalWaveInForRecording()) {
     if (armed) {
+      // Keep monitoring silent while merely "armed"; we only enable physical input right before actual record.
+      physIn->setMonitorMode(tracktion::engine::InputDevice::MonitorMode::off);
+      physIn->setEnabled(false);
       physIn->setRecordAdjustmentMs(12.0);
       routePhysicalWaveInToTrack(*physIn, *track);
     } else {
@@ -4201,6 +5696,7 @@ bool setTrackRecordArm(int32_t trackId, bool armed, std::string& error) {
           }
         }
       }
+      disablePhysicalWaveInputsMonitoring();
     }
   }
   std::fprintf(stderr, "[thestuu-native] setTrackRecordArm track=%d armed=%d (device enabled + destination armed)\n", static_cast<int>(trackId), armed ? 1 : 0);
@@ -4227,6 +5723,7 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
     deviceManager.initialise(2, 2);
     gState->spectrumAnalyzerTap = std::make_unique<GlobalSpectrumAnalyzerTap>();
     deviceManager.deviceManager.addAudioCallback(gState->spectrumAnalyzerTap.get());
+    disablePhysicalWaveInputsMonitoring();
 
     // Do not create an edit here: the device list is not ready yet (Rebuilding Wave Device List
     // runs later), so tracks would get output device null and be excluded from the playback graph.
@@ -4268,6 +5765,7 @@ bool resetDefaultEdit(int32_t trackCount, std::string& error) {
     if (!createDefaultEditOnMessageThread(safeTrackCount, error)) {
       return false;
     }
+    disablePhysicalWaveInputsMonitoring();
     gState->parameterCacheByUid.clear();
     error.clear();
     return true;
@@ -4463,6 +5961,56 @@ bool openPluginEditor(int32_t trackId, int32_t pluginIndex, std::string& error) 
   const bool finished = cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
   if (!finished) {
     error = "timeout while opening plugin editor";
+    return false;
+  }
+  return ok;
+}
+
+bool getPluginPreviewImage(
+  const std::string& pluginUid,
+  int32_t width,
+  int32_t height,
+  const std::string& outputPath,
+  bool& generated,
+  std::string& error
+) {
+  generated = false;
+  error.clear();
+
+  if (!isInitialised(error)) {
+    return false;
+  }
+  if (!requireEdit(error)) {
+    return false;
+  }
+
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return getPluginPreviewImageImpl(pluginUid, width, height, outputPath, generated, error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+
+  mm->callAsync([&]() {
+    ok = getPluginPreviewImageImpl(pluginUid, width, height, outputPath, generated, error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+
+  std::unique_lock<std::mutex> lock(mtx);
+  const bool finished = cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!finished) {
+    error = "timeout while generating plugin preview";
     return false;
   }
   return ok;
@@ -4783,10 +6331,69 @@ bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::strin
 
 bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
   out = {};
-  if (!gState || !gState->spectrumAnalyzerTap) {
+  if (!gState) {
+    return false;
+  }
+
+  const int32_t targetTrackId = gState->spectrumAnalyzerTargetTrackId.load(std::memory_order_relaxed);
+  const int32_t targetPluginIndex = gState->spectrumAnalyzerTargetPluginIndex.load(std::memory_order_relaxed);
+  if (targetTrackId > 0) {
+    if (auto* track = getAudioTrackByIndex(targetTrackId)) {
+      if (auto* meterPlugin = track->getLevelMeterPlugin()) {
+        double sampleRate = 0.0;
+        int fftSize = 0;
+        int64_t timestamp = 0;
+        std::vector<float> freqsHz;
+        std::vector<float> postDb;
+        if (meterPlugin->getRealtimeSpectrumSnapshot(sampleRate, fftSize, timestamp, freqsHz, postDb)
+            && !freqsHz.empty() && freqsHz.size() == postDb.size()) {
+          out.available = true;
+          out.preMirrorsPost = true;
+          out.scope = targetPluginIndex >= 0
+            ? ("track:" + std::to_string(targetTrackId) + ":plugin:" + std::to_string(targetPluginIndex))
+            : ("track:" + std::to_string(targetTrackId));
+          out.channels = "mono";
+          out.sampleRate = sampleRate;
+          out.fftSize = fftSize;
+          out.minDb = -96.0;
+          out.maxDb = 6.0;
+          out.timestamp = timestamp;
+          out.freqsHz = std::move(freqsHz);
+          out.postDb = std::move(postDb);
+          out.preDb = out.postDb;
+          return true;
+        }
+      }
+    }
+  }
+
+  if (!gState->spectrumAnalyzerTap) {
     return false;
   }
   return gState->spectrumAnalyzerTap->getSnapshot(out);
+}
+
+bool setSpectrumAnalyzerTarget(int32_t trackId, int32_t pluginIndex, std::string& error) {
+  error.clear();
+  if (!gState || !gState->edit) {
+    error = "Backend not initialised";
+    return false;
+  }
+
+  if (trackId <= 0) {
+    gState->spectrumAnalyzerTargetTrackId.store(0, std::memory_order_relaxed);
+    gState->spectrumAnalyzerTargetPluginIndex.store(-1, std::memory_order_relaxed);
+    return true;
+  }
+
+  if (!getAudioTrackByIndex(trackId)) {
+    error = "Track not found";
+    return false;
+  }
+
+  gState->spectrumAnalyzerTargetTrackId.store(trackId, std::memory_order_relaxed);
+  gState->spectrumAnalyzerTargetPluginIndex.store(pluginIndex, std::memory_order_relaxed);
+  return true;
 }
 
 static double getBpmFromEdit() {
@@ -4842,6 +6449,7 @@ static void transportPlayImpl() {
   if (!gState || !gState->edit) {
     return;
   }
+  disablePhysicalWaveInputsMonitoring();
   auto& transport = gState->edit->getTransport();
   const bool shouldPlay = gState->edit->shouldPlay();
   std::cerr << "[thestuu-native] transport play: edit.shouldPlay()=" << (shouldPlay ? 1 : 0) << std::endl;
@@ -4880,27 +6488,49 @@ static void transportRecordImpl() {
     std::fprintf(stderr, "[thestuu-native] transportRecordImpl: edit.shouldPlay()=false, skip\n");
     return;
   }
+  // RecordingDemo: enable physical wave inputs and set monitor mode before recording.
+  ensurePhysicalWaveInputsReadyForRecording();
   const auto tracks = tracktion::engine::getAudioTracks(*gState->edit);
   int armedCount = 0;
   tracktion::engine::AudioTrack* firstArmedTrack = nullptr;
   std::string armedTrackIds;
   for (size_t i = 0; i < tracks.size(); ++i) {
-    if (tracks[i] && tracks[i]->getWaveInputDevice().isEnabled()) {
+    auto* tr = tracks[i];
+    if (tr && tr->getWaveInputDevice().isEnabled()) {
       ++armedCount;
-      if (firstArmedTrack == nullptr) firstArmedTrack = tracks[i];
+      if (firstArmedTrack == nullptr) firstArmedTrack = tr;
       if (!armedTrackIds.empty()) armedTrackIds += ',';
       armedTrackIds += std::to_string(static_cast<int>(i) + 1);
     }
   }
   std::fprintf(stderr, "[thestuu-native] transportRecordImpl: starting record (tracks with wave input enabled=%d: %s)\n",
                armedCount, armedTrackIds.empty() ? "none" : armedTrackIds.c_str());
-  // Re-apply physical mic → armed track so recording goes to the right track (e.g. after edit:reset).
-  if (firstArmedTrack) {
-    if (tracktion::engine::WaveInputDevice* physIn = getPhysicalWaveInForRecording())
-      routePhysicalWaveInToTrack(*physIn, *firstArmedTrack);
-  }
+  // Ensure edit state has physical mic routed to armed track (so new context picks it up).
+  tracktion::engine::WaveInputDevice* physIn = getPhysicalWaveInForRecording();
+  if (firstArmedTrack && physIn)
+    routePhysicalWaveInToTrack(*physIn, *firstArmedTrack);
   transport.freePlaybackContext();
   transport.ensureContextAllocated(true);
+  // RecordingDemo: use setTarget(..., 0) and setRecordingEnabled so startRecording() includes this input.
+  if (firstArmedTrack && physIn) {
+    if (auto* ctx = transport.getCurrentPlaybackContext()) {
+      if (auto* instance = ctx->getInputFor(physIn)) {
+        for (auto targetId : instance->getTargets())
+          (void) instance->removeTarget(targetId, nullptr);
+        auto res = instance->setTarget(firstArmedTrack->itemID, true, nullptr, 0);
+        if (res) {
+          instance->setRecordingEnabled(firstArmedTrack->itemID, true);
+          std::fprintf(stderr, "[thestuu-native] transportRecordImpl: physical input -> track armed (setTarget + setRecordingEnabled OK)\n");
+        } else {
+          std::fprintf(stderr, "[thestuu-native] transportRecordImpl: setTarget failed: %s\n", res.error().toRawUTF8());
+        }
+      } else {
+        std::fprintf(stderr, "[thestuu-native] transportRecordImpl: no input instance for physical wave in\n");
+      }
+    } else {
+      std::fprintf(stderr, "[thestuu-native] transportRecordImpl: no playback context after ensureContextAllocated\n");
+    }
+  }
   transport.record(false, true);
   std::fprintf(stderr, "[thestuu-native] transportRecordImpl: transport.record() returned (isPlaying=%d isRecording=%d)\n",
                transport.isPlaying() ? 1 : 0, transport.isRecording() ? 1 : 0);
@@ -5015,6 +6645,7 @@ void transportRecord() {
 
 static void transportPauseImpl() {
   if (!gState || !gState->edit) return;
+  disablePhysicalWaveInputsMonitoring();
   auto& transport = gState->edit->getTransport();
   const auto savedPosition = transport.getPosition();
   transport.stop(false, true, true);
@@ -5023,6 +6654,7 @@ static void transportPauseImpl() {
 
 static void transportStopImpl() {
   if (!gState || !gState->edit) return;
+  disablePhysicalWaveInputsMonitoring();
   auto& transport = gState->edit->getTransport();
   transport.stop(false, true, true);
   transport.setPosition(tracktion::core::TimePosition::fromSeconds(0.0));
@@ -5196,6 +6828,7 @@ bool setAudioOutputDevice(const std::string& deviceId, std::string& error) {
       for (int i = 0; i < 20; ++i) {
         pumpMessageLoop();
       }
+      disablePhysicalWaveInputsMonitoring();
       dm.saveSettings();
     } catch (const std::exception& ex) {
       errMsg = ex.what();

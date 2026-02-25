@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="96" viewBox="0 0 320 96" fill="none">
+  <defs>
+    <linearGradient id="bg_compressor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b4049"/>
+      <stop offset="100%" stop-color="#242933"/>
+    </linearGradient>
+    <linearGradient id="shine_compressor" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="319" height="95" rx="10" fill="url(#bg_compressor)" stroke="#dbe2ee" stroke-opacity="0.18"/>
+  <rect x="1" y="1" width="318" height="18" rx="9" fill="url(#shine_compressor)"/>
+  <rect x="8" y="8" width="7" height="7" rx="3.5" fill="#ef4444" fill-opacity="0.85"/>
+  <rect x="18" y="8" width="7" height="7" rx="3.5" fill="#f59e0b" fill-opacity="0.75"/>
+  <rect x="28" y="8" width="7" height="7" rx="3.5" fill="#22c55e" fill-opacity="0.75"/>
+  <g opacity="0.96">
+    
+    <rect x="18" y="18" width="128" height="56" rx="8" fill="#f8fafc" fill-opacity="0.10" stroke="#f8fafc" stroke-opacity="0.16"/>
+    <path d="M34 62 A44 44 0 0 1 130 62" fill="none" stroke="#f8fafc" stroke-width="3" stroke-opacity="0.55"/>
+    <path d="M82 62 L114 36" stroke="#f59e0b" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="82" cy="62" r="4" fill="#f59e0b"/>
+    <circle cx="210" cy="46" r="14" fill="#111827" stroke="#f8fafc" stroke-opacity="0.32"/>
+    <circle cx="258" cy="46" r="14" fill="#111827" stroke="#f8fafc" stroke-opacity="0.32"/>
+    <path d="M204 46 L216 46" stroke="#fef08a" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M258 40 L258 52" stroke="#fef08a" stroke-width="2.5" stroke-linecap="round"/>
+    
+  </g>
+  <rect x="10" y="76" width="300" height="10" rx="5" fill="#0f131a" fill-opacity="0.42"/>
+  <text x="16" y="84" fill="#f3f4f6" fill-opacity="0.92" font-size="8.6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">Tracktion Compressor</text>
+</svg>

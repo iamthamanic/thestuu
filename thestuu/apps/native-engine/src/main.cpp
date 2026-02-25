@@ -736,7 +736,8 @@ int g_tickLogCounter = 0;
 MsgValue makeTickEvent(const TransportCore& transport) {
   thestuu::native::TransportSnapshot backendSnap;
   if (g_useTracktionTransport && thestuu::native::getTransportSnapshot(backendSnap)) {
-    if (++g_tickLogCounter <= 12 || (g_tickLogCounter % 50 == 0)) {
+    // Log only first 2 ticks then every 200th to avoid flooding the console
+    if (++g_tickLogCounter <= 2 || (g_tickLogCounter % 200 == 0)) {
       std::fprintf(
         stderr,
         "[thestuu-native] tick playing=%d positionBeats=%.4f bpm=%.3f\n",
@@ -874,6 +875,36 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       transport.seekToBeats(positionBeats);
     }
     return makeResponse(id, MsgValue::Object{{"transport", MsgValue(transport.snapshot())}});
+  }
+  if (cmd == "analyzer.set_target" || cmd == "analyzer:set-target") {
+    if (!payload) {
+      return makeErrorResponse(id, "analyzer:set-target requires payload");
+    }
+    const std::string mode = asString(getField(*payload, "mode"));
+    int32_t trackId = static_cast<int32_t>(
+      asInt(getField(*payload, "track_id"),
+        asInt(getField(*payload, "trackId"), 0))
+    );
+    const int32_t pluginIndex = static_cast<int32_t>(
+      asInt(getField(*payload, "plugin_index"),
+        asInt(getField(*payload, "pluginIndex"), -1))
+    );
+    if (mode == "master") {
+      trackId = 0;
+    }
+    std::string error;
+    if (!thestuu::native::setSpectrumAnalyzerTarget(trackId, pluginIndex, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(
+      id,
+      MsgValue::Object{
+        {"ok", MsgValue(true)},
+        {"mode", MsgValue(trackId > 0 ? std::string("track") : std::string("master"))},
+        {"trackId", MsgValue(static_cast<int64_t>(trackId))},
+        {"pluginIndex", MsgValue(static_cast<int64_t>(pluginIndex))},
+      }
+    );
   }
   if (cmd == "edit:reset") {
     const int32_t requestedTrackCount = static_cast<int32_t>(
@@ -1054,6 +1085,57 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
         {"trackId", MsgValue(trackId)},
         {"pluginIndex", MsgValue(pluginIndex)},
         {"opened", MsgValue(true)},
+      }
+    );
+  }
+  if (cmd == "vst:preview:get") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "vst:preview:get requires payload");
+    }
+
+    std::string pluginUid = asString(getField(*payload, "plugin_uid"));
+    if (pluginUid.empty()) {
+      pluginUid = asString(getField(*payload, "pluginUid"));
+    }
+    if (pluginUid.empty()) {
+      return makeErrorResponse(id, "vst:preview:get requires plugin_uid");
+    }
+
+    std::string outputPath = asString(getField(*payload, "output_path"));
+    if (outputPath.empty()) {
+      outputPath = asString(getField(*payload, "outputPath"));
+    }
+    if (outputPath.empty()) {
+      return makeErrorResponse(id, "vst:preview:get requires output_path");
+    }
+
+    const int32_t width = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "width"),
+        asInt(getField(*payload, "w"), 320)
+      )
+    );
+    const int32_t height = static_cast<int32_t>(
+      asInt(
+        getField(*payload, "height"),
+        asInt(getField(*payload, "h"), 96)
+      )
+    );
+
+    bool generated = false;
+    std::string error;
+    if (!thestuu::native::getPluginPreviewImage(pluginUid, width, height, outputPath, generated, error)) {
+      return makeErrorResponse(id, error);
+    }
+
+    return makeResponse(
+      id,
+      MsgValue::Object{
+        {"uid", MsgValue(pluginUid)},
+        {"path", MsgValue(outputPath)},
+        {"width", MsgValue(width)},
+        {"height", MsgValue(height)},
+        {"generated", MsgValue(generated)},
       }
     );
   }

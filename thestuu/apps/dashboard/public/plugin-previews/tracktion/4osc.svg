@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="96" viewBox="0 0 320 96" fill="none">
+  <defs>
+    <linearGradient id="bg_4osc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b4049"/>
+      <stop offset="100%" stop-color="#242933"/>
+    </linearGradient>
+    <linearGradient id="shine_4osc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="319" height="95" rx="10" fill="url(#bg_4osc)" stroke="#dbe2ee" stroke-opacity="0.18"/>
+  <rect x="1" y="1" width="318" height="18" rx="9" fill="url(#shine_4osc)"/>
+  <rect x="8" y="8" width="7" height="7" rx="3.5" fill="#ef4444" fill-opacity="0.85"/>
+  <rect x="18" y="8" width="7" height="7" rx="3.5" fill="#f59e0b" fill-opacity="0.75"/>
+  <rect x="28" y="8" width="7" height="7" rx="3.5" fill="#22c55e" fill-opacity="0.75"/>
+  <g opacity="0.96">
+    
+    <path d="M18 60 C30 24, 42 24, 54 60 C66 24, 78 24, 90 60 C102 24, 114 24, 126 60" fill="none" stroke="#f472b6" stroke-width="3" stroke-linecap="round"/>
+    <path d="M138 26 L138 68" stroke="#f8fafc" stroke-opacity="0.22" stroke-width="2"/>
+    <path d="M154 26 L154 68" stroke="#f8fafc" stroke-opacity="0.22" stroke-width="2"/>
+    <path d="M170 26 L170 68" stroke="#f8fafc" stroke-opacity="0.22" stroke-width="2"/>
+    <path d="M186 26 L186 68" stroke="#f8fafc" stroke-opacity="0.22" stroke-width="2"/>
+    <path d="M204 46 C216 32, 228 32, 240 46 C252 60, 264 60, 276 46 C286 34, 296 34, 304 44" fill="none" stroke="#60a5fa" stroke-width="3" stroke-linecap="round"/>
+    
+  </g>
+  <rect x="10" y="76" width="300" height="10" rx="5" fill="#0f131a" fill-opacity="0.42"/>
+  <text x="16" y="84" fill="#f3f4f6" fill-opacity="0.92" font-size="8.6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">Tracktion Four Osc</text>
+</svg>

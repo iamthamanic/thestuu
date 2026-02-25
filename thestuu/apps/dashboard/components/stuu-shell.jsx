@@ -9,6 +9,7 @@ import {
   AudioWaveform,
   ArrowUpDown,
   Check,
+  ChevronDown,
   ChevronRight,
   Circle,
   Clock3,
@@ -40,6 +41,48 @@ import {
 } from 'lucide-react';
 import 'reactflow/dist/style.css';
 import { createEngineSocket } from '../lib/socket';
+
+function ExtractStemsIcon({ size = 24, strokeWidth = 2, ...props }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      {...props}
+    >
+      <circle cx="12" cy="4.5" r="2.25" />
+      <path d="M3.75 12.25H20.25V16.25L14.75 20V22L9.25 23.25V20L3.75 16.25Z" />
+    </svg>
+  );
+}
+
+function FitToTempoIcon({ size = 24, strokeWidth = 2, ...props }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      {...props}
+    >
+      <path d="M3 12H9" />
+      <path d="M6.75 9.5L9.25 12L6.75 14.5" />
+      <circle cx="16" cy="12" r="5.25" />
+      <path d="M16 9.25V12H18.5" />
+    </svg>
+  );
+}
 
 const TABS = ['Edit', 'Mix'];
 const DAW_MENU_ITEMS = ['FILE', 'VIEW', 'HELP', 'SETTINGS'];
@@ -101,6 +144,24 @@ const TRACK_CONTEXT_MENU_ITEMS = [
   { id: 'duplicate', label: 'Duplizieren' },
   { id: 'delete', label: 'Entfernen' },
 ];
+const CLIP_QUICK_TOOL_MENU_ITEMS = [
+  { id: 'extract_stems', label: 'Extract Stems', icon: ExtractStemsIcon },
+  { id: 'fit_to_tempo', label: 'Fit to Tempo', icon: FitToTempoIcon },
+  { id: 'rename_and_color', label: 'Rename and Color', icon: PaintBucket },
+  { id: 'analyze_bpm_key', label: 'Analyze BPM & Key', icon: Gauge },
+];
+const CLIP_RENAME_COLOR_SWATCHES = [
+  { id: 'default', label: 'Default', color: '' },
+  { id: 'sky', label: 'Sky', color: '#60a5fa' },
+  { id: 'emerald', label: 'Emerald', color: '#34d399' },
+  { id: 'amber', label: 'Amber', color: '#fbbf24' },
+  { id: 'rose', label: 'Rose', color: '#fb7185' },
+  { id: 'violet', label: 'Violet', color: '#a78bfa' },
+  { id: 'cyan', label: 'Cyan', color: '#22d3ee' },
+  { id: 'lime', label: 'Lime', color: '#a3e635' },
+  { id: 'orange', label: 'Orange', color: '#fb923c' },
+  { id: 'red', label: 'Red', color: '#f87171' },
+];
 const DEFAULT_SNAP_MODE = 'free';
 const SNAP_MODE_OPTIONS = [
   { id: 'free', label: 'Free' },
@@ -121,6 +182,7 @@ const EDIT_TOOL_OPTIONS = [
 const DEFAULT_EDIT_TOOL = 'select';
 const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3987';
 const LIVE_ENGINE_LOG_LIMIT = 500;
+const TRACKTION_PLUGIN_PREVIEW_DIMENSIONS = { width: 320, height: 96 };
 
 function normalizeLiveEngineLogLevel(level) {
   if (level === 'error' || level === 'warn' || level === 'info') {
@@ -272,7 +334,20 @@ function resolveTracktionPluginUiMeta(pluginUid, pluginName) {
   if (!token) {
     return null;
   }
-  return TRACKTION_PLUGIN_UI_META[token] || TRACKTION_GENERIC_PLUGIN_UI_META;
+  const baseMeta = TRACKTION_PLUGIN_UI_META[token] || TRACKTION_GENERIC_PLUGIN_UI_META;
+  if (!TRACKTION_PLUGIN_UI_META[token]) {
+    return baseMeta;
+  }
+  const previewPluginUid = typeof pluginUid === 'string' && pluginUid.trim()
+    ? pluginUid.trim()
+    : `internal:tracktion:${token}`;
+  return {
+    ...baseMeta,
+    previewSrc: `${ENGINE_BASE_URL}/plugin-preview?uid=${encodeURIComponent(previewPluginUid)}&w=${TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.width}&h=${TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.height}`,
+    fallbackPreviewSrc: `/plugin-previews/tracktion/${token}.svg`,
+    previewWidth: TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.width,
+    previewHeight: TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.height,
+  };
 }
 
 function buildPluginHelpTooltip(pluginName, pluginUiMeta) {
@@ -1279,11 +1354,84 @@ function getImportedClipLabel(clip) {
 }
 
 function getClipDisplayLabel(clip) {
+  if (isNonEmptyString(clip?.name)) {
+    return clip.name.trim();
+  }
   const patternId = getPatternId(clip);
   if (patternId) {
     return patternId;
   }
   return getImportedClipLabel(clip);
+}
+
+function normalizeClipCustomColor(value) {
+  if (!isNonEmptyString(value)) {
+    return null;
+  }
+  const match = /^#?([0-9a-fA-F]{6})$/.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+  return `#${match[1].toLowerCase()}`;
+}
+
+function hexToRgbChannels(value) {
+  const hex = normalizeClipCustomColor(value);
+  if (!hex) {
+    return null;
+  }
+  const r = Number.parseInt(hex.slice(1, 3), 16);
+  const g = Number.parseInt(hex.slice(3, 5), 16);
+  const b = Number.parseInt(hex.slice(5, 7), 16);
+  if (![r, g, b].every((channel) => Number.isFinite(channel))) {
+    return null;
+  }
+  return `${r}, ${g}, ${b}`;
+}
+
+function stripFilenameExtension(value) {
+  if (!isNonEmptyString(value)) {
+    return '';
+  }
+  const trimmed = value.trim();
+  return trimmed.replace(/\.[^.]+$/, '');
+}
+
+function normalizeAutoAnalyzedNameBase(value) {
+  const withoutExt = stripFilenameExtension(value);
+  const normalized = withoutExt
+    .replace(/\s+/g, '_')
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return normalized || 'Clip';
+}
+
+function formatAnalyzedKeyNameToken(value) {
+  if (!isNonEmptyString(value)) {
+    return '';
+  }
+  const trimmed = value.trim();
+  const match = /^([A-Ga-g])([#b]?)[\s_-]*(major|minor)$/i.exec(trimmed);
+  if (match) {
+    const note = `${match[1].toUpperCase()}${match[2] || ''}`;
+    const quality = String(match[3] || '').toLowerCase() === 'minor' ? 'Minor' : 'Major';
+    return `${note}${quality}`;
+  }
+  return trimmed.replace(/\s+/g, '');
+}
+
+function buildAutoAnalyzedClipName(baseName, { bpm, key } = {}) {
+  const parts = [normalizeAutoAnalyzedNameBase(baseName)];
+  const bpmNumber = Number(bpm);
+  if (Number.isFinite(bpmNumber) && bpmNumber > 0) {
+    parts.push(`BPM_${Math.round(bpmNumber)}`);
+  }
+  const keyToken = formatAnalyzedKeyNameToken(key);
+  if (keyToken) {
+    parts.push(`Key_${keyToken}`);
+  }
+  return parts.join('_');
 }
 
 function getClipWaveformPeaks(clip) {
@@ -2140,6 +2288,7 @@ export default function StuuShell() {
   const [inspectorEqAnalyzerFrozen, setInspectorEqAnalyzerFrozen] = useState(false);
   const [activePatternId, setActivePatternId] = useState(null);
   const [clipDrafts, setClipDrafts] = useState({});
+  const [clipDisplayOverrides, setClipDisplayOverrides] = useState({});
   const [clipInteraction, setClipInteraction] = useState(null);
   const [fadeHandleInteraction, setFadeHandleInteraction] = useState(/** @type {{ which: 'in'|'out'; trackId: number; clipId: string; originX: number; originY: number; fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; clipLengthBars: number; clipLengthSeconds: number } | null} */ (null));
   const fadeHandleDraftRef = useRef(/** @type {{ fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } | null} */ (null));
@@ -2211,6 +2360,9 @@ export default function StuuShell() {
   const [trackChainEnabledOverrides, setTrackChainEnabledOverrides] = useState({});
   const [playheadDragBars, setPlayheadDragBars] = useState(null);
   const [trackContextMenu, setTrackContextMenu] = useState(null);
+  const [clipQuickToolMenu, setClipQuickToolMenu] = useState(null);
+  const [clipRenameColorPrompt, setClipRenameColorPrompt] = useState(null);
+  const [clipAnalyzeResultModal, setClipAnalyzeResultModal] = useState(null);
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [selectedTrackIds, setSelectedTrackIds] = useState([]);
   const [openTrackPluginPicker, setOpenTrackPluginPicker] = useState(null);
@@ -2218,6 +2370,7 @@ export default function StuuShell() {
   const [slicePreviewBars, setSlicePreviewBars] = useState(null);
   const [sliceCursorPosition, setSliceCursorPosition] = useState(null);
   const [importTrackRenamePrompt, setImportTrackRenamePrompt] = useState(null);
+  const clipRenameColorNameInputRef = useRef(null);
   const appendConnectionLogEntry = useCallback((entry) => {
     const normalized = normalizeLiveEngineLogEntry(entry);
     if (!normalized) {
@@ -3574,6 +3727,43 @@ export default function StuuShell() {
   }, [inspector.type, inspectorNode?.id]);
 
   useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket) {
+      return;
+    }
+
+    const isEqNode = inspector.type === 'node'
+      && inspectorNode?.type === 'vst_instrument'
+      && resolveTracktionPluginToken(inspectorNode?.plugin_uid, inspectorNode?.plugin) === '4bandeq';
+
+    if (isEqNode) {
+      const trackId = Number(inspectorNode?.track_id ?? inspectorNode?.trackId);
+      const pluginIndex = Number(inspectorNode?.plugin_index ?? inspectorNode?.pluginIndex);
+      if (Number.isInteger(trackId) && trackId > 0) {
+        socket.emit('analyzer:set-target', {
+          mode: 'track',
+          trackId,
+          pluginIndex: Number.isInteger(pluginIndex) ? pluginIndex : -1,
+        });
+        return;
+      }
+    }
+
+    socket.emit('analyzer:set-target', { mode: 'master' });
+  }, [
+    connection,
+    inspector.type,
+    inspectorNode?.id,
+    inspectorNode?.type,
+    inspectorNode?.plugin_uid,
+    inspectorNode?.plugin,
+    inspectorNode?.track_id,
+    inspectorNode?.trackId,
+    inspectorNode?.plugin_index,
+    inspectorNode?.pluginIndex,
+  ]);
+
+  useEffect(() => {
     if (inspectorEqViewMode !== 'pro' || !inspectorTracktionEqSelectedBandParamKey) {
       return;
     }
@@ -3683,6 +3873,28 @@ export default function StuuShell() {
     setChatMessages((previous) => [...previous, { role: 'system', text }]);
   }, []);
 
+  const applyProjectBpm = useCallback((rawBpm, { sourceLabel = 'Analyse' } = {}) => {
+    const parsed = Number(rawBpm);
+    if (!Number.isFinite(parsed)) {
+      appendSystemMessage(`Fehler (transport:set-bpm): Ungueltiger BPM-Wert aus ${sourceLabel}.`);
+      return;
+    }
+    const nextBpm = Math.round(clamp(parsed, 20, 300));
+    setBpmInputValue(String(nextBpm));
+    const socket = socketRef.current;
+    if (!socket) {
+      appendSystemMessage('Fehler (transport:set-bpm): Keine Engine-Verbindung.');
+      return;
+    }
+    socket.emit('transport:set-bpm', { bpm: nextBpm }, (result) => {
+      if (!result?.ok) {
+        appendSystemMessage(`Fehler (transport:set-bpm): ${result?.error || 'Unbekannter Fehler'}`);
+        return;
+      }
+      appendSystemMessage(`Projekt-BPM auf ${nextBpm} gesetzt (${sourceLabel}).`);
+    });
+  }, [appendSystemMessage]);
+
   const emitMutation = useCallback((eventName, payload, onSuccess) => {
     socketRef.current?.emit(eventName, payload, (result) => {
       if (result?.ok) {
@@ -3694,6 +3906,88 @@ export default function StuuShell() {
       appendSystemMessage(`Fehler (${eventName}): ${result?.error || 'Unbekannter Fehler'}`);
     });
   }, [appendSystemMessage]);
+
+  const requestClipBpmKeyAnalysis = useCallback(({
+    trackId,
+    clipId,
+    clipType = 'audio',
+    clipLabel = '',
+    showResultModal = true,
+    announceStart = true,
+    announceDone = true,
+    autoRenameBaseName = '',
+  } = {}) => {
+    const resolvedTrackId = Number(trackId);
+    const resolvedClipId = isNonEmptyString(clipId) ? clipId.trim() : '';
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !resolvedClipId) {
+      return;
+    }
+    if (String(clipType || '').toLowerCase() !== 'audio') {
+      appendSystemMessage(`Analyze BPM & Key ist aktuell nur fuer Audio-Clips gedacht (Clip ${resolvedClipId} auf Track ${resolvedTrackId}).`);
+      return;
+    }
+
+    const descriptor = clipLabel
+      ? `"${clipLabel}" (Track ${resolvedTrackId})`
+      : `Clip ${resolvedClipId} auf Track ${resolvedTrackId}`;
+    const clipKey = getClipSelectionKey(resolvedTrackId, resolvedClipId);
+
+    if (announceStart) {
+      appendSystemMessage(`Analyze BPM & Key gestartet fuer ${descriptor}...`);
+    }
+
+    emitMutation('clip:analyze-bpm-key', {
+      trackId: resolvedTrackId,
+      clipId: resolvedClipId,
+    }, (result) => {
+      const resolvedBpm = Number(result?.bpm);
+      const resolvedKey = isNonEmptyString(result?.key) ? result.key.trim() : '';
+      const autoName = isNonEmptyString(autoRenameBaseName)
+        ? buildAutoAnalyzedClipName(autoRenameBaseName, {
+          bpm: Number.isFinite(resolvedBpm) ? resolvedBpm : null,
+          key: resolvedKey || null,
+        })
+        : '';
+
+      setClipDisplayOverrides((previous) => ({
+        ...previous,
+        [clipKey]: {
+          ...(previous?.[clipKey] || {}),
+          ...(Number.isFinite(resolvedBpm) ? { bpm: resolvedBpm } : { bpm: undefined }),
+          ...(resolvedKey ? { key: resolvedKey } : { key: undefined }),
+          ...(isNonEmptyString(result?.analyzed_at) ? { analyzed_at: result.analyzed_at } : {}),
+          ...(autoName ? { name: autoName } : {}),
+        },
+      }));
+
+      if (autoName) {
+        emitMutation('clip:set-properties', {
+          trackId: resolvedTrackId,
+          clipId: resolvedClipId,
+          name: autoName,
+        });
+      }
+
+      if (showResultModal) {
+        setClipAnalyzeResultModal({
+          trackId: resolvedTrackId,
+          clipId: resolvedClipId,
+          clipLabel: clipLabel || '',
+          bpm: Number.isFinite(resolvedBpm) ? Number(resolvedBpm.toFixed(1)) : null,
+          key: resolvedKey || null,
+          analyzedAt: isNonEmptyString(result?.analyzed_at) ? result.analyzed_at : null,
+          methodBpm: typeof result?.method?.bpm === 'string' ? result.method.bpm : null,
+          methodKey: typeof result?.method?.key === 'string' ? result.method.key : null,
+        });
+      }
+
+      if (announceDone) {
+        const bpmText = Number.isFinite(resolvedBpm) ? `${resolvedBpm.toFixed(1)} BPM` : 'BPM ?';
+        const keyText = resolvedKey || 'Key ?';
+        appendSystemMessage(`Analyse fertig fuer ${descriptor}: ${bpmText}, ${keyText}.${autoName ? ` Name: ${autoName}` : ''}`);
+      }
+    });
+  }, [appendSystemMessage, emitMutation]);
 
   const resolveImportTrackRenamePrompt = useCallback((payload = { apply: false, trackName: '' }) => {
     const resolver = importTrackRenamePromptResolverRef.current;
@@ -3769,6 +4063,15 @@ export default function StuuShell() {
       if (!target.closest('[data-track-context-menu-root="true"]')) {
         setTrackContextMenu(null);
       }
+      if (!target.closest('[data-clip-quick-tool-menu-root="true"]')) {
+        setClipQuickToolMenu(null);
+      }
+      if (!target.closest('[data-clip-rename-color-root="true"]')) {
+        setClipRenameColorPrompt(null);
+      }
+      if (!target.closest('[data-clip-analyze-result-root="true"]')) {
+        setClipAnalyzeResultModal(null);
+      }
       if (!target.closest('[data-track-plugin-picker-root="true"]')) {
         setOpenTrackPluginPicker(null);
       }
@@ -3821,6 +4124,9 @@ export default function StuuShell() {
       if (event.key === 'Escape') {
         setOpenTrackMenuId(null);
         setTrackContextMenu(null);
+        setClipQuickToolMenu(null);
+        setClipRenameColorPrompt(null);
+        setClipAnalyzeResultModal(null);
         setOpenTrackPluginPicker(null);
         setTrackChainModalTrackId(null);
         setToolDragOverlay(null);
@@ -3874,6 +4180,19 @@ export default function StuuShell() {
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [activeTab, state?.playing, selectedClipKeys, emitMutation, triggerProjectRedo, triggerProjectUndo, importTrackRenamePrompt, resolveImportTrackRenamePrompt]);
+
+  useEffect(() => {
+    if (!clipRenameColorPrompt) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      clipRenameColorNameInputRef.current?.focus();
+      clipRenameColorNameInputRef.current?.select();
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [clipRenameColorPrompt?.trackId, clipRenameColorPrompt?.clipId]);
 
   useEffect(() => {
     return () => {
@@ -4222,16 +4541,19 @@ export default function StuuShell() {
   }, [getTrackRowHeightPx, snapStep]);
 
   const getRenderedClip = useCallback((trackId, clip) => {
+    const clipKey = isNonEmptyString(clip?.id) ? getClipSelectionKey(trackId, clip.id) : null;
+    const displayOverride = clipKey ? clipDisplayOverrides[clipKey] : null;
+    const baseClip = displayOverride ? { ...clip, ...displayOverride } : clip;
     const draft = clipDrafts[clip.id];
     if (!draft || draft.trackId !== trackId) {
-      return clip;
+      return baseClip;
     }
     return {
-      ...clip,
+      ...baseClip,
       start: draft.start,
       length: draft.length,
     };
-  }, [clipDrafts]);
+  }, [clipDrafts, clipDisplayOverrides]);
 
   const getClipEntriesForTools = useCallback(() => {
     const entries = [];
@@ -5496,6 +5818,7 @@ export default function StuuShell() {
     event.preventDefault();
     event.stopPropagation();
     setOpenTrackMenuId(null);
+    setClipQuickToolMenu(null);
     setOpenTrackPluginPicker(null);
 
     const estimatedWidth = 168;
@@ -5905,6 +6228,18 @@ export default function StuuShell() {
     });
   }
 
+  function openTrackChainModalSlotPluginPicker(trackId, slotIndex) {
+    const resolvedTrackId = Number(trackId);
+    const resolvedSlotIndex = Number(slotIndex);
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !Number.isInteger(resolvedSlotIndex) || resolvedSlotIndex < 0) {
+      return;
+    }
+
+    setTrackChainModalTrackId(resolvedTrackId);
+    restoreFloatingWindow('trackChain');
+    openTrackSlotPluginPicker(resolvedTrackId, resolvedSlotIndex, 'modal');
+  }
+
   function openTrackSlotPluginPicker(trackId, slotIndex, scope = 'track') {
     const resolvedTrackId = Number(trackId);
     const resolvedSlotIndex = Number(slotIndex);
@@ -6151,6 +6486,19 @@ export default function StuuShell() {
               if (result?.nativeImportError) {
                 appendSystemMessage(`Clip angelegt, aber Audio-Engine-Import fehlgeschlagen: ${result.nativeImportError}. Playback moeglicherweise ohne Ton.`);
               }
+              const importedClipId = isNonEmptyString(result?.clipId) ? result.clipId.trim() : '';
+              if (imported.type === 'audio' && importedClipId) {
+                requestClipBpmKeyAnalysis({
+                  trackId: resolvedTrackId,
+                  clipId: importedClipId,
+                  clipType: 'audio',
+                  clipLabel: imported.sourceName || importedClipId,
+                  showResultModal: supported.length === 1,
+                  announceStart: false,
+                  announceDone: false,
+                  autoRenameBaseName: imported.sourceName || importedClipId,
+                });
+              }
             },
           );
           nextStart = snapToGrid(nextStart + lengthBars, snapStep);
@@ -6280,6 +6628,7 @@ export default function StuuShell() {
     cancelTrackNameEditRef.current = false;
     setOpenTrackMenuId(null);
     setTrackContextMenu(null);
+    setClipQuickToolMenu(null);
     setOpenTrackPluginPicker(null);
     setEditingTrackId(track.track_id);
     setEditingTrackName(formatTrackName(track.name, track.track_id));
@@ -6301,11 +6650,13 @@ export default function StuuShell() {
       openTrackImportPicker(trackId);
       setOpenTrackMenuId(null);
       setTrackContextMenu(null);
+      setClipQuickToolMenu(null);
       setOpenTrackPluginPicker(null);
       return;
     }
     setOpenTrackMenuId(null);
     setTrackContextMenu(null);
+    setClipQuickToolMenu(null);
     setOpenTrackPluginPicker(null);
     if (actionId === 'pattern') {
       if (trackId === 1) {
@@ -6342,6 +6693,166 @@ export default function StuuShell() {
     if (actionId === 'delete') {
       deleteTrack(track.track_id);
     }
+  }
+
+  function openClipQuickToolMenu(event, {
+    trackId,
+    clipId,
+    clipType,
+    clipLabel,
+    clipName,
+    clipColor,
+  }) {
+    const resolvedTrackId = Number(trackId);
+    const resolvedClipId = isNonEmptyString(clipId)
+      ? clipId.trim()
+      : (clipId !== undefined && clipId !== null ? String(clipId) : '');
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !resolvedClipId) {
+      return;
+    }
+
+    event.stopPropagation();
+    setClipRenameColorPrompt(null);
+    const rect = event.currentTarget.getBoundingClientRect();
+    const estimatedWidth = 210;
+    const estimatedHeight = 164;
+    let nextX = rect.left;
+    let nextY = rect.bottom + 6;
+    if (typeof window !== 'undefined') {
+      nextX = Math.min(nextX, window.innerWidth - estimatedWidth - 8);
+      nextY = Math.min(nextY, window.innerHeight - estimatedHeight - 8);
+    }
+
+    setClipQuickToolMenu((previous) => {
+      if (previous && previous.trackId === resolvedTrackId && previous.clipId === resolvedClipId) {
+        return null;
+      }
+      return {
+        trackId: resolvedTrackId,
+        clipId: resolvedClipId,
+        clipType: typeof clipType === 'string' ? clipType : 'unknown',
+        clipLabel: typeof clipLabel === 'string' ? clipLabel : '',
+        clipName: typeof clipName === 'string' ? clipName : '',
+        clipColor: normalizeClipCustomColor(clipColor) || '',
+        x: Math.max(8, nextX),
+        y: Math.max(8, nextY),
+      };
+    });
+  }
+
+  function handleClipQuickToolAction(menu, actionId) {
+    setClipQuickToolMenu(null);
+    const resolvedTrackId = Number(menu?.trackId);
+    const resolvedClipId = isNonEmptyString(menu?.clipId) ? menu.clipId.trim() : '';
+    if (!menu || !Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !resolvedClipId) {
+      return;
+    }
+
+    const clipDescriptor = menu.clipLabel
+      ? `"${menu.clipLabel}" (Track ${menu.trackId})`
+      : `Clip ${menu.clipId} auf Track ${menu.trackId}`;
+
+    if (actionId === 'extract_stems') {
+      if (menu.clipType !== 'audio') {
+        appendSystemMessage(`Extract Stems ist aktuell nur fuer Audio-Clips gedacht (${clipDescriptor}).`);
+        return;
+      }
+      appendSystemMessage(`Extract Stems fuer ${clipDescriptor} ist noch nicht implementiert.`);
+      return;
+    }
+
+    if (actionId === 'fit_to_tempo') {
+      appendSystemMessage(`Fit to Tempo fuer ${clipDescriptor} ist noch nicht implementiert.`);
+      return;
+    }
+
+    if (actionId === 'rename_and_color') {
+      const estimatedWidth = 256;
+      const estimatedHeight = 212;
+      let nextX = Number(menu.x) || 8;
+      let nextY = (Number(menu.y) || 8) + 8;
+      if (typeof window !== 'undefined') {
+        nextX = Math.min(nextX, window.innerWidth - estimatedWidth - 8);
+        nextY = Math.min(nextY, window.innerHeight - estimatedHeight - 8);
+      }
+      setClipRenameColorPrompt({
+        trackId: resolvedTrackId,
+        clipId: resolvedClipId,
+        clipType: typeof menu.clipType === 'string' ? menu.clipType : 'unknown',
+        clipLabel: typeof menu.clipLabel === 'string' ? menu.clipLabel : '',
+        nameValue: typeof menu.clipName === 'string' ? menu.clipName : '',
+        colorValue: normalizeClipCustomColor(menu.clipColor) || '',
+        x: Math.max(8, nextX),
+        y: Math.max(8, nextY),
+      });
+      return;
+    }
+
+    if (actionId === 'analyze_bpm_key') {
+      requestClipBpmKeyAnalysis({
+        trackId: resolvedTrackId,
+        clipId: resolvedClipId,
+        clipType: menu.clipType,
+        clipLabel: menu.clipLabel || '',
+        showResultModal: true,
+        announceStart: true,
+        announceDone: true,
+      });
+    }
+  }
+
+  function updateClipRenameColorPrompt(patch) {
+    setClipRenameColorPrompt((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        ...current,
+        ...(patch && typeof patch === 'object' ? patch : {}),
+      };
+    });
+  }
+
+  function closeClipRenameColorPrompt() {
+    setClipRenameColorPrompt(null);
+  }
+
+  function submitClipRenameColorPrompt() {
+    if (!clipRenameColorPrompt) {
+      return;
+    }
+    const trackId = Number(clipRenameColorPrompt.trackId);
+    const clipId = isNonEmptyString(clipRenameColorPrompt.clipId)
+      ? clipRenameColorPrompt.clipId.trim()
+      : '';
+    if (!Number.isInteger(trackId) || trackId <= 0 || !clipId) {
+      setClipRenameColorPrompt(null);
+      return;
+    }
+
+    const nextName = isNonEmptyString(clipRenameColorPrompt.nameValue)
+      ? clipRenameColorPrompt.nameValue.trim()
+      : '';
+    const nextColor = normalizeClipCustomColor(clipRenameColorPrompt.colorValue) || '';
+    const clipKey = getClipSelectionKey(trackId, clipId);
+
+    setClipDisplayOverrides((previous) => ({
+      ...previous,
+      [clipKey]: {
+        name: nextName || undefined,
+        color: nextColor || undefined,
+      },
+    }));
+    setClipRenameColorPrompt(null);
+
+    emitMutation('clip:set-properties', {
+      trackId,
+      clipId,
+      name: nextName,
+      color: nextColor,
+    }, () => {
+      appendSystemMessage(`Rename and Color fuer Clip "${clipId}" auf Track ${trackId} aktualisiert.`);
+    });
   }
 
   function beginClipInteraction(event, mode, trackId, clip) {
@@ -6820,6 +7331,172 @@ export default function StuuShell() {
         : null}
     </span>
   );
+
+  const renderInspectorTracktionEqCurvePanel = ({ mode = 'easy', showBandButtons = true } = {}) => {
+    const curve = inspectorTracktionEqUi?.curve;
+    if (!inspectorNode || !curve) {
+      return null;
+    }
+
+    const showMasterScopeNote = inspectorEqAnalyzerAvailable
+      && String(inspectorTracktionEqAnalyzerOverlay?.scope || '').toLowerCase() === 'master';
+
+    return (
+      <div
+        className={`inspector-eq-mini-curve ${mode === 'pro' ? 'is-pro' : ''}`}
+        aria-label={mode === 'pro' ? 'EQ Verlauf und Analyzer (Pro)' : 'EQ Verlauf Vorschau'}
+      >
+        <div className="inspector-eq-mini-curve-head">
+          <span>{`EQ Verlauf + Analyzer (${inspectorTracktionEqAnalyzerStatusText})`}</span>
+          <div className="inspector-eq-mini-curve-head-actions">
+            <span className={inspectorTracktionEqCurveReadout ? 'is-active' : ''}>
+              {inspectorTracktionEqCurveReadout
+                ? `${inspectorEqPinnedReadout ? 'PIN · ' : ''}${inspectorTracktionEqCurveReadout.label ? `${inspectorTracktionEqCurveReadout.label}: ` : ''}${formatTracktionEqInspectorReadoutFreq(inspectorTracktionEqCurveReadout.freqHz)} · ${formatTracktionEqInspectorReadoutDb(inspectorTracktionEqCurveReadout.gainDb)}`
+                : 'ca. ±18 dB'}
+            </span>
+            <button
+              type="button"
+              className={`inspector-eq-mini-curve-pin ${inspectorEqAnalyzerFrozen ? 'active' : ''}`}
+              onClick={toggleInspectorEqAnalyzerFreeze}
+              aria-pressed={inspectorEqAnalyzerFrozen}
+              title={inspectorEqAnalyzerFrozen ? 'Analyzer weiterlaufen lassen' : 'Analyzer einfrieren'}
+            >
+              {inspectorEqAnalyzerFrozen ? 'Frozen' : 'Freeze'}
+            </button>
+            <button
+              type="button"
+              className={`inspector-eq-mini-curve-pin ${inspectorEqPinnedReadout ? 'active' : ''}`}
+              onClick={toggleInspectorTracktionEqReadoutPin}
+              aria-pressed={Boolean(inspectorEqPinnedReadout)}
+              disabled={!inspectorTracktionEqCurveReadout && !inspectorEqPinnedReadout}
+              title={inspectorEqPinnedReadout ? 'Readout loesen' : 'Aktuelles Readout pinnen'}
+            >
+              {inspectorEqPinnedReadout ? 'Unpin' : 'Pin'}
+            </button>
+          </div>
+        </div>
+        <svg
+          className="inspector-eq-mini-curve-svg"
+          viewBox={`0 0 ${curve.width} ${curve.height}`}
+          preserveAspectRatio="none"
+          role="img"
+          aria-hidden="true"
+          onPointerMove={handleInspectorTracktionEqCurvePointerMove}
+          onPointerLeave={clearInspectorTracktionEqCurveHover}
+        >
+          {curve.dbLines.map((line) => (
+            <line
+              key={`${inspectorNode.id}_${mode}_db_${line.db}`}
+              x1="0"
+              x2={curve.width}
+              y1={line.y}
+              y2={line.y}
+              className={line.db === 0 ? 'eq-zero' : 'eq-grid'}
+            />
+          ))}
+
+          {curve.ticks.map((tick) => (
+            <line
+              key={`${inspectorNode.id}_${mode}_tick_${tick.freqHz}`}
+              x1={tick.x}
+              x2={tick.x}
+              y1="0"
+              y2={curve.height}
+              className="eq-grid"
+            />
+          ))}
+
+          <path d={curve.fillPath} className="eq-fill" />
+
+          {inspectorTracktionEqAnalyzerOverlay?.pre ? (
+            <path
+              d={inspectorTracktionEqAnalyzerOverlay.pre.fillPath}
+              className={`eq-analyzer-fill-pre ${inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'is-mirrored' : ''}`}
+            />
+          ) : null}
+          {inspectorTracktionEqAnalyzerOverlay?.post ? (
+            <path
+              d={inspectorTracktionEqAnalyzerOverlay.post.fillPath}
+              className="eq-analyzer-fill-post"
+            />
+          ) : null}
+          {inspectorTracktionEqAnalyzerOverlay?.pre ? (
+            <path
+              d={inspectorTracktionEqAnalyzerOverlay.pre.linePath}
+              className={`eq-analyzer-line-pre ${inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'is-mirrored' : ''}`}
+            />
+          ) : null}
+          {inspectorTracktionEqAnalyzerOverlay?.post ? (
+            <path
+              d={inspectorTracktionEqAnalyzerOverlay.post.linePath}
+              className="eq-analyzer-line-post"
+            />
+          ) : null}
+
+          <path d={curve.strokePath} className="eq-line" />
+
+          {curve.nodePoints.map((point) => (
+            <g
+              key={`${inspectorNode.id}_${mode}_node_${point.id}`}
+              className={`eq-node ${inspectorTracktionEqMiniCurveHighlightBandId === point.id ? 'is-selected' : ''}`}
+              onClick={() => selectInspectorTracktionEqBand(point.id)}
+            >
+              <circle
+                cx={point.x}
+                cy={point.y}
+                r={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '6.3' : '4.5'}
+                fill={point.color}
+                fillOpacity={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '0.26' : '0.18'}
+              />
+              <circle
+                cx={point.x}
+                cy={point.y}
+                r={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '3.2' : '2.6'}
+                fill={point.color}
+                stroke="rgba(255,255,255,0.82)"
+                strokeWidth={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '1.1' : '0.8'}
+              />
+            </g>
+          ))}
+        </svg>
+        {!inspectorEqAnalyzerAvailable ? (
+          <p className="inspector-eq-analyzer-note">Analyzer nur mit laufender Native-Engine verfügbar.</p>
+        ) : null}
+        {showMasterScopeNote ? (
+          <p className="inspector-eq-analyzer-note is-master">Live-Analyzer zeigt aktuell Master-Out (noch nicht nur diesen EQ/Track).</p>
+        ) : null}
+
+        <div className="inspector-eq-mini-curve-ticks" aria-hidden="true">
+          {curve.ticks.filter((tick) => (
+            tick.freqHz === 50
+            || tick.freqHz === 200
+            || tick.freqHz === 1000
+            || tick.freqHz === 5000
+            || tick.freqHz === 10000
+          )).map((tick) => (
+            <span key={`${inspectorNode.id}_${mode}_tick_label_${tick.freqHz}`}>{tick.label}</span>
+          ))}
+        </div>
+
+        {showBandButtons ? (
+          <div className="inspector-eq-mini-band-buttons" role="group" aria-label="EQ Baender">
+            {curve.nodePoints.map((point) => (
+              <button
+                key={`${inspectorNode.id}_${mode}_band_btn_${point.id}`}
+                type="button"
+                className={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? 'active' : ''}
+                onClick={() => selectInspectorTracktionEqBand(point.id)}
+                title={`${point.label}: ${formatTracktionEqInspectorReadoutFreq(point.freqHz)} · ${formatTracktionEqInspectorReadoutDb(point.gainDb)}`}
+              >
+                <span className="dot" style={{ backgroundColor: point.color }} aria-hidden="true" />
+                <span>{point.label}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
 
   return (
     <>
@@ -7308,6 +7985,7 @@ export default function StuuShell() {
                               onClick={() => {
                                 setOpenTrackMenuId(null);
                                 setTrackContextMenu(null);
+                                setClipQuickToolMenu(null);
                                 setOpenTrackPluginPicker(null);
                                 if (multiSelectMode) {
                                   toggleTrackSelection(track.track_id);
@@ -7420,6 +8098,7 @@ export default function StuuShell() {
                                     onClick={(event) => {
                                       event.stopPropagation();
                                       setTrackContextMenu(null);
+                                      setClipQuickToolMenu(null);
                                       setOpenTrackPluginPicker(null);
                                       const nextOpen = openTrackMenuId === track.track_id ? null : track.track_id;
                                       if (nextOpen === track.track_id) {
@@ -7585,6 +8264,15 @@ export default function StuuShell() {
                                         <div
                                           key={`track_chain_${track.track_id}_${slotIndex}`}
                                           className="arrangement-track-chain-flow-segment"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            if (!hasNode) {
+                                              openTrackChainModalSlotPluginPicker(track.track_id, slotIndex);
+                                              return;
+                                            }
+                                            setInspector({ type: 'node', nodeId: node.id });
+                                            openVstNodeEditor(node);
+                                          }}
                                         >
                                           <div
                                             className={`arrangement-track-chain-slot ${hasNode ? 'filled' : 'empty'} ${isBypassed ? 'bypassed' : ''}`}
@@ -7620,7 +8308,7 @@ export default function StuuShell() {
                                               onClick={(event) => {
                                                 event.stopPropagation();
                                                 if (!hasNode) {
-                                                  openTrackSlotPluginPicker(track.track_id, slotIndex, 'track');
+                                                  openTrackChainModalSlotPluginPicker(track.track_id, slotIndex);
                                                   return;
                                                 }
                                                 setInspector({ type: 'node', nodeId: node.id });
@@ -7806,6 +8494,224 @@ export default function StuuShell() {
                           ))}
                         </div>
                       ) : null}
+                      {clipQuickToolMenu ? (
+                        <div
+                          className="clip-quick-tools-menu"
+                          role="menu"
+                          aria-label={`Clip Tools Menue fuer Track ${clipQuickToolMenu.trackId}`}
+                          data-clip-quick-tool-menu-root="true"
+                          style={{
+                            left: `${clipQuickToolMenu.x}px`,
+                            top: `${clipQuickToolMenu.y}px`,
+                          }}
+                        >
+                          {CLIP_QUICK_TOOL_MENU_ITEMS.map((item) => (
+                            (() => {
+                              const ItemIcon = item.icon;
+                              return (
+                                <button
+                                  key={`clip_quick_menu_${clipQuickToolMenu.trackId}_${clipQuickToolMenu.clipId}_${item.id}`}
+                                  type="button"
+                                  role="menuitem"
+                                  className="clip-quick-tools-menu-item"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    handleClipQuickToolAction(clipQuickToolMenu, item.id);
+                                  }}
+                                >
+                                  <span className="clip-quick-tools-menu-item-icon" aria-hidden="true">
+                                    <ItemIcon size={15} strokeWidth={2} />
+                                  </span>
+                                  <span className="clip-quick-tools-menu-item-label">{item.label}</span>
+                                </button>
+                              );
+                            })()
+                          ))}
+                        </div>
+                      ) : null}
+                      {clipRenameColorPrompt ? (
+                        <div
+                          className="clip-rename-color-popover"
+                          role="dialog"
+                          aria-modal="false"
+                          aria-label={`Rename and Color fuer Clip ${clipRenameColorPrompt.clipId}`}
+                          data-clip-rename-color-root="true"
+                          style={{
+                            left: `${clipRenameColorPrompt.x}px`,
+                            top: `${clipRenameColorPrompt.y}px`,
+                          }}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <div className="clip-rename-color-popover-head">
+                            <div className="clip-rename-color-popover-title">
+                              <Pencil size={12} strokeWidth={2} aria-hidden="true" />
+                              <span>Rename and Color</span>
+                            </div>
+                            <button
+                              type="button"
+                              className="clip-rename-color-popover-close"
+                              onClick={closeClipRenameColorPrompt}
+                              aria-label="Schliessen"
+                              title="Schliessen"
+                            >
+                              <X size={12} strokeWidth={2} aria-hidden="true" />
+                            </button>
+                          </div>
+                          <form
+                            className="clip-rename-color-popover-body"
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              submitClipRenameColorPrompt();
+                            }}
+                          >
+                            <label className="clip-rename-color-field">
+                              <span>Name</span>
+                              <input
+                                ref={clipRenameColorNameInputRef}
+                                type="text"
+                                value={clipRenameColorPrompt.nameValue}
+                                maxLength={255}
+                                placeholder={clipRenameColorPrompt.clipLabel || 'Clip name'}
+                                onChange={(event) => {
+                                  updateClipRenameColorPrompt({ nameValue: event.target.value });
+                                }}
+                              />
+                            </label>
+                            <div className="clip-rename-color-field">
+                              <span>
+                                <PaintBucket size={11} strokeWidth={2} aria-hidden="true" />
+                                Farbe
+                              </span>
+                              <div className="clip-rename-color-swatches">
+                                {CLIP_RENAME_COLOR_SWATCHES.map((swatch) => {
+                                  const isActive = (clipRenameColorPrompt.colorValue || '') === (swatch.color || '');
+                                  return (
+                                    <button
+                                      key={`clip_rename_color_${swatch.id}`}
+                                      type="button"
+                                      className={`clip-rename-color-swatch ${isActive ? 'active' : ''} ${swatch.color ? '' : 'is-default'}`}
+                                      onClick={() => {
+                                        updateClipRenameColorPrompt({ colorValue: swatch.color || '' });
+                                      }}
+                                      aria-label={swatch.label}
+                                      title={swatch.label}
+                                      style={swatch.color ? { '--swatch-color': swatch.color } : undefined}
+                                    >
+                                      {!swatch.color ? <span>Auto</span> : null}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            <label className="clip-rename-color-field">
+                              <span>Hex</span>
+                              <input
+                                type="text"
+                                value={clipRenameColorPrompt.colorValue || ''}
+                                maxLength={7}
+                                placeholder="#60a5fa"
+                                onChange={(event) => {
+                                  updateClipRenameColorPrompt({ colorValue: event.target.value });
+                                }}
+                              />
+                            </label>
+                            <div className="clip-rename-color-actions">
+                              <button
+                                type="button"
+                                className="clip-rename-color-btn"
+                                onClick={closeClipRenameColorPrompt}
+                              >
+                                Abbrechen
+                              </button>
+                              <button
+                                type="submit"
+                                className="clip-rename-color-btn primary"
+                              >
+                                Ok
+                              </button>
+                            </div>
+                          </form>
+                        </div>
+                      ) : null}
+                      {clipAnalyzeResultModal ? (
+                        <div
+                          className="clip-analyze-result-modal-overlay"
+                          role="presentation"
+                          onPointerDown={() => {
+                            setClipAnalyzeResultModal(null);
+                          }}
+                        >
+                          <div
+                            className="clip-analyze-result-modal"
+                            role="dialog"
+                            aria-modal="true"
+                            aria-label={`Analyse-Ergebnis fuer Clip ${clipAnalyzeResultModal.clipId}`}
+                            data-clip-analyze-result-root="true"
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            <div className="clip-analyze-result-modal-head">
+                              <div className="clip-analyze-result-modal-title">
+                                <Gauge size={14} strokeWidth={2} aria-hidden="true" />
+                                <span>Analyze BPM & Key</span>
+                              </div>
+                              <button
+                                type="button"
+                                className="clip-analyze-result-modal-close"
+                                onClick={() => setClipAnalyzeResultModal(null)}
+                                aria-label="Schliessen"
+                                title="Schliessen"
+                              >
+                                <X size={14} strokeWidth={2} aria-hidden="true" />
+                              </button>
+                            </div>
+                            <div className="clip-analyze-result-modal-body">
+                              <div className="clip-analyze-result-modal-clip">
+                                {clipAnalyzeResultModal.clipLabel || `Clip ${clipAnalyzeResultModal.clipId}`}
+                                <small>{`Track ${clipAnalyzeResultModal.trackId}`}</small>
+                              </div>
+                              <div className="clip-analyze-result-grid">
+                                <div className="clip-analyze-result-cell">
+                                  <span className="label">BPM</span>
+                                  <strong>{clipAnalyzeResultModal.bpm != null ? clipAnalyzeResultModal.bpm.toFixed(1) : '—'}</strong>
+                                  <small>{clipAnalyzeResultModal.methodBpm || 'unknown'}</small>
+                                </div>
+                                <div className="clip-analyze-result-cell">
+                                  <span className="label">Key</span>
+                                  <strong>{clipAnalyzeResultModal.key || '—'}</strong>
+                                  <small>{clipAnalyzeResultModal.methodKey || 'unknown'}</small>
+                                </div>
+                              </div>
+                              <div className="clip-analyze-result-modal-actions">
+                                <button
+                                  type="button"
+                                  className="clip-analyze-result-btn"
+                                  onClick={() => setClipAnalyzeResultModal(null)}
+                                >
+                                  Schliessen
+                                </button>
+                                <button
+                                  type="button"
+                                  className="clip-analyze-result-btn primary"
+                                  disabled={clipAnalyzeResultModal.bpm == null}
+                                  onClick={() => {
+                                    if (clipAnalyzeResultModal.bpm == null) {
+                                      return;
+                                    }
+                                    applyProjectBpm(clipAnalyzeResultModal.bpm, {
+                                      sourceLabel: `Clip-Analyse (${clipAnalyzeResultModal.clipLabel || clipAnalyzeResultModal.clipId})`,
+                                    });
+                                    setClipAnalyzeResultModal(null);
+                                  }}
+                                >
+                                  BPM uebernehmen
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
                     </section>
 
                     <section className="arrangement-canvas">
@@ -7922,6 +8828,15 @@ export default function StuuShell() {
                                   const slipPreviewPx = Number((slipPreviewBars * barWidth).toFixed(3));
                                   const showSlipBadge = Math.abs(slipPreviewBars) >= 0.02;
                                   const slipLabel = `${slipPreviewBars >= 0 ? '+' : ''}${slipPreviewBars.toFixed(2)}`;
+                                  const clipCustomColor = normalizeClipCustomColor(renderedClip?.color);
+                                  const clipAccentRgb = hexToRgbChannels(clipCustomColor);
+                                  const clipAnalyzedBpmValue = Number(renderedClip?.bpm);
+                                  const clipAnalyzedBpm = Number.isFinite(clipAnalyzedBpmValue) && clipAnalyzedBpmValue > 0
+                                    ? Number(clipAnalyzedBpmValue.toFixed(1))
+                                    : null;
+                                  const clipAnalyzedKey = isNonEmptyString(renderedClip?.key)
+                                    ? renderedClip.key.trim()
+                                    : '';
                                   const rawPeaks = clipType === 'audio' ? getClipWaveformPeaks(renderedClip) : [];
                                   const waveformPeaks = clipType === 'audio'
                                     ? getAdaptiveWaveformPeaks(rawPeaks.length > 0 ? rawPeaks : PLACEHOLDER_WAVEFORM_PEAKS, clipWidth)
@@ -7932,11 +8847,13 @@ export default function StuuShell() {
                                   return (
                                     <div
                                       key={clip.id}
-                                      className={`timeline-clip ${clipType ? `clip-type-${clipType}` : ''} ${audioMissingFile ? 'clip-missing-file' : ''} ${isClipSelected ? 'clip-selected' : ''} ${isClipMuted ? 'clip-muted' : ''}`}
+                                      className={`timeline-clip ${clipType ? `clip-type-${clipType}` : ''} ${audioMissingFile ? 'clip-missing-file' : ''} ${isClipSelected ? 'clip-selected' : ''} ${isClipMuted ? 'clip-muted' : ''} ${clipAccentRgb ? 'has-custom-color' : ''}`}
                                       style={{
                                         left: `${clipLeft}px`,
                                         width: `${clipWidth}px`,
                                         '--clip-slip-shift-px': `${slipPreviewPx}px`,
+                                        ...(clipCustomColor ? { '--clip-accent': clipCustomColor } : {}),
+                                        ...(clipAccentRgb ? { '--clip-accent-rgb': clipAccentRgb } : {}),
                                       }}
                                       title={audioMissingFile ? 'Datei fehlt – Abspielen nicht möglich. Bitte erneut importieren.' : undefined}
                                       onClick={() => {
@@ -7956,6 +8873,52 @@ export default function StuuShell() {
                                       }}
                                       onPointerDown={(event) => handleClipPointerDown(event, track.track_id, renderedClip)}
                                     >
+                                      <div
+                                        className="clip-corner-tools"
+                                        data-clip-quick-tool-menu-root="true"
+                                        onPointerDown={(event) => event.stopPropagation()}
+                                        onClick={(event) => event.stopPropagation()}
+                                      >
+                                        <button
+                                          type="button"
+                                          className="clip-corner-button danger"
+                                          onPointerDown={(event) => event.stopPropagation()}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            setClipQuickToolMenu(null);
+                                            emitMutation('clip:delete', { trackId: track.track_id, clipId: clip.id });
+                                          }}
+                                          aria-label="Clip entfernen"
+                                          title="Clip entfernen"
+                                        >
+                                          <Trash2 size={10} strokeWidth={2} aria-hidden="true" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`clip-corner-button ${clipQuickToolMenu && clipQuickToolMenu.trackId === track.track_id && String(clipQuickToolMenu.clipId) === String(clip.id) ? 'active' : ''}`}
+                                          onPointerDown={(event) => event.stopPropagation()}
+                                          onClick={(event) => {
+                                            openClipQuickToolMenu(event, {
+                                              trackId: track.track_id,
+                                              clipId: clip.id,
+                                              clipType,
+                                              clipLabel,
+                                              clipName: typeof renderedClip?.name === 'string' ? renderedClip.name : '',
+                                              clipColor: clipCustomColor || '',
+                                            });
+                                          }}
+                                          aria-label="Clip Tools"
+                                          title="Clip Tools"
+                                          aria-haspopup="menu"
+                                          aria-expanded={Boolean(
+                                            clipQuickToolMenu
+                                            && clipQuickToolMenu.trackId === track.track_id
+                                            && String(clipQuickToolMenu.clipId) === String(clip.id)
+                                          )}
+                                        >
+                                          <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />
+                                        </button>
+                                      </div>
                                       {clipType === 'audio' ? (
                                         <>
                                           <div className="timeline-clip-label-bar">
@@ -7965,21 +8928,19 @@ export default function StuuShell() {
                                                 {slipLabel}
                                               </span>
                                             ) : null}
+                                            {clipAnalyzedBpm != null ? (
+                                              <span className="timeline-clip-analysis-badge bpm" title={`Detected Tempo: ${clipAnalyzedBpm.toFixed(1)} BPM`}>
+                                                {clipAnalyzedBpm.toFixed(1)} BPM
+                                              </span>
+                                            ) : null}
+                                            {clipAnalyzedKey ? (
+                                              <span className="timeline-clip-analysis-badge key" title={`Detected Key: ${clipAnalyzedKey}`}>
+                                                {clipAnalyzedKey}
+                                              </span>
+                                            ) : null}
                                             {audioMissingFile ? (
                                               <span className="timeline-clip-missing-badge" title="Datei fehlt – kein Abspielen">!</span>
                                             ) : null}
-                                            <button
-                                              className="clip-delete"
-                                              onPointerDown={(event) => event.stopPropagation()}
-                                              onClick={(event) => {
-                                                event.stopPropagation();
-                                                emitMutation('clip:delete', { trackId: track.track_id, clipId: clip.id });
-                                              }}
-                                              aria-label="Clip entfernen"
-                                              title="Clip entfernen"
-                                            >
-                                              <Trash2 size={11} strokeWidth={2} aria-hidden="true" />
-                                            </button>
                                           </div>
                                           <div className="timeline-clip-waveform-wrap">
                                             <div
@@ -8012,18 +8973,6 @@ export default function StuuShell() {
                                               {slipLabel}
                                             </span>
                                           ) : null}
-                                          <button
-                                            className="clip-delete"
-                                            onPointerDown={(event) => event.stopPropagation()}
-                                            onClick={(event) => {
-                                              event.stopPropagation();
-                                              emitMutation('clip:delete', { trackId: track.track_id, clipId: clip.id });
-                                            }}
-                                            aria-label="Clip entfernen"
-                                            title="Clip entfernen"
-                                          >
-                                            <Trash2 size={11} strokeWidth={2} aria-hidden="true" />
-                                          </button>
                                           <div
                                             className="clip-resize-handle"
                                             onPointerDown={(event) => {
@@ -8120,6 +9069,7 @@ export default function StuuShell() {
                                 ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
                                 : null;
                               const SlotPluginIcon = pluginUiMeta?.icon || null;
+                              const hasPreviewThumb = Boolean(hasNode && pluginUiMeta?.previewSrc);
                               const slotTooltip = hasNode
                                 ? buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)
                                 : `Slot ${slotIndex + 1}: Plugin hinzufuegen`;
@@ -8156,6 +9106,7 @@ export default function StuuShell() {
                                         className="track-chain-modal-slot-main"
                                         draggable={hasNode}
                                         title={slotTooltip}
+                                        aria-label={hasNode ? `${pluginDisplayName} Plugin oeffnen` : `Slot ${slotIndex + 1} Effekt hinzufuegen`}
                                         onDragStart={(event) => {
                                           if (!hasNode) {
                                             return;
@@ -8172,14 +9123,41 @@ export default function StuuShell() {
                                           openVstNodeEditor(node);
                                         }}
                                       >
-                                        <span className="track-chain-modal-slot-label">
-                                          {hasNode ? (
-                                            <span className="plugin-name-with-icon truncate">
-                                              {SlotPluginIcon ? <SlotPluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
-                                              <span>{formatTrackChainPluginName(pluginDisplayName)}</span>
+                                        {hasPreviewThumb ? (
+                                          <span className="track-chain-modal-slot-preview" aria-hidden="true">
+                                            <span className="track-chain-modal-slot-preview-frame">
+                                              <img
+                                                src={pluginUiMeta.previewSrc}
+                                                alt=""
+                                                width={pluginUiMeta.previewWidth || TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.width}
+                                                height={pluginUiMeta.previewHeight || TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.height}
+                                                className="track-chain-modal-slot-preview-image"
+                                                loading="lazy"
+                                                decoding="async"
+                                                data-fallback-src={pluginUiMeta.fallbackPreviewSrc || ''}
+                                                onError={(event) => {
+                                                  const imgEl = event.currentTarget;
+                                                  const fallbackSrc = imgEl.dataset.fallbackSrc || '';
+                                                  if (fallbackSrc && imgEl.dataset.fallbackApplied !== '1') {
+                                                    imgEl.dataset.fallbackApplied = '1';
+                                                    imgEl.src = fallbackSrc;
+                                                    return;
+                                                  }
+                                                  imgEl.onerror = null;
+                                                }}
+                                              />
                                             </span>
-                                          ) : 'add Effect'}
-                                        </span>
+                                          </span>
+                                        ) : (
+                                          <span className="track-chain-modal-slot-label">
+                                            {hasNode ? (
+                                              <span className="plugin-name-with-icon truncate">
+                                                {SlotPluginIcon ? <SlotPluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
+                                                <span>{formatTrackChainPluginName(pluginDisplayName)}</span>
+                                              </span>
+                                            ) : 'add Effect'}
+                                          </span>
+                                        )}
                                       </button>
                                       {hasNode ? (
                                         <div className="track-chain-modal-slot-tools">
@@ -9476,152 +10454,7 @@ export default function StuuShell() {
                           Schnellstart fuer den Tracktion EQ: Preset klicken, dann mit 3 Reglern nach Gehoer anpassen.
                         </p>
 
-                        {inspectorTracktionEqUi.curve ? (
-                          <div className="inspector-eq-mini-curve" aria-label="EQ Verlauf Vorschau">
-                            <div className="inspector-eq-mini-curve-head">
-                              <span>{`EQ Verlauf + Analyzer (${inspectorTracktionEqAnalyzerStatusText})`}</span>
-                              <div className="inspector-eq-mini-curve-head-actions">
-                                <span className={inspectorTracktionEqCurveReadout ? 'is-active' : ''}>
-                                  {inspectorTracktionEqCurveReadout
-                                    ? `${inspectorEqPinnedReadout ? 'PIN · ' : ''}${inspectorTracktionEqCurveReadout.label ? `${inspectorTracktionEqCurveReadout.label}: ` : ''}${formatTracktionEqInspectorReadoutFreq(inspectorTracktionEqCurveReadout.freqHz)} · ${formatTracktionEqInspectorReadoutDb(inspectorTracktionEqCurveReadout.gainDb)}`
-                                    : 'ca. ±18 dB'}
-                                </span>
-                                <button
-                                  type="button"
-                                  className={`inspector-eq-mini-curve-pin ${inspectorEqAnalyzerFrozen ? 'active' : ''}`}
-                                  onClick={toggleInspectorEqAnalyzerFreeze}
-                                  aria-pressed={inspectorEqAnalyzerFrozen}
-                                  title={inspectorEqAnalyzerFrozen ? 'Analyzer weiterlaufen lassen' : 'Analyzer einfrieren'}
-                                >
-                                  {inspectorEqAnalyzerFrozen ? 'Frozen' : 'Freeze'}
-                                </button>
-                                <button
-                                  type="button"
-                                  className={`inspector-eq-mini-curve-pin ${inspectorEqPinnedReadout ? 'active' : ''}`}
-                                  onClick={toggleInspectorTracktionEqReadoutPin}
-                                  aria-pressed={Boolean(inspectorEqPinnedReadout)}
-                                  disabled={!inspectorTracktionEqCurveReadout && !inspectorEqPinnedReadout}
-                                  title={inspectorEqPinnedReadout ? 'Readout loesen' : 'Aktuelles Readout pinnen'}
-                                >
-                                  {inspectorEqPinnedReadout ? 'Unpin' : 'Pin'}
-                                </button>
-                              </div>
-                            </div>
-                            <svg
-                              className="inspector-eq-mini-curve-svg"
-                              viewBox={`0 0 ${inspectorTracktionEqUi.curve.width} ${inspectorTracktionEqUi.curve.height}`}
-                              preserveAspectRatio="none"
-                              role="img"
-                              aria-hidden="true"
-                              onPointerMove={handleInspectorTracktionEqCurvePointerMove}
-                              onPointerLeave={clearInspectorTracktionEqCurveHover}
-                            >
-                              {inspectorTracktionEqUi.curve.dbLines.map((line) => (
-                                <line
-                                  key={`${inspectorNode.id}_db_${line.db}`}
-                                  x1="0"
-                                  x2={inspectorTracktionEqUi.curve.width}
-                                  y1={line.y}
-                                  y2={line.y}
-                                  className={line.db === 0 ? 'eq-zero' : 'eq-grid'}
-                                />
-                              ))}
-
-                              {inspectorTracktionEqUi.curve.ticks.map((tick) => (
-                                <line
-                                  key={`${inspectorNode.id}_tick_${tick.freqHz}`}
-                                  x1={tick.x}
-                                  x2={tick.x}
-                                  y1="0"
-                                  y2={inspectorTracktionEqUi.curve.height}
-                                  className="eq-grid"
-                                />
-                              ))}
-
-                              {inspectorTracktionEqAnalyzerOverlay?.pre ? (
-                                <path
-                                  d={inspectorTracktionEqAnalyzerOverlay.pre.fillPath}
-                                  className={`eq-analyzer-fill-pre ${inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'is-mirrored' : ''}`}
-                                />
-                              ) : null}
-                              {inspectorTracktionEqAnalyzerOverlay?.post ? (
-                                <path
-                                  d={inspectorTracktionEqAnalyzerOverlay.post.fillPath}
-                                  className="eq-analyzer-fill-post"
-                                />
-                              ) : null}
-                              {inspectorTracktionEqAnalyzerOverlay?.pre ? (
-                                <path
-                                  d={inspectorTracktionEqAnalyzerOverlay.pre.linePath}
-                                  className={`eq-analyzer-line-pre ${inspectorTracktionEqAnalyzerOverlay.preMirrorsPost ? 'is-mirrored' : ''}`}
-                                />
-                              ) : null}
-                              {inspectorTracktionEqAnalyzerOverlay?.post ? (
-                                <path
-                                  d={inspectorTracktionEqAnalyzerOverlay.post.linePath}
-                                  className="eq-analyzer-line-post"
-                                />
-                              ) : null}
-
-                              <path d={inspectorTracktionEqUi.curve.fillPath} className="eq-fill" />
-                              <path d={inspectorTracktionEqUi.curve.strokePath} className="eq-line" />
-
-                              {inspectorTracktionEqUi.curve.nodePoints.map((point) => (
-                                <g
-                                  key={`${inspectorNode.id}_node_${point.id}`}
-                                  className={`eq-node ${inspectorTracktionEqMiniCurveHighlightBandId === point.id ? 'is-selected' : ''}`}
-                                  onClick={() => selectInspectorTracktionEqBand(point.id)}
-                                >
-                                  <circle
-                                    cx={point.x}
-                                    cy={point.y}
-                                    r={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '6.3' : '4.5'}
-                                    fill={point.color}
-                                    fillOpacity={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '0.26' : '0.18'}
-                                  />
-                                  <circle
-                                    cx={point.x}
-                                    cy={point.y}
-                                    r={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '3.2' : '2.6'}
-                                    fill={point.color}
-                                    stroke="rgba(255,255,255,0.82)"
-                                    strokeWidth={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? '1.1' : '0.8'}
-                                  />
-                                </g>
-                              ))}
-                            </svg>
-                            {!inspectorEqAnalyzerAvailable ? (
-                              <p className="inspector-eq-analyzer-note">Analyzer nur mit laufender Native-Engine verfügbar.</p>
-                            ) : null}
-
-                            <div className="inspector-eq-mini-curve-ticks" aria-hidden="true">
-                              {inspectorTracktionEqUi.curve.ticks.filter((tick) => (
-                                tick.freqHz === 50
-                                || tick.freqHz === 200
-                                || tick.freqHz === 1000
-                                || tick.freqHz === 5000
-                                || tick.freqHz === 10000
-                              )).map((tick) => (
-                                <span key={`${inspectorNode.id}_tick_label_${tick.freqHz}`}>{tick.label}</span>
-                              ))}
-                            </div>
-
-                            <div className="inspector-eq-mini-band-buttons" role="group" aria-label="EQ Baender">
-                              {inspectorTracktionEqUi.curve.nodePoints.map((point) => (
-                                <button
-                                  key={`${inspectorNode.id}_band_btn_${point.id}`}
-                                  type="button"
-                                  className={inspectorTracktionEqMiniCurveHighlightBandId === point.id ? 'active' : ''}
-                                  onClick={() => selectInspectorTracktionEqBand(point.id)}
-                                  title={`${point.label}: ${formatTracktionEqInspectorReadoutFreq(point.freqHz)} · ${formatTracktionEqInspectorReadoutDb(point.gainDb)}`}
-                                >
-                                  <span className="dot" style={{ backgroundColor: point.color }} aria-hidden="true" />
-                                  <span>{point.label}</span>
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
+                        {renderInspectorTracktionEqCurvePanel({ mode: 'easy', showBandButtons: true })}
 
                         <div className="inspector-eq-preset-grid" role="group" aria-label="EQ Easy Presets">
                           <button type="button" onClick={() => applyInspectorTracktionEqPreset('clean_up')}>Clean Up</button>
@@ -9676,6 +10509,9 @@ export default function StuuShell() {
                             Easy-Mapping fuer diesen EQ wurde nicht erkannt. Pro zeigt alle Parameter.
                           </p>
                         ) : null}
+                        {inspectorEqViewMode === 'pro'
+                          ? renderInspectorTracktionEqCurvePanel({ mode: 'pro', showBandButtons: false })
+                          : null}
                         {inspectorEqViewMode === 'pro' && inspectorTracktionEqSelectedBand ? (
                           <div className="inspector-eq-pro-focus">
                             <strong>{`Band Fokus: ${inspectorTracktionEqSelectedBand.label}`}</strong>

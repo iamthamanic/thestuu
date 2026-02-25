@@ -35,6 +35,10 @@ target_compile_definitions(thestuu-native PRIVATE
   JUCE_USE_CURL=0
   JUCE_WEB_BROWSER=0
   JUCE_MODAL_LOOPS_PERMITTED=1
+  # Enable external plugin hosting (AU/VST3) for the native scan/load flow.
+  JUCE_PLUGINHOST_AU=1
+  JUCE_PLUGINHOST_VST3=1
+  JUCE_VST3_CAN_REPLACE_VST2=0
 )
 if(APPLE)
   target_compile_options(thestuu-native PRIVATE "-fno-aligned-allocation")
