@@ -9,8 +9,13 @@ import { Server } from 'socket.io';
 import decode from 'audio-decode';
 import { createDefaultProject, normalizeProject, parseProject, serializeProject, validateProject } from '@thestuu/shared-json';
 import { NativeTransportClient } from './native-transport-client.js';
+import {
+  maxPeakFromMeterRows,
+  mergeNativeMetersPayload,
+  placeholderMetersForPlaylist,
+} from './meter-payload.js';
 
-const enginePort = Number(process.env.ENGINE_PORT || 3987);
+const enginePort = Number(process.env.ENGINE_PORT || 3990);
 const engineHost = process.env.ENGINE_HOST || '127.0.0.1';
 const stuuHome = process.env.STUU_HOME || path.join(os.homedir(), '.thestuu');
 const projectsDir = path.join(stuuHome, 'projects');
@@ -18,6 +23,9 @@ const defaultProjectPath = path.join(projectsDir, 'welcome.stu');
 const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
 const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
+const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
+/** Opt-in only: fake random meter motion when Native has no transport.get_meters. Default off — meters stay at 0 until Native is rebuilt. */
+const meterUiFallbackEnabled = process.env.STUU_METER_UI_FALLBACK === '1';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const engineDir = path.resolve(__dirname, '..');
@@ -1625,6 +1633,10 @@ let liveRecordStartBeats = null;
 const LIVE_RECORD_MERGE_MS = 800;
 /** Placeholder source_path for the clip shown while recording (before native exposes the real clip). */
 const LIVE_RECORDING_SOURCE_PATH = '__live_recording__';
+/** Bumped whenever native arrangement is synced from the authoritative playlist (clear + rebuild).
+ * In-flight `mergeNativeClipsIntoPlaylist` calls must abort if the epoch changed while awaiting
+ * `edit:get-audio-clips`, or they can re-append stale native clips after a delete/move. */
+let nativeArrangementEpoch = 0;
 let nativeTickEstimator = {
   hasLast: false,
   lastMs: 0,
@@ -1759,11 +1771,9 @@ function assertTrackId(payload) {
 }
 
 function assertClipId(payload) {
-  if (isNonEmptyString(payload.clipId)) {
-    return payload.clipId.trim();
-  }
-  if (isNonEmptyString(payload.clip_id)) {
-    return payload.clip_id.trim();
+  const raw = payload.clipId ?? payload.clip_id;
+  if (raw !== undefined && raw !== null && String(raw).trim() !== '') {
+    return String(raw).trim();
   }
   throw new Error('clipId is required');
 }
@@ -2295,10 +2305,12 @@ async function syncPlaylistClipsToNative() {
   return errors;
 }
 
-async function syncNativeArrangementFromPlaylist() {
+async function syncNativeArrangementFromPlaylist(options = {}) {
+  const mergeNativeFirst = options.mergeNativeFirst !== false;
   if (!nativeTransportActive) {
     return;
   }
+  nativeArrangementEpoch += 1;
   let savedPositionBeats = null;
   let savedPlaying = false;
   try {
@@ -2312,8 +2324,12 @@ async function syncNativeArrangementFromPlaylist() {
     // ignore; we simply won't restore
   }
   try {
-    // Merge native edit into playlist first so we don't wipe freshly recorded clips
-    await mergeNativeClipsIntoPlaylist();
+    // Merge native edit into playlist first so we don't wipe freshly recorded clips.
+    // Skip when the playlist was just mutated from JS (delete/move/resize/fade): merging would
+    // re-append stale native clips before clear-audio-clips runs.
+    if (mergeNativeFirst) {
+      await mergeNativeClipsIntoPlaylist();
+    }
     await requestNativeTransport('edit:clear-audio-clips');
     await syncPlaylistClipsToNative();
     // Ensure every playlist track has a mixer entry so we apply mute/solo/volume to all (Track 1 must not be left unmapped).
@@ -2371,11 +2387,15 @@ async function syncNativeArrangementFromPlaylist() {
  */
 async function mergeNativeClipsIntoPlaylist() {
   if (!nativeTransportActive) return;
+  const epochAtStart = nativeArrangementEpoch;
   let response;
   try {
     response = await requestNativeTransport('edit:get-audio-clips');
   } catch (e) {
     console.warn('[thestuu-engine] edit:get-audio-clips failed:', e instanceof Error ? e.message : String(e));
+    return;
+  }
+  if (epochAtStart !== nativeArrangementEpoch) {
     return;
   }
   const clips = Array.isArray(response?.clips) ? response.clips : [];
@@ -2478,7 +2498,7 @@ async function mergeNativeClipsIntoPlaylist() {
       sortClips(track);
     }
   }
-  if (merged > 0) {
+  if (merged > 0 && epochAtStart === nativeArrangementEpoch) {
     console.log(`[thestuu-engine] mergeNativeClipsIntoPlaylist: merged ${merged} clip(s) from native edit.`);
     emitState();
   }
@@ -2488,7 +2508,7 @@ function findClip(track, clipId) {
   if (!track || !Array.isArray(track.clips)) {
     return { clip: null, index: -1 };
   }
-  const index = track.clips.findIndex((clip) => clip.id === clipId);
+  const index = track.clips.findIndex((clip) => String(clip.id).trim() === clipId);
   if (index === -1) {
     return { clip: null, index: -1 };
   }
@@ -2911,14 +2931,14 @@ async function moveClip(payload = {}) {
         start: nextStart,
       });
       sortClips(destinationTrack);
-      await syncNativeArrangementFromPlaylist();
+      await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
       return { clipId, trackId: destinationTrackId };
     }
   }
 
   clip.start = nextStart;
   sortClips(sourceTrack);
-  await syncNativeArrangementFromPlaylist();
+  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
   return { clipId, trackId: sourceTrackId };
 }
 
@@ -2940,7 +2960,7 @@ async function resizeClip(payload = {}) {
   }
 
   clip.length = Math.max(GRID_STEP, roundToGrid(nextLengthRaw));
-  await syncNativeArrangementFromPlaylist();
+  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
   return { clipId, trackId };
 }
 
@@ -2983,7 +3003,7 @@ async function setClipFade(payload = {}) {
   if (payload.fade_out_curve !== undefined || payload.fadeOutCurve !== undefined) {
     clip.fade_out_curve = normalizeFadeCurve(payload.fade_out_curve ?? payload.fadeOutCurve);
   }
-  await syncNativeArrangementFromPlaylist();
+  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
   return { clipId, trackId };
 }
 
@@ -3043,11 +3063,11 @@ async function deleteClip(payload = {}) {
   }
 
   const currentLength = track.clips.length;
-  track.clips = track.clips.filter((clip) => clip.id !== clipId);
+  track.clips = track.clips.filter((clip) => String(clip.id).trim() !== clipId);
   if (track.clips.length === currentLength) {
     throw new Error(`clip "${clipId}" not found on track ${trackId}`);
   }
-  await syncNativeArrangementFromPlaylist();
+  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
   return { clipId, trackId };
 }
 
@@ -4961,27 +4981,86 @@ io.on('connection', (socket) => {
   bindMutation(socket, 'delete_clip', deleteClip);
 });
 
-const engineTickTimer = setInterval(() => {
+let cachedNativeMetersPayload = null;
+let lastMetersFlatLogMs = 0;
+let lastMetersRequestErrorLogMs = 0;
+let lastStuuDebugMetersLogMs = 0;
+let loggedMeterPlaceholderNotice = false;
+
+async function emitEngineMeterTick() {
   const now = Date.now();
   emitTransport(now);
 
   const playlist = state.project.playlist || [];
-  const meters = playlist.map((track) => {
-    if (nativeTransportActive) {
-      return { trackId: track.track_id, peak: 0, rms: 0 };
+  let meters;
+  if (nativeTransportActive && nativeTransportClient?.connected && playlist.length > 0) {
+    try {
+      const raw = await nativeTransportClient.request('transport.get_meters', {
+        track_count: playlist.length,
+      });
+      cachedNativeMetersPayload = raw;
+    } catch (error) {
+      // Keep last good reading so a single slow/failed poll does not blank the UI.
+      if (now - lastMetersRequestErrorLogMs > 12000) {
+        lastMetersRequestErrorLogMs = now;
+        console.warn(
+          '[thestuu-engine] transport.get_meters failed:',
+          error instanceof Error ? error.message : error,
+        );
+      }
     }
-    return {
-      trackId: track.track_id,
-      peak: state.playing ? Math.random() * 0.95 : Math.random() * 0.05,
-      rms: state.playing ? Math.random() * 0.75 : Math.random() * 0.03,
-    };
-  });
+    const nativeRows = cachedNativeMetersPayload?.meters;
+    const hasNativeRows = Array.isArray(nativeRows) && nativeRows.length > 0;
+    const mergedNative = mergeNativeMetersPayload(playlist, cachedNativeMetersPayload);
+    if (meterUiFallbackEnabled && !hasNativeRows) {
+      meters = placeholderMetersForPlaylist(playlist, state.playing);
+      if (!loggedMeterPlaceholderNotice) {
+        loggedMeterPlaceholderNotice = true;
+        console.warn(
+          '[thestuu-engine] Keine Native-Meterzeilen (transport.get_meters fehlt oder leer). '
+            + 'Pegel bleiben bei 0 bis thestuu-native neu gebaut ist. Nur zu Tests: STUU_METER_UI_FALLBACK=1 für zufällige Balken.',
+        );
+      }
+    } else {
+      meters = mergedNative;
+      if (hasNativeRows && maxPeakFromMeterRows(mergedNative) > 0.02) {
+        loggedMeterPlaceholderNotice = false;
+      }
+    }
+    const maxPeak = maxPeakFromMeterRows(meters);
+    if (state.playing && maxPeak < 0.0005 && hasNativeRows && now - lastMetersFlatLogMs > 15000) {
+      lastMetersFlatLogMs = now;
+      const rawRows = Array.isArray(cachedNativeMetersPayload?.meters)
+        ? cachedNativeMetersPayload.meters.length
+        : 0;
+      console.warn(
+        `[thestuu-engine] Meter pegel bleiben bei 0 während Wiedergabe (merged maxPeak=${maxPeak.toFixed(
+          6,
+        )}, nativeZeilen=${rawRows}). Baue thestuu-native neu oder prüfe Tracktion-LevelMeter.`,
+      );
+    }
+    if (stuuDebugMeters && now - lastStuuDebugMetersLogMs > 2000) {
+      lastStuuDebugMetersLogMs = now;
+      const rawPreview = cachedNativeMetersPayload
+        ? JSON.stringify(cachedNativeMetersPayload).slice(0, 420)
+        : 'null';
+      console.log(
+        `[thestuu-engine] STUU_DEBUG_METERS merged maxPeak=${maxPeak.toFixed(4)} playlist=${playlist.length} raw=${rawPreview}`,
+      );
+    }
+  } else {
+    meters = placeholderMetersForPlaylist(playlist, state.playing);
+  }
 
   io.emit('engine:meter', {
     playing: state.playing,
     timestamp: now,
     meters,
   });
+}
+
+const engineTickTimer = setInterval(() => {
+  void emitEngineMeterTick();
 }, 120);
 
 async function boot() {

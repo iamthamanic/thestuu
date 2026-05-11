@@ -169,6 +169,14 @@ struct TransportSnapshot {
 };
 
 bool getTransportSnapshot(TransportSnapshot& out);
+
+/** Per-track peak/RMS from native LevelMeter taps (0..1 linear). Vector length matches trackCount (1..N). */
+struct TrackMeterLevels {
+  float peak = 0.f;
+  float rms = 0.f;
+};
+bool getTransportMeterLevels(std::vector<TrackMeterLevels>& out, int32_t trackCount, std::string& error);
+
 void transportPlay();
 /** Start playback with recording; use when at least one track is record-armed. */
 void transportRecord();

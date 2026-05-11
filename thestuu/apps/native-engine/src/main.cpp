@@ -876,6 +876,32 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     }
     return makeResponse(id, MsgValue::Object{{"transport", MsgValue(transport.snapshot())}});
   }
+  if (cmd == "transport.get_meters") {
+    const int32_t trackCount = payload
+      ? static_cast<int32_t>(
+          asInt(getField(*payload, "track_count"),
+            asInt(getField(*payload, "trackCount"), 0))
+        )
+      : 0;
+    if (trackCount <= 0) {
+      return makeResponse(id, MsgValue::Object{{"meters", MsgValue(MsgValue::Array{})}});
+    }
+    std::vector<thestuu::native::TrackMeterLevels> levels;
+    std::string meterError;
+    if (!thestuu::native::getTransportMeterLevels(levels, trackCount, meterError)) {
+      return makeErrorResponse(id, meterError.empty() ? std::string("transport.get_meters failed") : meterError);
+    }
+    MsgValue::Array arr;
+    arr.reserve(levels.size());
+    for (size_t i = 0; i < levels.size(); ++i) {
+      arr.push_back(MsgValue(MsgValue::Object{
+        {"track_id", MsgValue(static_cast<int64_t>(static_cast<int32_t>(i) + 1))},
+        {"peak", MsgValue(static_cast<double>(levels[i].peak))},
+        {"rms", MsgValue(static_cast<double>(levels[i].rms))},
+      }));
+    }
+    return makeResponse(id, MsgValue::Object{{"meters", MsgValue(std::move(arr))}});
+  }
   if (cmd == "analyzer.set_target" || cmd == "analyzer:set-target") {
     if (!payload) {
       return makeErrorResponse(id, "analyzer:set-target requires payload");

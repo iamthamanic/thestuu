@@ -9,7 +9,7 @@ Usage:
 
 Options:
   --port <number>         Dashboard port (default: 3000)
-  --engine-port <number>  Engine port (default: 3987)
+  --engine-port <number>  Engine port (default: 3990)
   --project <name>        Project filename in ~/.thestuu/projects
   --native-backend <id>   Native backend: tracktion (erforderlich)
   --native-vendor-dir <path> Path containing JUCE + tracktion_engine sources
@@ -23,7 +23,7 @@ Options:
 function parseArgs(argv) {
   const options = {
     port: 3000,
-    enginePort: 3987,
+    enginePort: 3990,
     browser: true,
     project: 'welcome.stu',
     native: true,

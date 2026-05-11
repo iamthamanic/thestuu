@@ -105,6 +105,16 @@ bool getTransportSnapshot(TransportSnapshot& out) {
   return false;
 }
 
+bool getTransportMeterLevels(std::vector<TrackMeterLevels>& out, int32_t trackCount, std::string& error) {
+  out.clear();
+  error.clear();
+  if (trackCount <= 0) {
+    return true;
+  }
+  out.assign(static_cast<size_t>(trackCount), TrackMeterLevels{});
+  return true;
+}
+
 void transportPlay() {}
 void transportRecord() {}
 void transportPause() {}

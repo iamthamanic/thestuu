@@ -1,13 +1,13 @@
 'use client';
 
 import Image from 'next/image';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AnimatePresence, motion } from 'framer-motion';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import {
   AudioWaveform,
   ArrowUpDown,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -19,6 +19,7 @@ import {
   Filter,
   Gauge,
   LayoutGrid,
+  Mic,
   Minus,
   MousePointer2,
   MoveHorizontal,
@@ -41,6 +42,9 @@ import {
 } from 'lucide-react';
 import 'reactflow/dist/style.css';
 import { createEngineSocket } from '../lib/socket';
+import { getMeterMap } from '../lib/meter-map';
+import LevelMeter from './LevelMeter';
+import MixStripChain from './MixStripChain';
 
 function ExtractStemsIcon({ size = 24, strokeWidth = 2, ...props }) {
   return (
@@ -110,7 +114,6 @@ const FLOATING_WINDOW_DOCK_GAP = 10;
 const TRACK_CHAIN_VISIBLE_SLOTS = 7;
 const TRACK_CHAIN_MODAL_MIN_SLOTS = TRACK_CHAIN_VISIBLE_SLOTS;
 const TRACK_CHAIN_PLUGIN_NAME_LIMIT = 14;
-const MIXER_INSPECTOR_SLOT_COUNT = 10;
 const FADE_CURVE_ORDER = ['linear', 'convex', 'concave', 'sCurve'];
 const DEFAULT_METRONOME_ENABLED = false;
 const DEFAULT_WAVEFORM_SAMPLE_COUNT = 1024;
@@ -180,8 +183,28 @@ const EDIT_TOOL_OPTIONS = [
   { id: 'zoom', label: 'Zoom', description: 'zoomt in einen aufgezogenen Bereich' },
 ];
 const DEFAULT_EDIT_TOOL = 'select';
-const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3987';
+const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3990';
 const LIVE_ENGINE_LOG_LIMIT = 500;
+
+/** Safe basename for exported project JSON (no path separators or illegal filename chars). */
+function sanitizeProjectJsonBasename(raw) {
+  if (raw == null || typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  const stripped = trimmed
+    .replace(/[/\\?%*:|"<>]/g, '-')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120);
+  return stripped || '';
+}
+
+function getProjectJsonDownloadFilename(project) {
+  const base = sanitizeProjectJsonBasename(project?.project_name);
+  if (base) return `${base}.json`;
+  return 'thestuu-project.json';
+}
 const TRACKTION_PLUGIN_PREVIEW_DIMENSIONS = { width: 320, height: 96 };
 
 function normalizeLiveEngineLogLevel(level) {
@@ -989,19 +1012,6 @@ function formatTimeMMSS(totalSeconds) {
   const m = Math.floor(totalSeconds / 60);
   const s = Math.floor(totalSeconds % 60);
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
-function getMeterMap(payload) {
-  const map = {};
-  if (!payload || !Array.isArray(payload.meters)) {
-    return map;
-  }
-
-  for (const meter of payload.meters) {
-    map[meter.trackId] = meter;
-  }
-
-  return map;
 }
 
 function getPatternId(value) {
@@ -1813,6 +1823,11 @@ function createDefaultTrackMix(trackId) {
   };
 }
 
+/** Mix strip M/S/R: semantic classes (`mute-toggle`, `solo-toggle`, `record-toggle`) + `active`, aligned with Edit `arrangement-track-toggle`. */
+function mixStripToggleButtonClass(action, active) {
+  return `${action}-toggle${active ? ' active' : ''}`;
+}
+
 function normalizeTrackMixEntry(entry, trackId) {
   const safeEntry = isObject(entry) ? entry : {};
   return {
@@ -2182,6 +2197,10 @@ export default function StuuShell() {
   const seekAnimationFrameRef = useRef(null);
   const playheadAnimationFrameRef = useRef(null);
   const playheadLeftPxRef = useRef(-1);
+  /** Incremented when switching to Edit so the next scroll-element sync always writes --playhead-left-px (new DOM node / remount). */
+  const playheadSyncGenerationRef = useRef(0);
+  const playheadAppliedScrollGenRef = useRef(-1);
+  const prevTabForPlayheadRef = useRef(null);
   const pendingSeekBarsRef = useRef(null);
   const playheadPointerHandlersRef = useRef(null);
   const toolPointerHandlersRef = useRef(null);
@@ -2226,6 +2245,7 @@ export default function StuuShell() {
   const activateFloatingWindowRef = useRef(null);
   const loadedProjectFileRef = useRef(null);
   const chatHistoryLoadedRef = useRef(false);
+  const speechRecognitionRef = useRef(null);
   const lastSyncedViewRef = useRef({
     file: '',
     bars: DEFAULT_VIEW_BARS,
@@ -2255,9 +2275,9 @@ export default function StuuShell() {
   const [enginePort, setEnginePort] = useState(() => {
     try {
       const u = new URL(ENGINE_BASE_URL);
-      return u.port ? Number(u.port) : 3987;
+      return u.port ? Number(u.port) : 3990;
     } catch {
-      return 3987;
+      return 3990;
     }
   });
   const [editTool, setEditTool] = useState(DEFAULT_EDIT_TOOL);
@@ -2277,8 +2297,13 @@ export default function StuuShell() {
     : FALLBACK_STATE.appPreferences.record_use_standard_mic;
   const [transport, setTransport] = useState(FALLBACK_STATE.transport);
   const [meters, setMeters] = useState({});
+  const [meterFlatWarning, setMeterFlatWarning] = useState(false);
+  const meterFlatSinceRef = useRef(null);
   const [chatInput, setChatInput] = useState('');
+  const [speechListening, setSpeechListening] = useState(false);
   const [chatMessages, setChatMessages] = useState(DEFAULT_CHAT_MESSAGES);
+  const [aiChatDrawerOpen, setAiChatDrawerOpen] = useState(false);
+  const [sidePanelTab, setSidePanelTab] = useState('assistant');
   const [inspector, setInspector] = useState({ type: 'project' });
   const [inspectorEqViewMode, setInspectorEqViewMode] = useState('easy');
   const [inspectorEqSelectedBandId, setInspectorEqSelectedBandId] = useState('mid1');
@@ -2631,6 +2656,21 @@ export default function StuuShell() {
   }, [chatMessages]);
 
   useEffect(() => {
+    if (!aiChatDrawerOpen) {
+      return undefined;
+    }
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setAiChatDrawerOpen(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [aiChatDrawerOpen]);
+
+  useEffect(() => {
     try {
       const saved = window.localStorage.getItem('thestuu-playlist-snap-mode');
       if (!saved) {
@@ -2725,7 +2765,10 @@ export default function StuuShell() {
       socket.off('engine:logs:init', handleEngineLogsInit);
       socket.off('engine:log', handleEngineLog);
       socket.off('engine:ready');
+      socket.off('engine:state');
+      socket.off('engine:meter');
       socket.off('engine:analyzer');
+      socket.off('engine:transport');
       socket.io.off('reconnect_attempt', handleReconnectAttempt);
       socket.close();
     };
@@ -3873,6 +3916,82 @@ export default function StuuShell() {
     setChatMessages((previous) => [...previous, { role: 'system', text }]);
   }, []);
 
+  useEffect(() => () => {
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.abort();
+      speechRecognitionRef.current = null;
+    }
+  }, []);
+
+  function getSpeechRecognitionConstructor() {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+
+  function toggleSpeechRecognition() {
+    if (speechListening) {
+      speechRecognitionRef.current?.stop();
+      setSpeechListening(false);
+      return;
+    }
+
+    const SpeechRecognition = getSpeechRecognitionConstructor();
+    if (!SpeechRecognition) {
+      appendSystemMessage('Spracheingabe ist in diesem Browser nicht verfuegbar. In Chrome/Edge unter HTTPS oder localhost versuchen.');
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    speechRecognitionRef.current = recognition;
+    recognition.lang = 'de-DE';
+    recognition.interimResults = false;
+    recognition.continuous = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setSpeechListening(true);
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results || [])
+        .slice(event.resultIndex || 0)
+        .map((result) => result?.[0]?.transcript || '')
+        .join(' ')
+        .trim();
+
+      if (!transcript) {
+        return;
+      }
+
+      setChatInput((previous) => {
+        const trimmed = previous.trim();
+        return trimmed ? `${trimmed} ${transcript}` : transcript;
+      });
+    };
+
+    recognition.onerror = (event) => {
+      setSpeechListening(false);
+      appendSystemMessage(`Spracheingabe fehlgeschlagen: ${event?.error || 'Unbekannter Fehler'}`);
+    };
+
+    recognition.onend = () => {
+      setSpeechListening(false);
+      if (speechRecognitionRef.current === recognition) {
+        speechRecognitionRef.current = null;
+      }
+    };
+
+    try {
+      recognition.start();
+    } catch (error) {
+      setSpeechListening(false);
+      speechRecognitionRef.current = null;
+      appendSystemMessage(`Spracheingabe konnte nicht gestartet werden: ${error?.message || 'Unbekannter Fehler'}`);
+    }
+  }
+
   const applyProjectBpm = useCallback((rawBpm, { sourceLabel = 'Analyse' } = {}) => {
     const parsed = Number(rawBpm);
     if (!Number.isFinite(parsed)) {
@@ -4156,7 +4275,7 @@ export default function StuuShell() {
               if (!resolved) {
                 continue;
               }
-              emitMutation('clip:delete', { trackId: resolved.trackId, clipId: resolved.clipId });
+              emitMutation('clip:delete', { trackId: resolved.trackId, clipId: String(resolved.clipId) });
             }
             setSelectedClipKeys([]);
             return;
@@ -4249,6 +4368,33 @@ export default function StuuShell() {
     setViewBars((previous) => Math.max(previous, nextMinimumBars));
   }, []);
 
+  const applyPlayheadToScrollEl = useCallback(
+    (scrollEl) => {
+      const bars = getCurrentTransportBars();
+      const leftPx = clamp(
+        bars * barWidthRef.current,
+        0,
+        timelineBarsRef.current * barWidthRef.current,
+      );
+      const gen = playheadSyncGenerationRef.current;
+      if (gen !== playheadAppliedScrollGenRef.current) {
+        playheadAppliedScrollGenRef.current = gen;
+        playheadLeftPxRef.current = leftPx;
+        scrollEl.style.setProperty('--playhead-left-px', `${leftPx}px`);
+      } else if (Math.abs(leftPx - playheadLeftPxRef.current) >= 0.05) {
+        playheadLeftPxRef.current = leftPx;
+        scrollEl.style.setProperty('--playhead-left-px', `${leftPx}px`);
+      }
+      if (
+        Boolean(transportSnapshotRef.current.playing)
+        && bars >= viewBarsRef.current - PLAYHEAD_EXTEND_MARGIN_BARS
+      ) {
+        ensureViewBars(bars + PLAYHEAD_EXTEND_MARGIN_BARS + VIEW_EXTEND_STEP_BARS);
+      }
+    },
+    [ensureViewBars, getCurrentTransportBars],
+  );
+
   useEffect(() => {
     if (viewBars < minimumViewportBars) {
       setViewBars(minimumViewportBars);
@@ -4301,32 +4447,44 @@ export default function StuuShell() {
     ensureViewBars(positionBars + PLAYHEAD_EXTEND_MARGIN_BARS + VIEW_EXTEND_STEP_BARS);
   }, [activeTab, state?.playing, transport?.positionBars, ensureViewBars]);
 
+  /** Entering Edit (incl. first paint): bump generation before layout sync so --playhead-left-px is never skipped vs stale gen/ref. */
+  useLayoutEffect(() => {
+    const prev = prevTabForPlayheadRef.current;
+    if (activeTab === 'Edit' && prev !== 'Edit') {
+      playheadSyncGenerationRef.current += 1;
+      playheadLeftPxRef.current = -1;
+    }
+    prevTabForPlayheadRef.current = activeTab;
+
+    if (activeTab !== 'Edit') {
+      return;
+    }
+    const scrollEl = arrangementScrollRef.current;
+    if (!scrollEl) {
+      return;
+    }
+    applyPlayheadToScrollEl(scrollEl);
+  }, [activeTab, applyPlayheadToScrollEl]);
+
   useEffect(() => {
     if (activeTab !== 'Edit') {
       return;
     }
-    const scrollElement = arrangementScrollRef.current;
-    if (!scrollElement) {
-      return;
-    }
+
+    let scrollRefRetries = 0;
+    const MAX_SCROLL_REF_RETRIES = 24;
 
     const renderPlayhead = () => {
-      const bars = getCurrentTransportBars();
-      const leftPx = clamp(
-        bars * barWidthRef.current,
-        0,
-        timelineBarsRef.current * barWidthRef.current,
-      );
-      if (Math.abs(leftPx - playheadLeftPxRef.current) >= 0.05) {
-        playheadLeftPxRef.current = leftPx;
-        scrollElement.style.setProperty('--playhead-left-px', `${leftPx}px`);
+      const scrollElement = arrangementScrollRef.current;
+      if (!scrollElement) {
+        if (scrollRefRetries < MAX_SCROLL_REF_RETRIES) {
+          scrollRefRetries += 1;
+          playheadAnimationFrameRef.current = window.requestAnimationFrame(renderPlayhead);
+        }
+        return;
       }
-      if (
-        Boolean(transportSnapshotRef.current.playing)
-        && bars >= viewBarsRef.current - PLAYHEAD_EXTEND_MARGIN_BARS
-      ) {
-        ensureViewBars(bars + PLAYHEAD_EXTEND_MARGIN_BARS + VIEW_EXTEND_STEP_BARS);
-      }
+
+      applyPlayheadToScrollEl(scrollElement);
       playheadAnimationFrameRef.current = window.requestAnimationFrame(renderPlayhead);
     };
 
@@ -4337,7 +4495,7 @@ export default function StuuShell() {
         playheadAnimationFrameRef.current = null;
       }
     };
-  }, [activeTab, state?.playing, ensureViewBars, getCurrentTransportBars]);
+  }, [activeTab, state?.playing, applyPlayheadToScrollEl]);
 
   useEffect(() => {
     const selectedProjectFile = typeof state?.selectedProjectFile === 'string'
@@ -4890,7 +5048,7 @@ export default function StuuShell() {
             return;
           }
           for (const entry of clipEntries) {
-            emitMutation('clip:delete', { trackId: entry.trackId, clipId: entry.clipId });
+            emitMutation('clip:delete', { trackId: entry.trackId, clipId: String(entry.clipId) });
           }
           return;
         }
@@ -6915,7 +7073,7 @@ export default function StuuShell() {
     if (editTool === 'delete') {
       event.preventDefault();
       event.stopPropagation();
-      emitMutation('clip:delete', { trackId, clipId: clip.id });
+      emitMutation('clip:delete', { trackId, clipId: String(clip.id) });
       return;
     }
     if (editTool === 'mute') {
@@ -7172,6 +7330,10 @@ export default function StuuShell() {
   }, [arrangementTracks]);
   const mixMasterPeak = useMemo(() => {
     return mixTracks.reduce((maxPeak, track) => {
+      const hasClips = Array.isArray(track.clips) && track.clips.length > 0;
+      if (!hasClips) {
+        return maxPeak;
+      }
       const trackPeak = clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1);
       return Math.max(maxPeak, trackPeak);
     }, 0);
@@ -7182,37 +7344,26 @@ export default function StuuShell() {
     }
     return mixTracks[0]?.track_id ?? null;
   }, [selectedTrackId, mixTracks]);
-  const mixSelectedTrack = useMemo(() => {
-    if (!Number.isInteger(mixSelectedTrackId)) {
-      return null;
+
+  useEffect(() => {
+    const playing = Boolean(transport.playing);
+    const nativeOn = Boolean(state?.nativeTransport);
+    const flat =
+      playing && nativeOn && mixTracks.length > 0 && Number(mixMasterPeak) < 0.001;
+    if (!flat) {
+      meterFlatSinceRef.current = null;
+      setMeterFlatWarning(false);
+      return;
     }
-    return mixTracks.find((track) => track.track_id === mixSelectedTrackId) || null;
-  }, [mixTracks, mixSelectedTrackId]);
-  const mixSelectedTrackMix = useMemo(() => {
-    if (!mixSelectedTrack) {
-      return null;
+    const now = Date.now();
+    if (meterFlatSinceRef.current == null) {
+      meterFlatSinceRef.current = now;
     }
-    return mixSelectedTrack.mix || createDefaultTrackMix(mixSelectedTrack.track_id);
-  }, [mixSelectedTrack]);
-  const mixSelectedTrackNodes = useMemo(() => {
-    if (!mixSelectedTrack) {
-      return [];
+    if (now - meterFlatSinceRef.current > 2000) {
+      setMeterFlatWarning(true);
     }
-    return vstNodesByTrack.get(mixSelectedTrack.track_id) || [];
-  }, [mixSelectedTrack, vstNodesByTrack]);
-  const mixSelectedTrackSlots = useMemo(() => {
-    return Array.from({ length: MIXER_INSPECTOR_SLOT_COUNT }, (_, slotIndex) => ({
-      slotIndex,
-      node: mixSelectedTrackNodes[slotIndex] || null,
-    }));
-  }, [mixSelectedTrackNodes]);
-  const mixSelectedTrackSlotOverflow = Math.max(0, mixSelectedTrackNodes.length - MIXER_INSPECTOR_SLOT_COUNT);
-  const mixPluginPickerOpen = Boolean(
-    mixSelectedTrack
-      && openTrackPluginPicker
-      && openTrackPluginPicker.scope === 'mix'
-      && openTrackPluginPicker.trackId === mixSelectedTrack.track_id,
-  );
+  }, [transport.playing, state?.nativeTransport, mixTracks.length, mixMasterPeak]);
+
   const showDawTopShell = activeTab === 'Edit' || activeTab === 'Mix';
   const canUndoProject = Boolean(state?.history?.canUndo);
   const canRedoProject = Boolean(state?.history?.canRedo);
@@ -7498,6 +7649,355 @@ export default function StuuShell() {
     );
   };
 
+  /** Renders track/clip/node/pattern/EQ inspector UI for the unified side panel (Inspector tab). Lives in stuu-shell.jsx with access to shell state. */
+  function renderInspectorPanelBody() {
+    return (
+      <>
+          <p className="muted">
+            {inspector.type === 'project' && 'Aktives Projekt'}
+            {inspector.type === 'track' && `Track #${inspector.trackId}`}
+            {inspector.type === 'clip' && `Clip ${inspector.clipId}`}
+            {inspector.type === 'node' && `Node ${inspector.nodeId}`}
+            {(inspector.type === 'pattern' || inspector.type === 'pattern-step') && `Pattern ${inspectorPattern?.id || ''}`}
+          </p>
+
+          {(inspector.type === 'pattern' || inspector.type === 'pattern-step') && inspectorPattern ? (
+            <div className="inspector-form">
+              <label>
+                Pattern
+                <select
+                  value={inspectorPattern.id}
+                  onChange={(event) => {
+                    setInspector({ type: 'pattern', patternId: event.target.value });
+                    setActivePatternId(event.target.value);
+                  }}
+                >
+                  {patterns.map((pattern) => (
+                    <option key={pattern.id} value={pattern.id}>
+                      {pattern.id} ({pattern.type})
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Laenge
+                <select
+                  value={inspectorPattern.length}
+                  onChange={(event) => updatePatternMeta(inspectorPattern.id, { length: Number(event.target.value) })}
+                >
+                  {[8, 16, 32, 64].map((value) => (
+                    <option key={`length_${value}`} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Swing ({Number(inspectorPattern.swing || 0).toFixed(2)})
+                <input
+                  type="range"
+                  min={0}
+                  max={0.75}
+                  step={0.01}
+                  value={inspectorPattern.swing || 0}
+                  onChange={(event) => updatePatternMeta(inspectorPattern.id, { swing: Number(event.target.value) })}
+                />
+              </label>
+
+              {inspector.type === 'pattern-step' ? (
+                <div className="inspector-step-block">
+                  <p>
+                    Step {(inspector.index || 0) + 1} · {inspector.lane}
+                  </p>
+                  <div className="step-velocity-buttons">
+                    <button
+                      className={(inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) === 0 ? 'active' : ''}
+                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 0)}
+                    >
+                      Off
+                    </button>
+                    <button
+                      className={Math.abs((inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) - 0.55) < 0.05 ? 'active' : ''}
+                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 0.55)}
+                    >
+                      Soft
+                    </button>
+                    <button
+                      className={Math.abs((inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) - 1) < 0.05 ? 'active' : ''}
+                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 1)}
+                    >
+                      Accent
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {inspector.type === 'track' && inspectorTrack ? (
+            <div className="inspector-summary">
+              <p>Name: {inspectorTrack.name}</p>
+              <p>Clips: {(inspectorTrack.clips || []).length}</p>
+            </div>
+          ) : null}
+
+          {inspector.type === 'clip' && inspectorClip ? (
+            <div className="inspector-summary">
+              <p>ID: {inspectorClip.id}</p>
+              <p>Start: {Number(inspectorClip.start || 0).toFixed(2)} Bar</p>
+              <p>Laenge: {Number(inspectorClip.length || 0).toFixed(2)} Bar</p>
+              <p>Pattern: {getPatternId(inspectorClip) || '-'}</p>
+            </div>
+          ) : null}
+
+          {inspector.type === 'node' && inspectorNode ? (
+            <div className="inspector-form">
+              <div className="inspector-summary">
+                <p>Typ: {inspectorNode.type}</p>
+                <p>Plugin: {inspectorNode.plugin || inspectorNode.plugin_uid || '-'}</p>
+                <p>UID: {inspectorNode.plugin_uid || '-'}</p>
+                <p>Track: {Number(inspectorNode.track_id ?? inspectorNode.trackId ?? 0) || '-'}</p>
+                <p>Index: {Number(inspectorNode.plugin_index ?? inspectorNode.pluginIndex ?? 0)}</p>
+              </div>
+
+              {inspectorNode.type === 'vst_instrument' ? (
+                inspectorTracktionEqUi ? (
+                  <div className="inspector-plugin-mode-shell">
+                    <div className="inspector-plugin-mode-tabs" role="tablist" aria-label="EQ Inspector Modus">
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={inspectorEqViewMode === 'easy'}
+                        className={inspectorEqViewMode === 'easy' ? 'active' : ''}
+                        onClick={() => setInspectorEqViewMode('easy')}
+                        disabled={!inspectorTracktionEqUi.gainParams}
+                      >
+                        Easy
+                      </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={inspectorEqViewMode === 'pro'}
+                        className={inspectorEqViewMode === 'pro' ? 'active' : ''}
+                        onClick={() => setInspectorEqViewMode('pro')}
+                      >
+                        Pro
+                      </button>
+                    </div>
+
+                    {inspectorEqViewMode === 'easy' && inspectorTracktionEqUi.gainParams ? (
+                      <div className="inspector-eq-easy">
+                        <p className="inspector-eq-hint">
+                          Schnellstart fuer den Tracktion EQ: Preset klicken, dann mit 3 Reglern nach Gehoer anpassen.
+                        </p>
+
+                        {renderInspectorTracktionEqCurvePanel({ mode: 'easy', showBandButtons: true })}
+
+                        <div className="inspector-eq-preset-grid" role="group" aria-label="EQ Easy Presets">
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('clean_up')}>Clean Up</button>
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('vocal_clarity')}>Vocal Klarheit</button>
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('bass_tight')}>Bass Tight</button>
+                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('air_brilliance')}>Air / Brillanz</button>
+                        </div>
+
+                        <button
+                          type="button"
+                          className="inspector-eq-reset-button"
+                          disabled={Boolean(inspectorTracktionEqUi?.isEffectivelyFlat)}
+                          onClick={() => applyInspectorTracktionEqPreset('flat')}
+                          title={
+                            inspectorTracktionEqUi?.isEffectivelyFlat
+                              ? 'EQ ist bereits praktisch flat'
+                              : 'Alle EQ-Gains auf 0 dB setzen'
+                          }
+                        >
+                          Reset EQ (Flat)
+                        </button>
+
+                        {[
+                          { id: 'mud', label: 'Weniger dumpf', value: inspectorTracktionEqUi.easyMacros.mud },
+                          { id: 'presence', label: 'Mehr Praesenz', value: inspectorTracktionEqUi.easyMacros.presence },
+                          { id: 'softness', label: 'Weicher', value: inspectorTracktionEqUi.easyMacros.softness },
+                        ].map((macro) => (
+                          <label key={`${inspectorNode.id}_${macro.id}`} className="inspector-eq-macro-row">
+                            <div className="inspector-eq-macro-row-head">
+                              <span>{macro.label}</span>
+                              <span>{formatInspectorEqMacroPercent(macro.value)}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={clamp(Number(macro.value) || 0, 0, 1)}
+                              onChange={(event) => setInspectorTracktionEqEasyMacro(macro.id, Number(event.target.value))}
+                            />
+                          </label>
+                        ))}
+
+                        <p className="muted inspector-eq-footnote">
+                          Easy im Inspector arbeitet mit schnellen Gain-Makros. Fuer Frequenz/Q direkt auf Pro wechseln oder das Plugin-Fenster oeffnen.
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        {inspectorEqViewMode === 'easy' && !inspectorTracktionEqUi.gainParams ? (
+                          <p className="muted inspector-eq-footnote">
+                            Easy-Mapping fuer diesen EQ wurde nicht erkannt. Pro zeigt alle Parameter.
+                          </p>
+                        ) : null}
+                        {inspectorEqViewMode === 'pro'
+                          ? renderInspectorTracktionEqCurvePanel({ mode: 'pro', showBandButtons: false })
+                          : null}
+                        {inspectorEqViewMode === 'pro' && inspectorTracktionEqSelectedBand ? (
+                          <div className="inspector-eq-pro-focus">
+                            <strong>{`Band Fokus: ${inspectorTracktionEqSelectedBand.label}`}</strong>
+                            <span>
+                              {`${formatTracktionEqInspectorReadoutFreq(inspectorTracktionEqSelectedBand.freqHz)} · ${formatTracktionEqInspectorReadoutDb(inspectorTracktionEqSelectedBand.gainDb)} · ${formatTracktionEqInspectorReadoutQ(inspectorTracktionEqSelectedBand.qValue)}`}
+                            </span>
+                            <small>Freq / Gain / Q dieses Bands sind unten hervorgehoben.</small>
+                          </div>
+                        ) : null}
+                        <div className="vst-param-list">
+                          {inspectorNodeParameters.length > 0 ? (
+                            inspectorNodeParameters.map((parameter) => {
+                              const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
+                              const linkedBand = inspectorEqViewMode === 'pro'
+                                ? (inspectorTracktionEqBandByParamId.get(parameter.id) || null)
+                                : null;
+                              const isLinkedBandParam = Boolean(linkedBand);
+                              const isSelectedBandParam = inspectorEqViewMode === 'pro'
+                                && inspectorTracktionEqSelectedBandParamIdSet.has(parameter.id);
+                              return (
+                                <label
+                                  key={`${inspectorNode.id}_${parameter.id}`}
+                                  className={`vst-param-row ${isLinkedBandParam ? 'band-linked-param' : ''} ${isSelectedBandParam ? 'selected-band-param' : ''}`}
+                                  ref={(element) => registerInspectorEqProParamRowRef(parameter.id, element)}
+                                  onClick={() => {
+                                    if (linkedBand?.id) {
+                                      selectInspectorTracktionEqBand(linkedBand.id);
+                                    }
+                                  }}
+                                  onPointerEnter={() => {
+                                    if (linkedBand) {
+                                      previewInspectorTracktionEqBandHover(linkedBand);
+                                    }
+                                  }}
+                                  onPointerLeave={() => {
+                                    if (linkedBand) {
+                                      clearInspectorTracktionEqCurveHover();
+                                    }
+                                  }}
+                                  onFocus={() => {
+                                    if (linkedBand) {
+                                      previewInspectorTracktionEqBandHover(linkedBand);
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    if (linkedBand) {
+                                      clearInspectorTracktionEqCurveHover();
+                                    }
+                                  }}
+                                  title={linkedBand?.label ? `Band ${linkedBand.label}` : undefined}
+                                >
+                                  <div className="vst-param-head">
+                                    <span className="vst-param-head-name">
+                                      <span>{parameter.name}</span>
+                                      {linkedBand ? (
+                                        <em className={`vst-param-band-chip ${isSelectedBandParam ? 'active' : ''}`}>{linkedBand.label}</em>
+                                      ) : null}
+                                    </span>
+                                    <span>{normalizedValue.toFixed(2)}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={1}
+                                    step={0.01}
+                                    value={normalizedValue}
+                                    onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
+                                  />
+                                </label>
+                              );
+                            })
+                          ) : (
+                            <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className="vst-param-list">
+                    {inspectorNodeParameters.length > 0 ? (
+                      inspectorNodeParameters.map((parameter) => {
+                        const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
+                        return (
+                          <label key={`${inspectorNode.id}_${parameter.id}`} className="vst-param-row">
+                            <div className="vst-param-head">
+                              <span>{parameter.name}</span>
+                              <span>{normalizedValue.toFixed(2)}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              value={normalizedValue}
+                              onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
+                            />
+                          </label>
+                        );
+                      })
+                    ) : (
+                      <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
+                    )}
+                  </div>
+                )
+              ) : (
+                <pre>{JSON.stringify(inspectorNode, null, 2)}</pre>
+              )}
+            </div>
+          ) : null}
+
+          {inspector.type === 'project' ? (
+            <div className="inspector-project-json-shell">
+              <div className="inspector-json-download-bar">
+                <button
+                  type="button"
+                  className="inspector-json-download-btn"
+                  title="Projekt JSON herunterladen"
+                  aria-label="Projekt JSON herunterladen"
+                  onClick={() => {
+                    const payload = state?.project ?? {};
+                    const text = JSON.stringify(payload, null, 2);
+                    const blob = new Blob([text], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    try {
+                      const anchor = document.createElement('a');
+                      anchor.href = url;
+                      anchor.download = getProjectJsonDownloadFilename(state?.project);
+                      document.body.appendChild(anchor);
+                      anchor.click();
+                      anchor.remove();
+                    } finally {
+                      URL.revokeObjectURL(url);
+                    }
+                  }}
+                >
+                  <Download size={14} strokeWidth={2} aria-hidden="true" />
+                  <span>Download</span>
+                </button>
+              </div>
+              <pre>{JSON.stringify(state?.project, null, 2)}</pre>
+            </div>
+          ) : null}
+      </>
+    );
+  }
+
   return (
     <>
     <div className={`stuu-root ${activeTab === 'Edit' ? 'edit-focus' : ''}`}>
@@ -7510,27 +8010,6 @@ export default function StuuShell() {
         onChange={handleTrackImportInputChange}
       />
       <div className={`stuu-grid ${activeTab === 'Edit' ? 'edit-focus' : ''}`}>
-        <aside className="panel panel-chat">
-          <div className="panel-header">AI Chat</div>
-          <div className="chat-list">
-            {chatMessages.map((message, index) => (
-              <div key={`${message.role}_${index}`} className={`chat-bubble chat-${message.role}`}>
-                <strong>{message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Stuu' : 'System'}:</strong>{' '}
-                {message.text}
-              </div>
-            ))}
-          </div>
-
-          <form className="chat-form" onSubmit={submitChat}>
-            <input
-              value={chatInput}
-              onChange={(event) => setChatInput(event.target.value)}
-              placeholder="Prompt an Stuu..."
-            />
-            <button type="submit">Send</button>
-          </form>
-        </aside>
-
         <main className={`panel panel-main ${activeTab === 'Edit' ? 'edit-focus' : ''}`}>
           {showDawTopShell ? (
             <>
@@ -7567,6 +8046,24 @@ export default function StuuShell() {
                     )}
                   </div>
                   <div className="daw-menu-right">
+                    <button
+                      type="button"
+                      className="daw-history-btn ai-chat-toggle"
+                      onClick={() => {
+                        setAiChatDrawerOpen((prev) => {
+                          const opening = !prev;
+                          if (opening) {
+                            setSidePanelTab('assistant');
+                          }
+                          return opening;
+                        });
+                      }}
+                      aria-label={aiChatDrawerOpen ? 'Seitenpanel schließen' : 'Seitenpanel öffnen (Assistant)'}
+                      aria-expanded={aiChatDrawerOpen}
+                      title="Assistant / Inspector"
+                    >
+                      <Bot size={14} aria-hidden="true" />
+                    </button>
                     {renderConnectionStatusWithLogs()}
                   </div>
                 </div>
@@ -7815,15 +8312,7 @@ export default function StuuShell() {
             ) : null}
           </div>
 
-          <AnimatePresence mode="wait">
-            <motion.section
-              key={activeTab}
-              className={`tab-content ${showDawTopShell ? 'tab-content-edit' : ''}`}
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.2 }}
-            >
+          <section className={`tab-content ${showDawTopShell ? 'tab-content-edit' : ''}`}>
               {activeTab === 'Edit' ? (
                 <>
                   {editTool === 'slice' && sliceCursorPosition != null
@@ -8028,20 +8517,11 @@ export default function StuuShell() {
                                   >
                                     <MultiSelectIcon active={selectedTrackIdSet.has(track.track_id)} />
                                   </button>
-                                  <div
-                                    className="arrangement-track-meter"
-                                    role="img"
-                                    aria-label={`Track ${track.track_id} Pegel`}
-                                  >
-                                    <div
-                                      className="arrangement-track-meter-fill"
-                                      style={{
-                                        height: hasClips
-                                          ? `${Math.min(100, 100 * clamp(Number(meter?.peak) || 0, 0, 1))}%`
-                                          : '0%',
-                                      }}
-                                    />
-                                  </div>
+                                  <LevelMeter
+                                    variant="arrangement"
+                                    ariaLabel={`Track ${track.track_id} Pegel`}
+                                    value={hasClips ? clamp(Number(meter?.peak) || 0, 0, 1) : 0}
+                                  />
                                   <span className="arrangement-track-index">{track.track_id}</span>
                                   {editingTrackId === track.track_id ? (
                                     <input
@@ -8886,7 +9366,7 @@ export default function StuuShell() {
                                           onClick={(event) => {
                                             event.stopPropagation();
                                             setClipQuickToolMenu(null);
-                                            emitMutation('clip:delete', { trackId: track.track_id, clipId: clip.id });
+                                            emitMutation('clip:delete', { trackId: track.track_id, clipId: String(clip.id) });
                                           }}
                                           aria-label="Clip entfernen"
                                           title="Clip entfernen"
@@ -9876,6 +10356,14 @@ export default function StuuShell() {
 
               {activeTab === 'Mix' ? (
                 <div className="mix-layout">
+                  {meterFlatWarning ? (
+                    <div className="alert alert-warning mix-meter-flat-hint" role="status">
+                      Pegelanzeige bleibt bei 0 während der Wiedergabe: die Native-Bridge liefert keine Pegel. Im
+                      Engine-Terminal nach <code className="mix-meter-flat-hint-code">transport.get_meters</code> schauen
+                      oder <code className="mix-meter-flat-hint-code">thestuu-native</code> neu bauen. Mit{' '}
+                      <code className="mix-meter-flat-hint-code">STUU_DEBUG_METERS=1</code> erscheinen Rohdaten im Log.
+                    </div>
+                  ) : null}
                   <div className="mix-strip-scroller">
                     <div className="mix-strip-ruler" aria-hidden="true">
                       <span className="mix-strip-ruler-item master">M</span>
@@ -9891,9 +10379,7 @@ export default function StuuShell() {
                           <span className="mix-strip-index">M</span>
                           <strong>Master</strong>
                         </div>
-                        <div className="mix-strip-meter">
-                          <div className="mix-strip-meter-fill" style={{ height: `${Math.round(mixMasterPeak * 100)}%` }} />
-                        </div>
+                        <LevelMeter variant="mix" value={mixMasterPeak} />
                         <div className="mix-strip-db">0.0 dB</div>
                         <div className="mix-strip-route">1-2</div>
                       </article>
@@ -9901,15 +10387,16 @@ export default function StuuShell() {
                       {mixTracks.map((track) => {
                         const trackMix = track.mix || createDefaultTrackMix(track.track_id);
                         const trackNodes = vstNodesByTrack.get(track.track_id) || [];
-                        const meterPeak = clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1);
+                        const hasClips = Array.isArray(track.clips) && track.clips.length > 0;
+                        const meterPeak = hasClips
+                          ? clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1)
+                          : 0;
                         const isSelected = track.track_id === mixSelectedTrackId;
-                        const visibleNodes = trackNodes.slice(0, MIXER_INSPECTOR_SLOT_COUNT);
-                        const overflowCount = Math.max(0, trackNodes.length - MIXER_INSPECTOR_SLOT_COUNT);
 
                         return (
                           <article
                             key={`mix_strip_${track.track_id}`}
-                            className={`mix-strip ${isSelected ? 'active' : ''}`}
+                            className={`mix-strip ${isSelected ? 'active' : ''} ${trackMix.mute ? 'track-muted' : ''} ${trackMix.solo ? 'track-soloed' : ''}`}
                             onClick={() => {
                               setTrackContextMenu(null);
                               setOpenTrackPluginPicker(null);
@@ -9933,14 +10420,12 @@ export default function StuuShell() {
                               <strong>{track.name || `Track ${track.track_id}`}</strong>
                             </div>
 
-                            <div className="mix-strip-meter">
-                              <div className="mix-strip-meter-fill" style={{ height: `${Math.round(meterPeak * 100)}%` }} />
-                            </div>
+                            <LevelMeter variant="mix" value={meterPeak} />
 
                             <div className="mix-strip-toggle-row">
                               <button
                                 type="button"
-                                className={`mute-toggle ${trackMix.mute ? 'active' : ''}`}
+                                className={mixStripToggleButtonClass('mute', trackMix.mute)}
                                 onClick={(event) => {
                                   event.stopPropagation();
                                   setMute(track.track_id, !trackMix.mute);
@@ -9952,7 +10437,7 @@ export default function StuuShell() {
                               </button>
                               <button
                                 type="button"
-                                className={trackMix.solo ? 'active' : ''}
+                                className={mixStripToggleButtonClass('solo', trackMix.solo)}
                                 onClick={(event) => {
                                   event.stopPropagation();
                                   setSolo(track.track_id, !trackMix.solo);
@@ -9964,7 +10449,7 @@ export default function StuuShell() {
                               </button>
                               <button
                                 type="button"
-                                className={`record-toggle ${trackMix.record_armed ? 'active' : ''}`}
+                                className={mixStripToggleButtonClass('record', trackMix.record_armed)}
                                 onClick={(event) => {
                                   event.stopPropagation();
                                   if (trackMix.record_armed) {
@@ -10011,624 +10496,119 @@ export default function StuuShell() {
                             </div>
                             <div className="mix-strip-db">{formatVolumeDbLabel(trackMix.volume)}</div>
 
-                            <div className="mix-strip-slot-row">
-                              {Array.from({ length: MIXER_INSPECTOR_SLOT_COUNT }, (_, slotIndex) => {
-                                const node = visibleNodes[slotIndex] || null;
-                                const bypassed = Boolean(node?.bypassed);
-                                const pluginDisplayName = node
-                                  ? resolveNodePluginDisplayName(node, pluginNameByUid)
-                                  : '';
-                                const pluginUiMeta = node
-                                  ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
-                                  : null;
-                                const slotTooltip = node
-                                  ? `Slot ${slotIndex + 1}: ${buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)}`
-                                  : `Slot ${slotIndex + 1} leer`;
-                                return (
-                                  <span
-                                    key={`mix_strip_slot_${track.track_id}_${slotIndex}`}
-                                    className={`mix-strip-slot-dot ${node ? 'filled' : ''} ${bypassed ? 'bypassed' : ''}`}
-                                    title={slotTooltip}
-                                  />
-                                );
-                              })}
-                              {overflowCount > 0 ? <span className="mix-strip-slot-overflow">+{overflowCount}</span> : null}
-                            </div>
+                            <MixStripChain
+                              trackId={track.track_id}
+                              trackNodes={trackNodes}
+                              chainEnabled={track.chain_enabled !== false}
+                              pluginNameByUid={pluginNameByUid}
+                              resolveNodePluginDisplayName={resolveNodePluginDisplayName}
+                              formatTrackChainPluginName={formatTrackChainPluginName}
+                              resolveTracktionPluginUiMeta={resolveTracktionPluginUiMeta}
+                              buildPluginHelpTooltip={buildPluginHelpTooltip}
+                              openTrackChainModalSlotPluginPicker={openTrackChainModalSlotPluginPicker}
+                              setInspector={setInspector}
+                              openVstNodeEditor={openVstNodeEditor}
+                              setVstNodeBypassed={setVstNodeBypassed}
+                              removeVstNode={removeVstNode}
+                              reorderTrackVstNodes={reorderTrackVstNodes}
+                            />
                           </article>
                         );
                       })}
                     </div>
                   </div>
-
-                  <aside className="mix-channel-inspector" data-track-plugin-picker-root="true">
-                    {mixSelectedTrack && mixSelectedTrackMix ? (
-                      <>
-                        <div className="mix-channel-inspector-head">
-                          <h3>{mixSelectedTrack.name || `Track ${mixSelectedTrack.track_id}`}</h3>
-                          <p>{`Track ${mixSelectedTrack.track_id} · Nodes ${mixSelectedTrackNodes.length}`}</p>
-                        </div>
-
-                        <div className="mix-channel-inspector-controls">
-                          <div className="mix-channel-toggle-row">
-                            <button
-                              type="button"
-                              className={`mute-toggle ${mixSelectedTrackMix.mute ? 'active' : ''}`}
-                              onClick={() => setMute(mixSelectedTrack.track_id, !mixSelectedTrackMix.mute)}
-                            >
-                              <TrackMixToggleIcon action="mute" active={mixSelectedTrackMix.mute} />
-                            </button>
-                            <button
-                              type="button"
-                              className={mixSelectedTrackMix.solo ? 'active' : ''}
-                              onClick={() => setSolo(mixSelectedTrack.track_id, !mixSelectedTrackMix.solo)}
-                            >
-                              <TrackMixToggleIcon action="solo" active={mixSelectedTrackMix.solo} />
-                            </button>
-                            <button
-                              type="button"
-                              className={`record-toggle ${mixSelectedTrackMix.record_armed ? 'active' : ''}`}
-                              onClick={() => {
-                                if (mixSelectedTrackMix.record_armed) {
-                                  setRecordArm(mixSelectedTrack.track_id, false);
-                                } else {
-                                  openRecordArmMicSelection(mixSelectedTrack.track_id);
-                                }
-                              }}
-                            >
-                              R
-                            </button>
-                            <button
-                              type="button"
-                              className={`mix-chain-enabled-toggle ${mixSelectedTrack.chain_enabled !== false ? 'active' : ''}`}
-                              onClick={() => setTrackChainEnabled(mixSelectedTrack.track_id, mixSelectedTrack.chain_enabled === false)}
-                              title={mixSelectedTrack.chain_enabled !== false ? 'Effektkette aus' : 'Effektkette ein'}
-                            >
-                              FX
-                            </button>
-                          </div>
-                          {(mixSelectedTrackMix.record_armed && (mixSelectedTrackMix.record_input_device_name || mixSelectedTrackMix.record_input_device_id)) ? (
-                            <div className="arrangement-track-mic-label mix-inspector-mic-label">Mikro: {mixSelectedTrackMix.record_input_device_name || mixSelectedTrackMix.record_input_device_id}</div>
-                          ) : null}
-
-                          <label className="mix-channel-field">
-                            VOL
-                            <div className="mix-channel-field-body">
-                              <input
-                                type="range"
-                                min={0}
-                                max={1.2}
-                                step={0.01}
-                                value={mixSelectedTrackMix.volume}
-                                onChange={(event) => setVolume(mixSelectedTrack.track_id, event.target.value)}
-                              />
-                              <input
-                                type="number"
-                                min={MIN_VOLUME_DB}
-                                max={MAX_VOLUME_DB}
-                                step={0.1}
-                                value={toVolumeDbInput(mixSelectedTrackMix.volume)}
-                                onChange={(event) => setVolumeDb(mixSelectedTrack.track_id, event.target.value)}
-                              />
-                              <span>dB</span>
-                            </div>
-                          </label>
-
-                          <label className="mix-channel-field">
-                            PAN
-                            <div className="mix-channel-field-body">
-                              <input
-                                type="range"
-                                min={-1}
-                                max={1}
-                                step={0.01}
-                                value={mixSelectedTrackMix.pan}
-                                onChange={(event) => setPan(mixSelectedTrack.track_id, event.target.value)}
-                              />
-                              <input
-                                type="number"
-                                min={0}
-                                max={100}
-                                step={1}
-                                value={toPanMagnitudePercent(mixSelectedTrackMix.pan)}
-                                onChange={(event) => setPanPercent(mixSelectedTrack.track_id, event.target.value, mixSelectedTrackMix.pan)}
-                              />
-                              <span>{getPanSideLabel(mixSelectedTrackMix.pan)}</span>
-                            </div>
-                          </label>
-                        </div>
-
-                        <div className="mix-channel-slots">
-                          {mixSelectedTrackSlots.map(({ slotIndex, node }) => {
-                            const hasNode = Boolean(node);
-                            const bypassed = Boolean(node?.bypassed);
-                            const pluginDisplayName = hasNode
-                              ? resolveNodePluginDisplayName(node, pluginNameByUid)
-                              : '';
-                            const pluginUiMeta = hasNode
-                              ? resolveTracktionPluginUiMeta(node?.plugin_uid, pluginDisplayName)
-                              : null;
-                            const SlotPluginIcon = pluginUiMeta?.icon || null;
-                            const slotTooltip = hasNode
-                              ? buildPluginHelpTooltip(pluginDisplayName, pluginUiMeta)
-                              : `Slot ${slotIndex + 1}: Plugin hinzufuegen`;
-                            return (
-                              <div
-                                key={`mix_channel_slot_${mixSelectedTrack.track_id}_${slotIndex}`}
-                                className={`mix-channel-slot ${hasNode ? 'filled' : 'empty'} ${bypassed ? 'bypassed' : ''}`}
-                                draggable={hasNode}
-                                onDragStart={(event) => {
-                                  if (!hasNode) {
-                                    return;
-                                  }
-                                  event.dataTransfer.effectAllowed = 'move';
-                                  event.dataTransfer.setData('text/plain', String(slotIndex));
-                                }}
-                                onDragOver={(event) => {
-                                  event.preventDefault();
-                                }}
-                                onDrop={(event) => {
-                                  event.preventDefault();
-                                  const sourceIndex = Number(event.dataTransfer.getData('text/plain'));
-                                  if (
-                                    !Number.isInteger(sourceIndex)
-                                    || sourceIndex < 0
-                                    || sourceIndex >= mixSelectedTrackNodes.length
-                                  ) {
-                                    return;
-                                  }
-                                  const targetIndex = clamp(slotIndex, 0, Math.max(0, mixSelectedTrackNodes.length - 1));
-                                  reorderTrackVstNodes(mixSelectedTrack.track_id, sourceIndex, targetIndex);
-                                }}
-                              >
-                                <span className="mix-channel-slot-index">{`Slot ${slotIndex + 1}`}</span>
-                                <button
-                                  type="button"
-                                  className="mix-channel-slot-main"
-                                  title={slotTooltip}
-                                  onClick={() => {
-                                    if (!hasNode) {
-                                      openTrackSlotPluginPicker(mixSelectedTrack.track_id, slotIndex, 'mix');
-                                      return;
-                                    }
-                                    setInspector({ type: 'node', nodeId: node.id });
-                                    openVstNodeEditor(node);
-                                  }}
-                                >
-                                  {hasNode ? (
-                                    <span className="plugin-name-with-icon wrap">
-                                      {SlotPluginIcon ? <SlotPluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
-                                      <span>{pluginDisplayName}</span>
-                                    </span>
-                                  ) : 'Leerer Slot'}
-                                </button>
-                                <div className="mix-channel-slot-actions">
-                                  {hasNode ? (
-                                    <>
-                                      <button
-                                        type="button"
-                                        className={`mix-channel-slot-bypass ${bypassed ? 'active' : ''}`}
-                                        onClick={() => setVstNodeBypassed(node, !bypassed)}
-                                        title={bypassed ? 'Bypass aus' : 'Bypass an'}
-                                      >
-                                        <TrackChainBypassIcon active={bypassed} />
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="mix-channel-slot-remove"
-                                        onClick={() => removeVstNode(node)}
-                                        title="Plugin entfernen"
-                                        aria-label="Plugin entfernen"
-                                      >
-                                        <Trash2 size={12} strokeWidth={2} aria-hidden="true" />
-                                      </button>
-                                    </>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      className="mix-channel-slot-add"
-                                      onClick={() => openTrackSlotPluginPicker(mixSelectedTrack.track_id, slotIndex, 'mix')}
-                                    >
-                                      +
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-
-                        <div className="mix-channel-inspector-footer">
-                          <button
-                            type="button"
-                            className="mix-channel-add-plugin"
-                            onClick={() => openTrackSlotPluginPicker(mixSelectedTrack.track_id, mixSelectedTrackNodes.length, 'mix')}
-                          >
-                            + Plugin
-                          </button>
-                          <button
-                            type="button"
-                            className="mix-channel-open-nodes"
-                            onClick={() => {
-                              setTrackChainModalTrackId(mixSelectedTrack.track_id);
-                              restoreFloatingWindow('trackChain');
-                            }}
-                          >
-                            Node Modal
-                          </button>
-                          {mixSelectedTrackSlotOverflow > 0 ? (
-                            <span className="mix-channel-slot-overflow">{`+${mixSelectedTrackSlotOverflow} weitere Slots`}</span>
-                          ) : null}
-                        </div>
-
-                        {mixPluginPickerOpen ? (
-                          <div className="mix-channel-plugin-picker" role="menu" aria-label="Plugin Auswahl">
-                            {availableEffectPlugins.length === 0 ? (
-                              <button
-                                type="button"
-                                className="mix-channel-plugin-picker-item muted"
-                                onClick={() => scanVstPlugins()}
-                              >
-                                {pluginScanPending ? 'Scanne Effekt-Plugins...' : 'Effekt-Plugins scannen'}
-                              </button>
-                            ) : availableEffectPlugins.map((plugin) => {
-                              const pluginUiMeta = resolveTracktionPluginUiMeta(plugin.uid, plugin.name);
-                              const PluginIcon = pluginUiMeta?.icon || null;
-                              const pluginTooltip = buildPluginHelpTooltip(plugin.name, pluginUiMeta);
-                              return (
-                                <button
-                                  key={`mix_channel_picker_${mixSelectedTrack.track_id}_${plugin.uid}`}
-                                  type="button"
-                                  className="mix-channel-plugin-picker-item"
-                                  title={pluginTooltip}
-                                  disabled={pluginLoadPending}
-                                  onClick={() => {
-                                    addVst({
-                                      trackId: mixSelectedTrack.track_id,
-                                      pluginUid: plugin.uid,
-                                      insertIndex: openTrackPluginPicker?.slotIndex,
-                                      slotKind: 'effect',
-                                      onSuccess: () => setOpenTrackPluginPicker(null),
-                                    });
-                                  }}
-                                >
-                                  <span className="plugin-name-with-icon truncate">
-                                    {PluginIcon ? <PluginIcon size={12} strokeWidth={2} aria-hidden="true" /> : null}
-                                    <span>{plugin.name}</span>
-                                  </span>
-                                  <small>{plugin.type}</small>
-                                </button>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                      </>
-                    ) : (
-                      <p className="muted">Kein Track fuer Mix-Ansicht verfuegbar.</p>
-                    )}
-                  </aside>
                 </div>
               ) : null}
-            </motion.section>
-          </AnimatePresence>
+          </section>
         </main>
 
-        <aside className="panel panel-inspector">
-          <div className="panel-header">Inspector</div>
-          <p className="muted">
-            {inspector.type === 'project' && 'Aktives Projekt'}
-            {inspector.type === 'track' && `Track #${inspector.trackId}`}
-            {inspector.type === 'clip' && `Clip ${inspector.clipId}`}
-            {inspector.type === 'node' && `Node ${inspector.nodeId}`}
-            {(inspector.type === 'pattern' || inspector.type === 'pattern-step') && `Pattern ${inspectorPattern?.id || ''}`}
-          </p>
-
-          {(inspector.type === 'pattern' || inspector.type === 'pattern-step') && inspectorPattern ? (
-            <div className="inspector-form">
-              <label>
-                Pattern
-                <select
-                  value={inspectorPattern.id}
-                  onChange={(event) => {
-                    setInspector({ type: 'pattern', patternId: event.target.value });
-                    setActivePatternId(event.target.value);
-                  }}
-                >
-                  {patterns.map((pattern) => (
-                    <option key={pattern.id} value={pattern.id}>
-                      {pattern.id} ({pattern.type})
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Laenge
-                <select
-                  value={inspectorPattern.length}
-                  onChange={(event) => updatePatternMeta(inspectorPattern.id, { length: Number(event.target.value) })}
-                >
-                  {[8, 16, 32, 64].map((value) => (
-                    <option key={`length_${value}`} value={value}>
-                      {value}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Swing ({Number(inspectorPattern.swing || 0).toFixed(2)})
-                <input
-                  type="range"
-                  min={0}
-                  max={0.75}
-                  step={0.01}
-                  value={inspectorPattern.swing || 0}
-                  onChange={(event) => updatePatternMeta(inspectorPattern.id, { swing: Number(event.target.value) })}
-                />
-              </label>
-
-              {inspector.type === 'pattern-step' ? (
-                <div className="inspector-step-block">
-                  <p>
-                    Step {(inspector.index || 0) + 1} · {inspector.lane}
-                  </p>
-                  <div className="step-velocity-buttons">
-                    <button
-                      className={(inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) === 0 ? 'active' : ''}
-                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 0)}
-                    >
-                      Off
-                    </button>
-                    <button
-                      className={Math.abs((inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) - 0.55) < 0.05 ? 'active' : ''}
-                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 0.55)}
-                    >
-                      Soft
-                    </button>
-                    <button
-                      className={Math.abs((inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) - 1) < 0.05 ? 'active' : ''}
-                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 1)}
-                    >
-                      Accent
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-
-          {inspector.type === 'track' && inspectorTrack ? (
-            <div className="inspector-summary">
-              <p>Name: {inspectorTrack.name}</p>
-              <p>Clips: {(inspectorTrack.clips || []).length}</p>
-            </div>
-          ) : null}
-
-          {inspector.type === 'clip' && inspectorClip ? (
-            <div className="inspector-summary">
-              <p>ID: {inspectorClip.id}</p>
-              <p>Start: {Number(inspectorClip.start || 0).toFixed(2)} Bar</p>
-              <p>Laenge: {Number(inspectorClip.length || 0).toFixed(2)} Bar</p>
-              <p>Pattern: {getPatternId(inspectorClip) || '-'}</p>
-            </div>
-          ) : null}
-
-          {inspector.type === 'node' && inspectorNode ? (
-            <div className="inspector-form">
-              <div className="inspector-summary">
-                <p>Typ: {inspectorNode.type}</p>
-                <p>Plugin: {inspectorNode.plugin || inspectorNode.plugin_uid || '-'}</p>
-                <p>UID: {inspectorNode.plugin_uid || '-'}</p>
-                <p>Track: {Number(inspectorNode.track_id ?? inspectorNode.trackId ?? 0) || '-'}</p>
-                <p>Index: {Number(inspectorNode.plugin_index ?? inspectorNode.pluginIndex ?? 0)}</p>
-              </div>
-
-              {inspectorNode.type === 'vst_instrument' ? (
-                inspectorTracktionEqUi ? (
-                  <div className="inspector-plugin-mode-shell">
-                    <div className="inspector-plugin-mode-tabs" role="tablist" aria-label="EQ Inspector Modus">
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={inspectorEqViewMode === 'easy'}
-                        className={inspectorEqViewMode === 'easy' ? 'active' : ''}
-                        onClick={() => setInspectorEqViewMode('easy')}
-                        disabled={!inspectorTracktionEqUi.gainParams}
-                      >
-                        Easy
-                      </button>
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={inspectorEqViewMode === 'pro'}
-                        className={inspectorEqViewMode === 'pro' ? 'active' : ''}
-                        onClick={() => setInspectorEqViewMode('pro')}
-                      >
-                        Pro
-                      </button>
-                    </div>
-
-                    {inspectorEqViewMode === 'easy' && inspectorTracktionEqUi.gainParams ? (
-                      <div className="inspector-eq-easy">
-                        <p className="inspector-eq-hint">
-                          Schnellstart fuer den Tracktion EQ: Preset klicken, dann mit 3 Reglern nach Gehoer anpassen.
-                        </p>
-
-                        {renderInspectorTracktionEqCurvePanel({ mode: 'easy', showBandButtons: true })}
-
-                        <div className="inspector-eq-preset-grid" role="group" aria-label="EQ Easy Presets">
-                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('clean_up')}>Clean Up</button>
-                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('vocal_clarity')}>Vocal Klarheit</button>
-                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('bass_tight')}>Bass Tight</button>
-                          <button type="button" onClick={() => applyInspectorTracktionEqPreset('air_brilliance')}>Air / Brillanz</button>
-                        </div>
-
-                        <button
-                          type="button"
-                          className="inspector-eq-reset-button"
-                          disabled={Boolean(inspectorTracktionEqUi?.isEffectivelyFlat)}
-                          onClick={() => applyInspectorTracktionEqPreset('flat')}
-                          title={
-                            inspectorTracktionEqUi?.isEffectivelyFlat
-                              ? 'EQ ist bereits praktisch flat'
-                              : 'Alle EQ-Gains auf 0 dB setzen'
-                          }
-                        >
-                          Reset EQ (Flat)
-                        </button>
-
-                        {[
-                          { id: 'mud', label: 'Weniger dumpf', value: inspectorTracktionEqUi.easyMacros.mud },
-                          { id: 'presence', label: 'Mehr Praesenz', value: inspectorTracktionEqUi.easyMacros.presence },
-                          { id: 'softness', label: 'Weicher', value: inspectorTracktionEqUi.easyMacros.softness },
-                        ].map((macro) => (
-                          <label key={`${inspectorNode.id}_${macro.id}`} className="inspector-eq-macro-row">
-                            <div className="inspector-eq-macro-row-head">
-                              <span>{macro.label}</span>
-                              <span>{formatInspectorEqMacroPercent(macro.value)}</span>
-                            </div>
-                            <input
-                              type="range"
-                              min={0}
-                              max={1}
-                              step={0.01}
-                              value={clamp(Number(macro.value) || 0, 0, 1)}
-                              onChange={(event) => setInspectorTracktionEqEasyMacro(macro.id, Number(event.target.value))}
-                            />
-                          </label>
-                        ))}
-
-                        <p className="muted inspector-eq-footnote">
-                          Easy im Inspector arbeitet mit schnellen Gain-Makros. Fuer Frequenz/Q direkt auf Pro wechseln oder das Plugin-Fenster oeffnen.
-                        </p>
-                      </div>
-                    ) : (
-                      <>
-                        {inspectorEqViewMode === 'easy' && !inspectorTracktionEqUi.gainParams ? (
-                          <p className="muted inspector-eq-footnote">
-                            Easy-Mapping fuer diesen EQ wurde nicht erkannt. Pro zeigt alle Parameter.
-                          </p>
-                        ) : null}
-                        {inspectorEqViewMode === 'pro'
-                          ? renderInspectorTracktionEqCurvePanel({ mode: 'pro', showBandButtons: false })
-                          : null}
-                        {inspectorEqViewMode === 'pro' && inspectorTracktionEqSelectedBand ? (
-                          <div className="inspector-eq-pro-focus">
-                            <strong>{`Band Fokus: ${inspectorTracktionEqSelectedBand.label}`}</strong>
-                            <span>
-                              {`${formatTracktionEqInspectorReadoutFreq(inspectorTracktionEqSelectedBand.freqHz)} · ${formatTracktionEqInspectorReadoutDb(inspectorTracktionEqSelectedBand.gainDb)} · ${formatTracktionEqInspectorReadoutQ(inspectorTracktionEqSelectedBand.qValue)}`}
-                            </span>
-                            <small>Freq / Gain / Q dieses Bands sind unten hervorgehoben.</small>
-                          </div>
-                        ) : null}
-                        <div className="vst-param-list">
-                          {inspectorNodeParameters.length > 0 ? (
-                            inspectorNodeParameters.map((parameter) => {
-                              const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
-                              const linkedBand = inspectorEqViewMode === 'pro'
-                                ? (inspectorTracktionEqBandByParamId.get(parameter.id) || null)
-                                : null;
-                              const isLinkedBandParam = Boolean(linkedBand);
-                              const isSelectedBandParam = inspectorEqViewMode === 'pro'
-                                && inspectorTracktionEqSelectedBandParamIdSet.has(parameter.id);
-                              return (
-                                <label
-                                  key={`${inspectorNode.id}_${parameter.id}`}
-                                  className={`vst-param-row ${isLinkedBandParam ? 'band-linked-param' : ''} ${isSelectedBandParam ? 'selected-band-param' : ''}`}
-                                  ref={(element) => registerInspectorEqProParamRowRef(parameter.id, element)}
-                                  onClick={() => {
-                                    if (linkedBand?.id) {
-                                      selectInspectorTracktionEqBand(linkedBand.id);
-                                    }
-                                  }}
-                                  onPointerEnter={() => {
-                                    if (linkedBand) {
-                                      previewInspectorTracktionEqBandHover(linkedBand);
-                                    }
-                                  }}
-                                  onPointerLeave={() => {
-                                    if (linkedBand) {
-                                      clearInspectorTracktionEqCurveHover();
-                                    }
-                                  }}
-                                  onFocus={() => {
-                                    if (linkedBand) {
-                                      previewInspectorTracktionEqBandHover(linkedBand);
-                                    }
-                                  }}
-                                  onBlur={() => {
-                                    if (linkedBand) {
-                                      clearInspectorTracktionEqCurveHover();
-                                    }
-                                  }}
-                                  title={linkedBand?.label ? `Band ${linkedBand.label}` : undefined}
-                                >
-                                  <div className="vst-param-head">
-                                    <span className="vst-param-head-name">
-                                      <span>{parameter.name}</span>
-                                      {linkedBand ? (
-                                        <em className={`vst-param-band-chip ${isSelectedBandParam ? 'active' : ''}`}>{linkedBand.label}</em>
-                                      ) : null}
-                                    </span>
-                                    <span>{normalizedValue.toFixed(2)}</span>
-                                  </div>
-                                  <input
-                                    type="range"
-                                    min={0}
-                                    max={1}
-                                    step={0.01}
-                                    value={normalizedValue}
-                                    onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
-                                  />
-                                </label>
-                              );
-                            })
-                          ) : (
-                            <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
-                          )}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                ) : (
-                  <div className="vst-param-list">
-                    {inspectorNodeParameters.length > 0 ? (
-                      inspectorNodeParameters.map((parameter) => {
-                        const normalizedValue = clamp(Number(parameter.value) || 0, 0, 1);
-                        return (
-                          <label key={`${inspectorNode.id}_${parameter.id}`} className="vst-param-row">
-                            <div className="vst-param-head">
-                              <span>{parameter.name}</span>
-                              <span>{normalizedValue.toFixed(2)}</span>
-                            </div>
-                            <input
-                              type="range"
-                              min={0}
-                              max={1}
-                              step={0.01}
-                              value={normalizedValue}
-                              onChange={(event) => setVstNodeParameter(inspectorNode, parameter.id, Number(event.target.value))}
-                            />
-                          </label>
-                        );
-                      })
-                    ) : (
-                      <p className="muted">Keine automatisierbaren Parameter gefunden.</p>
-                    )}
-                  </div>
-                )
-              ) : (
-                <pre>{JSON.stringify(inspectorNode, null, 2)}</pre>
-              )}
-            </div>
-          ) : null}
-
-          {inspector.type === 'project' ? (
-            <pre>{JSON.stringify(state?.project, null, 2)}</pre>
-          ) : null}
-        </aside>
       </div>
     </div>
+    {aiChatDrawerOpen ? (
+      <div className="ai-chat-drawer-root" role="complementary" aria-label="Seitenpanel">
+        <aside className="ai-chat-drawer panel panel-chat">
+          <div className="panel-header ai-chat-drawer-header">
+            <div className="ai-chat-drawer-tabs" role="tablist" aria-label="Panel Tabs">
+              <button
+                type="button"
+                role="tab"
+                id="side-panel-tab-assistant"
+                aria-selected={sidePanelTab === 'assistant'}
+                aria-controls="side-panel-assistant"
+                className={`ai-chat-drawer-tab ${sidePanelTab === 'assistant' ? 'is-active' : ''}`}
+                onClick={() => setSidePanelTab('assistant')}
+              >
+                Assistant
+              </button>
+              <button
+                type="button"
+                role="tab"
+                id="side-panel-tab-inspector"
+                aria-selected={sidePanelTab === 'inspector'}
+                aria-controls="side-panel-inspector"
+                className={`ai-chat-drawer-tab ${sidePanelTab === 'inspector' ? 'is-active' : ''}`}
+                onClick={() => setSidePanelTab('inspector')}
+              >
+                Inspector
+              </button>
+            </div>
+            <button
+              type="button"
+              className="ai-chat-drawer-close"
+              onClick={() => setAiChatDrawerOpen(false)}
+              aria-label="Seitenpanel schließen"
+              title="Schließen (Esc)"
+            >
+              <X size={14} aria-hidden="true" />
+            </button>
+          </div>
+          {sidePanelTab === 'assistant' ? (
+            <div
+              id="side-panel-assistant"
+              className="ai-chat-drawer-assistant"
+              role="tabpanel"
+              aria-labelledby="side-panel-tab-assistant"
+            >
+              <div className="chat-list">
+                {chatMessages.map((message, index) => (
+                  <div key={`${message.role}_${index}`} className={`chat-bubble chat-${message.role}`}>
+                    <strong>{message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Stuu' : 'System'}:</strong>{' '}
+                    {message.text}
+                  </div>
+                ))}
+              </div>
+              <form className="chat-form" onSubmit={submitChat}>
+                <input
+                  value={chatInput}
+                  onChange={(event) => setChatInput(event.target.value)}
+                  placeholder="Prompt an Stuu..."
+                />
+                <button
+                  type="button"
+                  className={`chat-form-speech-btn${speechListening ? ' is-listening' : ''}`}
+                  aria-label="Spracheingabe"
+                  title={speechListening ? 'Diktat beenden' : 'Diktat starten'}
+                  aria-pressed={speechListening}
+                  onClick={toggleSpeechRecognition}
+                >
+                  <Mic size={16} aria-hidden="true" />
+                </button>
+                <button type="submit">Send</button>
+              </form>
+            </div>
+          ) : (
+            <div
+              id="side-panel-inspector"
+              className="panel-inspector ai-chat-drawer-inspector-body"
+              role="tabpanel"
+              aria-labelledby="side-panel-tab-inspector"
+            >
+              {renderInspectorPanelBody()}
+            </div>
+          )}
+        </aside>
+      </div>
+    ) : null}
     {(() => {
       const minimizedWindowIds = ['trackChain', 'settings', 'recordMic', 'importTrackRename']
         .filter((windowId) => isFloatingWindowOpen(windowId) && isFloatingWindowMinimized(windowId))

@@ -5478,6 +5478,137 @@ tracktion::engine::AudioTrack* getAudioTrackByIndex(int32_t trackId) {
   return tracks[index];
 }
 
+namespace {
+
+struct TrackMeterSlot {
+  tracktion::engine::LevelMeasurer::Client client;
+  tracktion::engine::LevelMeasurer* attachedTo = nullptr;
+};
+
+/** unique_ptr: LevelMeasurer::Client is not move-insertable in std::vector (libc++ resize). */
+std::vector<std::unique_ptr<TrackMeterSlot>> gTrackMeterSlots;
+
+void detachTrackMeterSlot(TrackMeterSlot& slot) {
+  if (slot.attachedTo != nullptr) {
+    slot.attachedTo->removeClient(slot.client);
+    slot.attachedTo = nullptr;
+  }
+}
+
+static void ensureTrackMeterSlotCount(size_t count) {
+  while (gTrackMeterSlots.size() > count) {
+    detachTrackMeterSlot(*gTrackMeterSlots.back());
+    gTrackMeterSlots.pop_back();
+  }
+  while (gTrackMeterSlots.size() < count) {
+    gTrackMeterSlots.push_back(std::make_unique<TrackMeterSlot>());
+  }
+}
+
+void clearTrackMeterSlots() {
+  for (auto& slotPtr : gTrackMeterSlots) {
+    if (slotPtr) {
+      detachTrackMeterSlot(*slotPtr);
+    }
+  }
+  gTrackMeterSlots.clear();
+}
+
+float dbToMeterLinear(float dB) {
+  if (!std::isfinite(dB) || dB <= -99.0f) {
+    return 0.0f;
+  }
+  return juce::jlimit(0.0f, 1.0f, std::pow(10.0f, dB / 20.0f));
+}
+
+bool pollTransportMeterLevels(std::vector<TrackMeterLevels>& out, int32_t trackCount, std::string& error) {
+  out.clear();
+  error.clear();
+  if (trackCount <= 0) {
+    return true;
+  }
+  if (!gState || !gState->edit) {
+    clearTrackMeterSlots();
+    out.assign(static_cast<size_t>(trackCount), {});
+    return true;
+  }
+
+  ensureTrackMeterSlotCount(static_cast<size_t>(trackCount));
+
+  out.resize(static_cast<size_t>(trackCount));
+  auto tracks = tracktion::engine::getAudioTracks(*gState->edit);
+  const int numTracks = static_cast<int>(tracks.size());
+  const int n = std::min(static_cast<int>(trackCount), numTracks);
+
+  for (int i = 0; i < n; ++i) {
+    auto* track = tracks[static_cast<size_t>(i)];
+    TrackMeterSlot& slot = *gTrackMeterSlots[static_cast<size_t>(i)];
+    tracktion::engine::LevelMeasurer* measurer = nullptr;
+    if (track != nullptr) {
+      if (track->getLevelMeterPlugin() == nullptr && track->pluginList.canInsertPlugin()) {
+        track->pluginList.insertPlugin(tracktion::engine::LevelMeterPlugin::create(), -1);
+      }
+      if (auto* lmp = track->getLevelMeterPlugin()) {
+        measurer = &lmp->measurer;
+      }
+    }
+    if (measurer != slot.attachedTo) {
+      detachTrackMeterSlot(slot);
+      if (measurer != nullptr) {
+        measurer->addClient(slot.client);
+        slot.attachedTo = measurer;
+      }
+    }
+    float peakLin = 0.f;
+    float rmsLin = 0.f;
+    if (measurer != nullptr && slot.attachedTo != nullptr) {
+      const auto left = slot.client.getAndClearAudioLevel(0);
+      const auto right = slot.client.getAndClearAudioLevel(1);
+      const float l = dbToMeterLinear(left.dB);
+      const float r = dbToMeterLinear(right.dB);
+      peakLin = juce::jmax(l, r);
+      rmsLin = std::sqrt(0.5f * (l * l + r * r));
+    }
+    out[static_cast<size_t>(i)] = { peakLin, rmsLin };
+  }
+  for (int i = n; i < trackCount; ++i) {
+    detachTrackMeterSlot(*gTrackMeterSlots[static_cast<size_t>(i)]);
+    out[static_cast<size_t>(i)] = {};
+  }
+  return true;
+}
+
+}  // namespace
+
+bool getTransportMeterLevels(std::vector<TrackMeterLevels>& out, int32_t trackCount, std::string& error) {
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return pollTransportMeterLevels(out, trackCount, error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = pollTransportMeterLevels(out, trackCount, error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  if (!cv.wait_for(lock, std::chrono::milliseconds(500), [&]() { return done.load(); })) {
+    error = "transport meter poll timed out";
+    return false;
+  }
+  return ok;
+}
+
 /** Prefer a wave input that looks like a built-in/mac mic (MacBook Pro Microphone etc.). */
 static bool isLikelyBuiltInMic(const juce::String& name) {
   const juce::String lower = name.toLowerCase();
@@ -5749,6 +5880,7 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
 }
 
 void shutdownBackend() {
+  clearTrackMeterSlots();
   if (gState && gState->engine && gState->spectrumAnalyzerTap) {
     gState->engine->getDeviceManager().deviceManager.removeAudioCallback(gState->spectrumAnalyzerTap.get());
   }
@@ -5765,6 +5897,7 @@ bool resetDefaultEdit(int32_t trackCount, std::string& error) {
     if (!createDefaultEditOnMessageThread(safeTrackCount, error)) {
       return false;
     }
+    clearTrackMeterSlots();
     disablePhysicalWaveInputsMonitoring();
     gState->parameterCacheByUid.clear();
     error.clear();
