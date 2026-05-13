@@ -1,5 +1,7 @@
 const SUPPORTED_VERSION = '1.0.0-alpha';
 const GRID_STEP = 1 / 16;
+/** Playlist clip start/length: match engine fine split grid so save/load does not coarsen to 1/16. */
+const CLIP_TIMELINE_GRID_STEP = 1 / 1024;
 const DEFAULT_PATTERN_LENGTH = 16;
 const DEFAULT_DRUM_LANES = ['Kick', 'Snare', 'CH', 'OH', 'Clap'];
 const DEFAULT_PLAYLIST_VIEW_BARS = 32;
@@ -249,8 +251,8 @@ function normalizePattern(pattern, index = 0) {
 function normalizeClip(clip, trackId, clipIndex) {
   const safeClip = isObject(clip) ? clip : {};
   const id = isNonEmptyString(safeClip.id) ? safeClip.id.trim() : `clip_${trackId}_${clipIndex + 1}`;
-  const start = Math.max(0, roundToStep(asNumber(safeClip.start, 0)));
-  const length = Math.max(GRID_STEP, roundToStep(asNumber(safeClip.length, 1)));
+  const start = Math.max(0, roundToStep(asNumber(safeClip.start, 0), CLIP_TIMELINE_GRID_STEP));
+  const length = Math.max(CLIP_TIMELINE_GRID_STEP, roundToStep(asNumber(safeClip.length, 1), CLIP_TIMELINE_GRID_STEP));
   const patternId = getClipPatternId(safeClip);
   const sourceNameRaw = safeClip.source_name ?? safeClip.sourceName ?? safeClip.file_name ?? safeClip.fileName ?? safeClip.filename ?? safeClip.name;
   const sourceName = isNonEmptyString(sourceNameRaw) ? sourceNameRaw.trim().slice(0, 255) : '';
@@ -277,6 +279,19 @@ function normalizeClip(clip, trackId, clipIndex) {
   const sourcePathRaw = safeClip.source_path ?? safeClip.sourcePath ?? safeClip.file_path ?? safeClip.filePath;
   const sourcePath = isNonEmptyString(sourcePathRaw) ? sourcePathRaw.trim() : '';
 
+  let trimStartSeconds = null;
+  if (!patternId && clipType === 'audio') {
+    const rawTrim = safeClip.trim_start_seconds ?? safeClip.trimStartSeconds;
+    if (rawTrim !== undefined && rawTrim !== null && String(rawTrim).trim() !== '') {
+      const t = asNumber(rawTrim, NaN);
+      if (Number.isFinite(t) && t >= 0) {
+        trimStartSeconds = sourceDurationSeconds !== null
+          ? clamp(t, 0, Math.max(0, sourceDurationSeconds - 1e-9))
+          : t;
+      }
+    }
+  }
+
   return {
     id,
     start,
@@ -290,6 +305,7 @@ function normalizeClip(clip, trackId, clipIndex) {
     ...(sourceDurationSeconds !== null ? { source_duration_seconds: sourceDurationSeconds } : {}),
     ...(waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
     ...(sourcePath ? { source_path: sourcePath } : {}),
+    ...(trimStartSeconds !== null ? { trim_start_seconds: Number(trimStartSeconds.toFixed(6)) } : {}),
   };
 }
 
@@ -609,6 +625,19 @@ function validatePlaylist(playlist, patternIds, errors) {
 
       if (clip.source_duration_seconds !== undefined && (!Number.isFinite(clip.source_duration_seconds) || clip.source_duration_seconds <= 0)) {
         errors.push(`playlist[${trackIndex}].clips[${clipIndex}].source_duration_seconds must be > 0`);
+      }
+
+      if (clip.trim_start_seconds !== undefined) {
+        if (!Number.isFinite(clip.trim_start_seconds) || clip.trim_start_seconds < 0) {
+          errors.push(`playlist[${trackIndex}].clips[${clipIndex}].trim_start_seconds must be a non-negative number`);
+        } else if (
+          clip.source_duration_seconds !== undefined
+          && Number.isFinite(clip.source_duration_seconds)
+          && clip.source_duration_seconds > 0
+          && clip.trim_start_seconds >= clip.source_duration_seconds
+        ) {
+          errors.push(`playlist[${trackIndex}].clips[${clipIndex}].trim_start_seconds must be < source_duration_seconds`);
+        }
       }
 
       if (clip.waveform_peaks !== undefined) {

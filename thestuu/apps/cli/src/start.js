@@ -414,7 +414,7 @@ async function ensureHomeFiles(stuuHome, requestedProject) {
           default_project: projectName,
           audio: {
             sample_rate: 48000,
-            buffer_size: 256,
+            buffer_size: 512,
           },
         },
         null,
@@ -603,9 +603,11 @@ export async function runStartCommand(options) {
   const dashboardEnv = {
     ...commonEnv,
     PORT: String(options.port),
-    HOSTNAME: host,
     NEXT_PUBLIC_ENGINE_URL: `http://${host}:${options.enginePort}`,
   };
+  // Next binds to process.env.HOSTNAME if present (macOS often sets it to the machine name).
+  // Never force 127.0.0.1 here: browsers may open http://localhost → IPv6 ::1 and get ERR_CONNECTION_REFUSED (-102).
+  delete dashboardEnv.HOSTNAME;
   const dashboardLockPath = path.join(repoRoot, 'apps', 'dashboard', '.next', 'dev', 'lock');
   let dashboardMode = 'spawned';
   let dashboardChild = null;

@@ -1233,6 +1233,7 @@ body {
 }
 
 .arrangement-track-meter {
+  position: relative;
   width: 4px;
   height: 22px;
   border-radius: 2px;
@@ -1248,8 +1249,20 @@ body {
   width: 100%;
   border-radius: 1px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(212, 212, 216, 0.85));
-  transition: height 0.06s ease-out;
   min-height: 0;
+}
+
+/* FL-style meters: height driven by LevelMeter RAF ballistics (no CSS transition). */
+.level-meter-peak-hold {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  transform: translateY(50%);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 3px rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+  z-index: 2;
 }
 
 .arrangement-track-meter-fill--graded {
@@ -3855,15 +3868,18 @@ body {
   position: relative;
 }
 
+/* Edge-to-edge waveform; resize handles sit on top (z-index) so no empty gutter at clip edges */
 .timeline-clip.clip-type-audio .timeline-clip-waveform {
   top: 2px;
-  right: 10px;
+  right: 0;
   bottom: 2px;
-  left: 2px;
+  left: 0;
 }
 
-.timeline-clip.clip-type-audio .clip-resize-handle {
-  top: auto;
+.timeline-clip.clip-type-audio .clip-resize-handle-left,
+.timeline-clip.clip-type-audio .clip-resize-handle-right {
+  top: 2px;
+  bottom: 2px;
 }
 
 .timeline-clip.clip-type-midi {
@@ -4434,12 +4450,22 @@ body {
 .clip-resize-handle {
   position: absolute;
   z-index: 3;
-  right: 0;
   top: 0;
   bottom: 0;
   width: 10px;
   cursor: ew-resize;
+  pointer-events: auto;
+}
+
+.clip-resize-handle-right {
+  right: 0;
   border-left: 1px solid rgba(255, 255, 255, 0.38);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0));
+}
+
+.clip-resize-handle-left {
+  left: 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.38);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0));
 }
 
@@ -4775,7 +4801,8 @@ body {
 
 .mix-strip-pan {
   display: grid;
-  gap: 2px;
+  gap: 4px;
+  min-width: 0;
 }
 
 .mix-strip-pan > span {
@@ -4785,15 +4812,36 @@ body {
   text-transform: uppercase;
 }
 
-.mix-strip-pan > input {
+.mix-strip-pan .arrangement-track-pan-range {
   width: 100%;
-  margin: 0;
+  min-width: 0;
 }
 
-.mix-strip-pan > strong {
+.mix-strip-pan-value-edit {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  gap: 6px;
+}
+
+.mix-strip-pan-value-side {
+  flex: 0 0 14px;
+  width: 14px;
+  text-align: center;
+  font-size: 0.56rem;
   font-family: var(--font-mono), monospace;
-  font-size: 0.58rem;
-  color: rgba(248, 248, 251, 0.9);
+  color: rgba(245, 245, 248, 0.86);
+  line-height: 1.2;
+}
+
+.mix-strip-pan-value-edit .arrangement-track-value-input {
+  width: 36px;
+  min-width: 36px;
+  max-width: 36px;
+  flex: 0 0 auto;
   text-align: center;
 }
 
@@ -4830,6 +4878,42 @@ body {
   font-size: 0.58rem;
   text-align: center;
   color: rgba(244, 244, 248, 0.86);
+}
+
+.mix-strip-db-editable {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: 100%;
+  min-height: 14px;
+  margin: 0 auto;
+  justify-self: center;
+}
+
+.mix-strip-db-inner {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: baseline;
+  justify-content: center;
+  gap: 3px;
+  margin: 0 auto;
+}
+
+.mix-strip-db-editable .mix-strip-db-input {
+  width: 3.5rem;
+  min-width: 0;
+  max-width: 4.75rem;
+  text-align: center;
+  padding: 0 1px;
+}
+
+.mix-strip-db-suffix {
+  flex: 0 0 auto;
+  font-family: var(--font-mono), monospace;
+  font-size: 0.58rem;
+  color: rgba(244, 244, 248, 0.78);
 }
 
 .mix-strip-route {

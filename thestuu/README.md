@@ -108,14 +108,14 @@ Die CLI:
 - erstellt `welcome.stu`, falls noch nicht vorhanden,
 - baut/startet Native Engine,
 - startet Engine auf `127.0.0.1:3987`,
-- startet Dashboard auf `127.0.0.1:3000`,
+- startet Dashboard auf `127.0.0.1:3010`,
 - oeffnet den Browser (wenn nicht deaktiviert).
 
 ## Bedienanleitung
 
 ### 1) Projekt starten
 1. `npm run start` ausfuehren.
-2. Im Browser das Dashboard oeffnen (`http://127.0.0.1:3000`).
+2. Im Browser das Dashboard oeffnen (`http://127.0.0.1:3010`).
 
 ### 2) Audio/MIDI importieren
 1. Im Edit-Tab Clip-Import verwenden.
@@ -154,7 +154,7 @@ npx thestuu start
 Typische Optionen:
 
 ```bash
-npx thestuu start --port 3000 --engine-port 3987 --no-browser
+npx thestuu start --port 3010 --engine-port 3987 --no-browser
 ```
 
 Native deaktivieren:

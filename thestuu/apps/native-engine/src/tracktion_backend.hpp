@@ -8,7 +8,7 @@ namespace thestuu::native {
 
 struct BackendConfig {
   double sampleRate = 48000.0;
-  int bufferSize = 256;
+  int bufferSize = 512;
 };
 
 struct BackendRuntimeInfo {

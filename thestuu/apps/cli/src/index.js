@@ -8,7 +8,7 @@ Usage:
   thestuu start [options]
 
 Options:
-  --port <number>         Dashboard port (default: 3000)
+  --port <number>         Dashboard port (default: 3010)
   --engine-port <number>  Engine port (default: 3990)
   --project <name>        Project filename in ~/.thestuu/projects
   --native-backend <id>   Native backend: tracktion (erforderlich)
@@ -22,7 +22,7 @@ Options:
 
 function parseArgs(argv) {
   const options = {
-    port: 3000,
+    port: 3010,
     enginePort: 3990,
     browser: true,
     project: 'welcome.stu',

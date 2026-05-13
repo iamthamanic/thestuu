@@ -34,7 +34,7 @@ struct BackendState {
   std::unique_ptr<tracktion::engine::Engine> engine;
   std::unique_ptr<tracktion::engine::Edit> edit;
   double sampleRate = 48000.0;
-  int bufferSize = 256;
+  int bufferSize = 512;
   std::unordered_map<std::string, juce::PluginDescription> pluginByUid;
   std::unordered_map<std::string, std::vector<PluginParameterInfo>> parameterCacheByUid;
   std::unique_ptr<GlobalSpectrumAnalyzerTap> spectrumAnalyzerTap;
@@ -5839,7 +5839,7 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
   try {
     gState = std::make_unique<BackendState>();
     gState->sampleRate = std::isfinite(config.sampleRate) && config.sampleRate > 0.0 ? config.sampleRate : 48000.0;
-    gState->bufferSize = config.bufferSize > 0 ? config.bufferSize : 256;
+    gState->bufferSize = config.bufferSize > 0 ? config.bufferSize : 512;
 
     gState->juce = std::make_unique<juce::ScopedJuceInitialiser_GUI>();
     gState->engine = std::make_unique<tracktion::engine::Engine>(
@@ -5852,6 +5852,22 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
 
     auto& deviceManager = gState->engine->getDeviceManager();
     deviceManager.initialise(2, 2);
+    {
+      auto& juceDm = deviceManager.deviceManager;
+      juce::AudioDeviceManager::AudioDeviceSetup setup = juceDm.getAudioDeviceSetup();
+      const int desired = gState->bufferSize;
+      if (desired > 0 && setup.bufferSize != desired) {
+        setup.bufferSize = desired;
+        const juce::String setupErr = juceDm.setAudioDeviceSetup(setup, true);
+        if (setupErr.isNotEmpty()) {
+          std::fprintf(
+            stderr,
+            "[thestuu-native] note: audio buffer size %d not applied: %s\n",
+            desired,
+            setupErr.toRawUTF8());
+        }
+      }
+    }
     gState->spectrumAnalyzerTap = std::make_unique<GlobalSpectrumAnalyzerTap>();
     deviceManager.deviceManager.addAudioCallback(gState->spectrumAnalyzerTap.get());
     disablePhysicalWaveInputsMonitoring();

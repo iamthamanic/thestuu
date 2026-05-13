@@ -26,6 +26,12 @@ const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
 /** Opt-in only: fake random meter motion when Native has no transport.get_meters. Default off — meters stay at 0 until Native is rebuilt. */
 const meterUiFallbackEnabled = process.env.STUU_METER_UI_FALLBACK === '1';
+/** Socket `engine:meter` poll interval (native `transport.get_meters`). Default 50 (~20 Hz); lowers JUCE/message-thread load vs 30 Hz (reduces crackle under load). Override: STUU_METER_INTERVAL_MS. */
+const meterIntervalMsRaw = Number(process.env.STUU_METER_INTERVAL_MS);
+const engineMeterIntervalMs =
+  Number.isFinite(meterIntervalMsRaw) && meterIntervalMsRaw >= 16
+    ? Math.min(500, Math.round(meterIntervalMsRaw))
+    : 50;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const engineDir = path.resolve(__dirname, '..');
@@ -941,6 +947,21 @@ function roundToGrid(value, step = GRID_STEP) {
   }
   const snapped = Math.round(value / step) * step;
   return Number(snapped.toFixed(6));
+}
+
+/** Optional finer grid (e.g. dashboard Free snap 1/256) so resize/import match client split. */
+const MIN_CLIP_QUANTIZE_STEP = 1 / 1024;
+const MAX_CLIP_QUANTIZE_STEP = 4;
+
+function resolveClipQuantizeStep(payload = {}) {
+  if (!payload || typeof payload !== 'object') {
+    return GRID_STEP;
+  }
+  const raw = Number(payload.grid_step ?? payload.gridStep);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return GRID_STEP;
+  }
+  return clamp(raw, MIN_CLIP_QUANTIZE_STEP, MAX_CLIP_QUANTIZE_STEP);
 }
 
 function makeId(prefix) {
@@ -2056,6 +2077,31 @@ function getLeadingSilenceOffsetSeconds(peaks, durationSeconds, threshold = 0.02
   return 0;
 }
 
+function clipHasExplicitTrimStart(clip) {
+  return Boolean(
+    clip
+    && typeof clip === 'object'
+    && Object.prototype.hasOwnProperty.call(clip, 'trim_start_seconds')
+    && Number.isFinite(Number(clip.trim_start_seconds)),
+  );
+}
+
+async function resolveAudioSourceOffsetSeconds(clip, waveformPeaks, lengthSeconds, pathToSend, fileReadable, isWav) {
+  const sourceDur = Number(clip?.source_duration_seconds ?? clip?.sourceDurationSeconds);
+  const peakDurationSec = Number.isFinite(sourceDur) && sourceDur > 0 ? sourceDur : lengthSeconds;
+  const peakLead = getLeadingSilenceOffsetSeconds(waveformPeaks, peakDurationSec);
+
+  if (clipHasExplicitTrimStart(clip)) {
+    const explicit = Math.max(0, Number(clip.trim_start_seconds) || 0);
+    return Math.max(explicit, peakLead);
+  }
+  let sourceOffsetSeconds = peakLead;
+  if (sourceOffsetSeconds === 0 && !isWav && fileReadable) {
+    sourceOffsetSeconds = await computeLeadingSilenceFromFile(pathToSend);
+  }
+  return sourceOffsetSeconds;
+}
+
 /** Max file size (bytes) for fallback leading-silence detection from file. */
 const MAX_FILE_SIZE_FOR_LEADING_SILENCE = 25 * 1024 * 1024;
 
@@ -2217,7 +2263,20 @@ async function syncPlaylistClipsToNative() {
       const fadeInCurve = normalizeFadeCurve(clip.fade_in_curve ?? clip.fadeInCurve);
       const fadeOutCurve = normalizeFadeCurve(clip.fade_out_curve ?? clip.fadeOutCurve);
       const waveform_peaks = Array.isArray(clip.waveform_peaks) ? clip.waveform_peaks : (Array.isArray(clip.waveformPeaks) ? clip.waveformPeaks : null);
-      clipsToSync.push({ trackId, clipId: clip.id, clipName: clip.source_name || clip.id, sourcePath, start, length, fade_in: fadeIn, fade_out: fadeOut, fade_in_curve: fadeInCurve, fade_out_curve: fadeOutCurve, waveform_peaks });
+      clipsToSync.push({
+        trackId,
+        clipId: clip.id,
+        clipName: clip.source_name || clip.id,
+        sourcePath,
+        clip,
+        start,
+        length,
+        fade_in: fadeIn,
+        fade_out: fadeOut,
+        fade_in_curve: fadeInCurve,
+        fade_out_curve: fadeOutCurve,
+        waveform_peaks,
+      });
     }
   }
 
@@ -2231,7 +2290,20 @@ async function syncPlaylistClipsToNative() {
 
   const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
   // All supported audio formats (wav, flac, mp3, ogg, aac, aiff, aif) use the same sync: start/length in bars → start_seconds/length_seconds.
-  for (const { trackId, clipId, clipName, sourcePath, start, length, fade_in: fadeIn, fade_out: fadeOut, fade_in_curve: fadeInCurve, fade_out_curve: fadeOutCurve, waveform_peaks } of clipsToSync) {
+  for (const {
+    trackId,
+    clipId,
+    clipName,
+    sourcePath,
+    clip,
+    start,
+    length,
+    fade_in: fadeIn,
+    fade_out: fadeOut,
+    fade_in_curve: fadeInCurve,
+    fade_out_curve: fadeOutCurve,
+    waveform_peaks,
+  } of clipsToSync) {
     let pathToSend = sourcePath;
     if (path.isAbsolute(sourcePath)) {
       try {
@@ -2262,15 +2334,16 @@ async function syncPlaylistClipsToNative() {
       }
       const fade_in = Number.isFinite(fadeIn) && fadeIn >= 0 ? fadeIn : 0;
       const fade_out = Number.isFinite(fadeOut) && fadeOut >= 0 ? fadeOut : 0;
-      let source_offset_seconds = getLeadingSilenceOffsetSeconds(waveform_peaks, length_seconds);
-      // Fallback: when peak-based offset is 0, detect from file for non-WAV formats only.
-      // For WAV we do not use file-based leading-silence detection: it can mis-detect and set a
-      // large offset, causing playback to start late (playhead ahead of audio). Use peak-based only.
       const ext = path.extname(pathToSend).toLowerCase();
       const isWav = ext === '.wav' || ext === '.wave';
-      if (source_offset_seconds === 0 && !isWav && fileReadable) {
-        source_offset_seconds = await computeLeadingSilenceFromFile(pathToSend);
-      }
+      const source_offset_seconds = await resolveAudioSourceOffsetSeconds(
+        clip,
+        waveform_peaks,
+        length_seconds,
+        pathToSend,
+        fileReadable,
+        isWav,
+      );
       const payload = {
         track_id: trackId,
         source_path: pathToSend,
@@ -2733,10 +2806,13 @@ function createClip(payload = {}) {
   }
 
   const clipId = isNonEmptyString(payload.id) ? payload.id.trim() : makeId('clip');
-  const start = payload.start !== undefined ? roundToGrid(Math.max(0, Number(payload.start))) : roundToGrid(nextClipStart(track));
+  const q = resolveClipQuantizeStep(payload);
+  const start = payload.start !== undefined
+    ? roundToGrid(Math.max(0, Number(payload.start)), q)
+    : roundToGrid(nextClipStart(track), q);
   const length = payload.length !== undefined
-    ? Math.max(GRID_STEP, roundToGrid(Number(payload.length)))
-    : 1;
+    ? Math.max(q, roundToGrid(Number(payload.length), q))
+    : Math.max(q, roundToGrid(1, q));
   if (!Number.isFinite(start) || !Number.isFinite(length)) {
     throw new Error('clip start/length must be numbers');
   }
@@ -2801,13 +2877,27 @@ async function importClipFile(payload = {}) {
   const sourcePathRaw = payload.source_path ?? payload.sourcePath ?? payload.file_path ?? payload.filePath;
   const sourcePath = isNonEmptyString(sourcePathRaw) ? sourcePathRaw.trim() : '';
 
-  const start = payload.start !== undefined ? roundToGrid(Math.max(0, Number(payload.start))) : roundToGrid(nextClipStart(track));
+  const q = resolveClipQuantizeStep(payload);
+  const start = payload.start !== undefined
+    ? roundToGrid(Math.max(0, Number(payload.start)), q)
+    : roundToGrid(nextClipStart(track), q);
   const length = payload.length !== undefined
-    ? Math.max(GRID_STEP, roundToGrid(Number(payload.length)))
-    : DEFAULT_IMPORTED_CLIP_LENGTH;
+    ? Math.max(q, roundToGrid(Number(payload.length), q))
+    : Math.max(q, roundToGrid(DEFAULT_IMPORTED_CLIP_LENGTH, q));
   if (!Number.isFinite(start) || !Number.isFinite(length)) {
     throw new Error('clip start/length must be numbers');
   }
+
+  console.log('[SERVER_IMPORT_INPUT]', {
+    payloadStart: payload.start,
+    payloadLength: payload.length,
+    payloadGridStep: payload.grid_step,
+    q,
+  });
+  console.log('[SERVER_IMPORT_CALC]', {
+    calculatedStart: start,
+    calculatedLength: length,
+  });
 
   const sourceSizeBytesRaw = Number(payload.source_size_bytes ?? payload.sourceSizeBytes ?? payload.size_bytes ?? payload.sizeBytes);
   const sourceSizeBytes = Number.isFinite(sourceSizeBytesRaw) && sourceSizeBytesRaw >= 0
@@ -2824,8 +2914,24 @@ async function importClipFile(payload = {}) {
     : null;
   const waveformPeaks = normalizeWaveformPeaks(payload.waveform_peaks ?? payload.waveformPeaks ?? payload.waveform ?? []);
 
+  let trimStartSeconds = 0;
+  if (clipType === 'audio' && waveformPeaks.length > 0 && sourceDurationSeconds !== null) {
+    trimStartSeconds = Number(getLeadingSilenceOffsetSeconds(waveformPeaks, sourceDurationSeconds).toFixed(6));
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
+    || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
+    const rawPayloadTrim = payload.trim_start_seconds ?? payload.trimStartSeconds;
+    const tv = Number(rawPayloadTrim);
+    if (Number.isFinite(tv) && tv >= 0) {
+      trimStartSeconds = Number(tv.toFixed(6));
+      if (sourceDurationSeconds !== null && sourceDurationSeconds > 0) {
+        trimStartSeconds = Math.min(trimStartSeconds, Math.max(0, sourceDurationSeconds - 1e-9));
+      }
+    }
+  }
+
   track.clips = Array.isArray(track.clips) ? track.clips : [];
-  track.clips.push({
+  const newClip = {
     id: clipId,
     start,
     length,
@@ -2838,8 +2944,20 @@ async function importClipFile(payload = {}) {
     ...(clipType === 'audio' && waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
     ...(sourcePath ? { source_path: sourcePath } : {}),
     ...(clipType === 'audio' ? { fade_in: 0, fade_out: 0, fade_in_curve: 'linear', fade_out_curve: 'linear' } : {}),
-  });
+    ...(clipType === 'audio' ? { trim_start_seconds: trimStartSeconds } : {}),
+  };
+  track.clips.push(newClip);
   sortClips(track);
+  console.log('[SERVER_IMPORT_CREATED_CLIP]', {
+    trackId,
+    newClip,
+    allClipsOnTrack: track.clips.map((c) => ({
+      id: c.id,
+      start: c.start,
+      length: c.length,
+      trim_start_seconds: c.trim_start_seconds,
+    })),
+  });
 
   let nativeImportError = null;
   if (nativeTransportActive && sourcePath) {
@@ -2854,19 +2972,23 @@ async function importClipFile(payload = {}) {
       if (!Number.isFinite(start_seconds) || start_seconds < 0 || !Number.isFinite(length_seconds) || length_seconds <= 0) {
         console.warn('[thestuu-engine] native clip import skipped: invalid start/length', { start, length, start_seconds, length_seconds });
       } else {
-      await requestNativeTransport('clip:import-file', {
-        track_id: trackId,
-        source_path: pathToSend,
-        start,
-        length,
-        start_seconds,
-        length_seconds,
-        fade_in: 0,
-        fade_out: 0,
-        fade_in_curve: 'linear',
-        fade_out_curve: 'linear',
-        type: clipType,
-      });
+        const nativePayload = {
+          track_id: trackId,
+          source_path: pathToSend,
+          start,
+          length,
+          start_seconds,
+          length_seconds,
+          fade_in: 0,
+          fade_out: 0,
+          fade_in_curve: 'linear',
+          fade_out_curve: 'linear',
+          type: clipType,
+        };
+        if (trimStartSeconds > 0) {
+          nativePayload.source_offset_seconds = trimStartSeconds;
+        }
+        await requestNativeTransport('clip:import-file', nativePayload);
       }
     } catch (error) {
       nativeImportError = error instanceof Error ? error.message : String(error);
@@ -2959,9 +3081,57 @@ async function resizeClip(payload = {}) {
     throw new Error(`clip "${clipId}" not found on track ${trackId}`);
   }
 
-  clip.length = Math.max(GRID_STEP, roundToGrid(nextLengthRaw));
+  const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
+  const q = resolveClipQuantizeStep(payload);
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'start')) {
+    const nextStartRaw = Number(payload.start);
+    if (Number.isFinite(nextStartRaw)) {
+      clip.start = Math.max(0, roundToGrid(nextStartRaw, q));
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
+    || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
+    const rawTrim = payload.trim_start_seconds ?? payload.trimStartSeconds;
+    const tv = Number(rawTrim);
+    if (Number.isFinite(tv) && tv >= 0) {
+      clip.trim_start_seconds = Number(tv.toFixed(6));
+    }
+  }
+
+  clip.length = Math.max(q, roundToGrid(nextLengthRaw, q));
+
+  const sourceDur = Number(clip.source_duration_seconds);
+  if (clipHasExplicitTrimStart(clip) && Number.isFinite(sourceDur) && sourceDur > 0) {
+    const trimS = Math.max(0, Number(clip.trim_start_seconds) || 0);
+    const maxLenSec = Math.max((q * BEATS_PER_BAR * 60) / bpm, sourceDur - trimS);
+    const maxLenBars = (maxLenSec * bpm) / (60 * BEATS_PER_BAR);
+    clip.length = Math.min(clip.length, Math.max(q, roundToGrid(maxLenBars, q)));
+  }
+
   await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
-  return { clipId, trackId };
+  const out = {
+    clipId,
+    trackId,
+    start: Number(clip.start) || 0,
+    length: Number(clip.length) || q,
+  };
+  if (clipHasExplicitTrimStart(clip)) {
+    out.trim_start_seconds = Math.max(0, Number(clip.trim_start_seconds) || 0);
+  }
+  console.log('[SERVER_RESIZE_RESULT]', {
+    trackId,
+    clipId,
+    requestedLength: Number(payload.length),
+    finalClip: {
+      id: clip.id,
+      start: clip.start,
+      length: clip.length,
+      trim_start_seconds: clip.trim_start_seconds,
+    },
+  });
+  return out;
 }
 
 async function setClipFade(payload = {}) {
@@ -3218,10 +3388,15 @@ async function trySpawnNativeEngine() {
     return false;
   }
   return new Promise((resolve) => {
+    const spawnEnv = { ...process.env };
+    if (!spawnEnv.STUU_BUFFER_SIZE) {
+      spawnEnv.STUU_BUFFER_SIZE = '512';
+    }
     const child = spawn(binPath, ['--socket', nativeSocketPath], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
+      env: spawnEnv,
     });
     attachChildProcessLogStream(child.stdout, 'info');
     attachChildProcessLogStream(child.stderr, 'log');
@@ -5061,7 +5236,7 @@ async function emitEngineMeterTick() {
 
 const engineTickTimer = setInterval(() => {
   void emitEngineMeterTick();
-}, 120);
+}, engineMeterIntervalMs);
 
 async function boot() {
   await ensureAppPreferencesFile();

@@ -102,6 +102,7 @@ const PLAYHEAD_EXTEND_MARGIN_BARS = 4;
 const PLAYHEAD_SCRUB_EDGE_PX = 24;
 const PLAYHEAD_SCRUB_SCROLL_PX = 24;
 const GRID_STEP = 1 / 16;
+const BEATS_PER_BAR = 4;
 const SLICE_FREE_STEP = 1 / 256;
 const MIN_VOLUME_DB = -80;
 const MAX_VOLUME_DB = Number((20 * Math.log10(1.2)).toFixed(1));
@@ -1451,6 +1452,110 @@ function getClipWaveformPeaks(clip) {
   return normalizeWaveformPeaks(clip.waveform_peaks ?? clip.waveformPeaks ?? clip.waveform ?? []);
 }
 
+/**
+ * First non-silent sample in the peak array mapped to seconds, assuming peaks are uniformly spaced
+ * over `sourceDurationSeconds` (full file). Mirrors engine `getLeadingSilenceOffsetSeconds` when
+ * duration is the true file length (engine sync still passes clip length for that call; UI uses
+ * source duration so the offset aligns with the full `waveform_peaks` buffer).
+ */
+function getLeadingSilenceOffsetSecondsFromPeaks(peaks, sourceDurationSeconds, threshold = 0.02) {
+  const n = peaks.length;
+  if (n === 0 || !Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) {
+    return 0;
+  }
+  for (let i = 0; i < n; i += 1) {
+    const p = Number(peaks[i]);
+    if (Number.isFinite(p) && Math.abs(p) > threshold) {
+      return (i / n) * sourceDurationSeconds;
+    }
+  }
+  return 0;
+}
+
+function sliceWaveformPeaksByFileTime(peaks, t0, t1) {
+  const n = peaks.length;
+  if (n === 0) {
+    return [];
+  }
+  if (n === 1) {
+    return [...peaks];
+  }
+  const lo = clamp(t0, 0, 1);
+  const hi = clamp(t1, lo, 1);
+  const last = n - 1;
+  const startFrac = lo * last;
+  const endFrac = hi * last;
+  let i0 = Math.floor(startFrac);
+  let i1 = Math.ceil(endFrac);
+  i0 = clamp(i0, 0, last);
+  i1 = clamp(i1, i0, last);
+  return peaks.slice(i0, i1 + 1);
+}
+
+function getInteractionTrimStart(clip) {
+  if (!clip || typeof clip !== 'object') {
+    return 0;
+  }
+  if (Object.prototype.hasOwnProperty.call(clip, 'trim_start_seconds') && Number.isFinite(Number(clip.trim_start_seconds))) {
+    return Math.max(0, Number(clip.trim_start_seconds) || 0);
+  }
+  const peaks = getClipWaveformPeaks(clip);
+  const sourceDur = Number(clip.source_duration_seconds ?? clip.sourceDurationSeconds);
+  if (peaks.length > 0 && Number.isFinite(sourceDur) && sourceDur > 0) {
+    return getLeadingSilenceOffsetSecondsFromPeaks(peaks, sourceDur);
+  }
+  return 0;
+}
+
+/** Effective file-time start for waveform + split (aligns with engine native offset when trim is stored too low). */
+function getEffectiveAudioTrimStartForWaveform(clip) {
+  if (!clip || typeof clip !== 'object') {
+    return 0;
+  }
+  const peaks = getClipWaveformPeaks(clip);
+  const sourceDur = Number(clip.source_duration_seconds ?? clip.sourceDurationSeconds);
+  let peakLead = 0;
+  if (peaks.length > 0 && Number.isFinite(sourceDur) && sourceDur > 0) {
+    peakLead = getLeadingSilenceOffsetSecondsFromPeaks(peaks, sourceDur);
+  }
+  if (Object.prototype.hasOwnProperty.call(clip, 'trim_start_seconds') && Number.isFinite(Number(clip.trim_start_seconds))) {
+    return Math.max(0, Number(clip.trim_start_seconds) || 0, peakLead);
+  }
+  return peakLead;
+}
+
+/**
+ * Waveform peaks for the audible file-time window (FL-style): [trim_start, trim_start + timeline length]
+ * mapped onto full-file waveform_peaks. Does not mutate stored peaks.
+ */
+function getVisibleWaveformPeaks(clip, { bpm, timeSignature } = {}) {
+  const peaks = getClipWaveformPeaks(clip);
+  if (peaks.length === 0) {
+    return [];
+  }
+
+  const lengthBars = Number(clip?.length) || 0;
+  const safeBpm = Number.isFinite(Number(bpm)) && Number(bpm) > 0 ? Number(bpm) : 128;
+  const lengthSeconds = barsToSeconds(lengthBars, safeBpm, timeSignature);
+
+  const sourceDurRaw = Number(clip?.source_duration_seconds ?? clip?.sourceDurationSeconds);
+  const hasSourceDur = Number.isFinite(sourceDurRaw) && sourceDurRaw > 0;
+  const effectiveSourceDur = hasSourceDur ? sourceDurRaw : Math.max(lengthSeconds, 1e-9);
+
+  const windowStartSec = getEffectiveAudioTrimStartForWaveform(clip);
+  const windowEndSec = windowStartSec + lengthSeconds;
+  const t0 = clamp(windowStartSec / effectiveSourceDur, 0, 1);
+  const t1 = clamp(windowEndSec / effectiveSourceDur, t0, 1);
+
+  if (t1 <= t0) {
+    const idx = Math.min(peaks.length - 1, Math.max(0, Math.round(t0 * Math.max(1, peaks.length - 1))));
+    return [peaks[idx]];
+  }
+
+  const sliced = sliceWaveformPeaksByFileTime(peaks, t0, t1);
+  return sliced.length > 0 ? sliced : peaks;
+}
+
 function resampleWaveformPeaks(peaks, targetCount) {
   const normalized = normalizeWaveformPeaks(peaks);
   if (normalized.length === 0) {
@@ -2396,6 +2501,8 @@ export default function StuuShell() {
   const [sliceCursorPosition, setSliceCursorPosition] = useState(null);
   const [importTrackRenamePrompt, setImportTrackRenamePrompt] = useState(null);
   const clipRenameColorNameInputRef = useRef(null);
+  /** TEMP split debug: throttle render + engine:state logs to this track + clip ids */
+  const splitDebugSessionRef = useRef({ until: 0, trackId: null, clipIds: null });
   const appendConnectionLogEntry = useCallback((entry) => {
     const normalized = normalizeLiveEngineLogEntry(entry);
     if (!normalized) {
@@ -2744,6 +2851,22 @@ export default function StuuShell() {
     socket.on('engine:logs:init', handleEngineLogsInit);
     socket.on('engine:log', handleEngineLog);
     socket.on('engine:state', (payload) => {
+      const dbg = splitDebugSessionRef.current;
+      if (dbg.until > Date.now() && dbg.trackId != null) {
+        const playlist = Array.isArray(payload?.project?.playlist) ? payload.project.playlist : [];
+        console.log('[CLIENT_ENGINE_STATE_CLIPS]', playlist.map((tr) => ({
+          trackId: tr.track_id,
+          clips: Array.isArray(tr.clips)
+            ? tr.clips.map((c) => ({
+              id: c.id,
+              start: c.start,
+              length: c.length,
+              trim_start_seconds: c.trim_start_seconds,
+              source_name: c.source_name,
+            }))
+            : [],
+        })));
+      }
       setState(payload);
       setTrackChainEnabledOverrides({});
     });
@@ -4015,7 +4138,13 @@ export default function StuuShell() {
   }, [appendSystemMessage]);
 
   const emitMutation = useCallback((eventName, payload, onSuccess) => {
+    if (eventName === 'clip:resize' || eventName === 'clip:import-file') {
+      console.log('[MUTATION_SEND]', eventName, payload);
+    }
     socketRef.current?.emit(eventName, payload, (result) => {
+      if (eventName === 'clip:resize' || eventName === 'clip:import-file') {
+        console.log('[MUTATION_RESULT]', eventName, result);
+      }
       if (result?.ok) {
         if (onSuccess) {
           onSuccess(result);
@@ -4843,7 +4972,7 @@ export default function StuuShell() {
     }, previewDurationMs);
   }
 
-  function createImportedClipFromSource(trackId, sourceClip, start, length, onCreated) {
+  function createImportedClipFromSource(trackId, sourceClip, start, length, onCreated, trimExtra = {}) {
     if (!isObject(sourceClip)) {
       appendSystemMessage('Slice nicht moeglich: ungueltiger Clip.');
       return;
@@ -4857,7 +4986,9 @@ export default function StuuShell() {
       appendSystemMessage('Slice fuer diesen Clip nicht moeglich (fehlende Import-Metadaten).');
       return;
     }
-    emitMutation('clip:import-file', {
+    const trimFromSplit = Number(trimExtra.trim_start_seconds ?? trimExtra.trimStartSeconds);
+    const gridStepExtra = trimExtra.grid_step ?? trimExtra.gridStep;
+    const importPayload = {
       trackId,
       type: normalizeClipType(sourceClip.type) || 'audio',
       source_name: sourceClip.source_name,
@@ -4869,7 +5000,11 @@ export default function StuuShell() {
       ...(Number.isInteger(sourceClip.source_size_bytes) ? { source_size_bytes: sourceClip.source_size_bytes } : {}),
       ...(Number.isFinite(Number(sourceClip.source_duration_seconds)) ? { source_duration_seconds: Number(sourceClip.source_duration_seconds) } : {}),
       ...(Array.isArray(sourceClip.waveform_peaks) && sourceClip.waveform_peaks.length > 0 ? { waveform_peaks: sourceClip.waveform_peaks } : {}),
-    }, onCreated);
+      ...(Number.isFinite(trimFromSplit) && trimFromSplit >= 0 ? { trim_start_seconds: trimFromSplit } : {}),
+      ...(Number.isFinite(Number(gridStepExtra)) && Number(gridStepExtra) > 0 ? { grid_step: Number(gridStepExtra) } : {}),
+    };
+    console.log('[IMPORT_RIGHT_CLIENT_PAYLOAD]', importPayload);
+    emitMutation('clip:import-file', importPayload, onCreated);
   }
 
   function splitClipAtBar(trackId, clip, splitBarsRaw, step = snapStep) {
@@ -4877,20 +5012,73 @@ export default function StuuShell() {
     const clipLength = Number(clip?.length) || 0;
     const clipEnd = clipStart + clipLength;
     const splitBars = snapToGrid(splitBarsRaw, step);
+    console.log('[SPLIT_START] input', {
+      trackId,
+      clipId: clip?.id,
+      clipStart,
+      clipLength,
+      clipEnd,
+      splitBarsRaw,
+      splitBars,
+      step,
+      trim_start_seconds: clip?.trim_start_seconds,
+    });
     if (splitBars <= clipStart + step || splitBars >= clipEnd - step) {
+      console.log('[SPLIT_START] aborted edge guard', { splitBars, clipStart, clipEnd, step });
       return;
     }
 
+    splitDebugSessionRef.current = {
+      until: Date.now() + 12000,
+      trackId: Number(trackId),
+      clipIds: new Set([String(clip?.id)]),
+    };
+
     const leftLength = Math.max(step, snapToGrid(splitBars - clipStart, step));
-    const rightLength = Math.max(step, snapToGrid(clipEnd - splitBars, step));
     const sourcePatternId = getPatternId(clip);
     const sourceKey = getClipSelectionKey(trackId, clip.id);
     const sourceMuted = clipMuteOverrides[sourceKey] === true;
     const sourceSlipBars = Number(clipSlipPreviewBars[sourceKey]) || 0;
+    const splitBpm = Number(state?.project?.bpm) || 128;
+    const splitTs = timeSignature;
+    const baseTrim = getEffectiveAudioTrimStartForWaveform(clip);
 
-    emitMutation('clip:resize', { trackId, clipId: clip.id, length: leftLength }, () => {
-      const onCreated = (result) => {
-        const newClipId = isNonEmptyString(result?.clipId) ? result.clipId : null;
+    console.log('[SPLIT_CALC] pre-resize math', {
+      clipStart,
+      clipLength,
+      clipEnd,
+      splitBars,
+      leftLength,
+      expectedRightStartBeforeServer: clipStart + leftLength,
+      expectedRightLengthBeforeServer: clipEnd - (clipStart + leftLength),
+      baseTrim,
+      splitBpm,
+      timeSignature: splitTs,
+      rightTrimPreview: baseTrim + barsToSeconds(leftLength, splitBpm, splitTs),
+    });
+
+    emitMutation('clip:resize', { trackId, clipId: clip.id, length: leftLength, grid_step: step }, (result) => {
+      console.log('[SPLIT_RESIZE_RESULT] resize callback result', result);
+      const leftStored = Number.isFinite(Number(result?.length)) ? Number(result.length) : leftLength;
+      const rightStart = clipStart + leftStored;
+      const rightLengthAdjusted = Math.max(step, snapToGrid(clipEnd - rightStart, step));
+      const rightClipTrim = baseTrim + barsToSeconds(leftStored, splitBpm, splitTs);
+      console.log('[SPLIT_CALC] post-resize math', {
+        resultLengthRaw: result?.length,
+        leftStored,
+        clipStart,
+        clipEnd,
+        rightStart,
+        rightLengthAdjusted,
+        rightClipTrim,
+        step,
+      });
+
+      const onCreated = (createResult) => {
+        const newClipId = isNonEmptyString(createResult?.clipId) ? createResult.clipId : null;
+        if (newClipId && splitDebugSessionRef.current.clipIds) {
+          splitDebugSessionRef.current.clipIds.add(String(newClipId));
+        }
         if (!newClipId) {
           return;
         }
@@ -4906,11 +5094,25 @@ export default function StuuShell() {
         emitMutation('clip:create', {
           trackId,
           patternId: sourcePatternId,
-          start: splitBars,
-          length: rightLength,
+          start: rightStart,
+          length: rightLengthAdjusted,
+          grid_step: step,
         }, onCreated);
       } else {
-        createImportedClipFromSource(trackId, clip, splitBars, rightLength, onCreated);
+        console.log('[SPLIT_CREATE_RIGHT_CLIENT] about to create right audio clip', {
+          trackId,
+          sourceClipId: clip?.id,
+          sourceClipStart: clip?.start,
+          sourceClipLength: clip?.length,
+          rightStart,
+          rightLengthAdjusted,
+          rightClipTrim,
+          step,
+        });
+        createImportedClipFromSource(trackId, clip, rightStart, rightLengthAdjusted, onCreated, {
+          trim_start_seconds: rightClipTrim,
+          grid_step: step,
+        });
       }
     });
   }
@@ -6625,6 +6827,9 @@ export default function StuuShell() {
               }
             }
           }
+          const trimFromPeaks = imported.type === 'audio' && waveformPeaks.length > 0 && sourceDurationSeconds !== null
+            ? Number(getLeadingSilenceOffsetSecondsFromPeaks(waveformPeaks, sourceDurationSeconds).toFixed(6))
+            : 0;
           emitMutation(
             'clip:import-file',
             {
@@ -6639,6 +6844,7 @@ export default function StuuShell() {
               ...(Number.isInteger(imported.sourceSizeBytes) ? { source_size_bytes: imported.sourceSizeBytes } : {}),
               ...(sourceDurationSeconds !== null ? { source_duration_seconds: sourceDurationSeconds } : {}),
               ...(waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
+              ...(imported.type === 'audio' ? { trim_start_seconds: trimFromPeaks } : {}),
             },
             (result) => {
               if (result?.nativeImportError) {
@@ -7013,7 +7219,7 @@ export default function StuuShell() {
     });
   }
 
-  function beginClipInteraction(event, mode, trackId, clip) {
+  function beginClipInteraction(event, mode, trackId, clip, interactionOptions = {}) {
     event.preventDefault();
     event.stopPropagation();
     const patternId = getPatternId(clip);
@@ -7025,13 +7231,30 @@ export default function StuuShell() {
     } else {
       setInspector({ type: 'clip', trackId, clipId: clip.id });
     }
+    if (mode === 'move') {
+      setClipInteraction({
+        mode: 'move',
+        trackId,
+        clipId: clip.id,
+        originX: event.clientX,
+        start: Number(clip.start) || 0,
+        length: Number(clip.length) || 1,
+      });
+      return;
+    }
+    const edge = interactionOptions.edge === 'start' ? 'start' : 'end';
+    const bpm = Number(state?.project?.bpm) || 128;
+    const sourceDur = Number(clip?.source_duration_seconds ?? clip?.sourceDurationSeconds);
     setClipInteraction({
-      mode,
+      mode: edge === 'start' ? 'resize-left' : 'resize',
       trackId,
       clipId: clip.id,
       originX: event.clientX,
       start: Number(clip.start) || 0,
       length: Number(clip.length) || 1,
+      bpm,
+      trimStart: getInteractionTrimStart(clip),
+      sourceDurationSeconds: Number.isFinite(sourceDur) && sourceDur > 0 ? sourceDur : null,
     });
   }
 
@@ -7087,8 +7310,44 @@ export default function StuuShell() {
       if (!context) {
         return;
       }
-      const splitBars = snapToGrid(context.bars, snapStep);
-      splitClipAtBar(trackId, clip, splitBars, snapStep);
+      const playlistArrSliceDbg = Array.isArray(state?.project?.playlist) ? state.project.playlist : [];
+      const srcTrackSliceDbg = playlistArrSliceDbg.find((tRow) => Number(tRow?.track_id) === Number(trackId));
+      const sourceClipRow = Array.isArray(srcTrackSliceDbg?.clips)
+        ? srcTrackSliceDbg.clips.find((cRow) => String(cRow?.id) === String(clip?.id))
+        : null;
+      console.log('[CUT_INPUT] raw event/client', {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      });
+      console.log('[CUT_INPUT] pointer context', {
+        x: context.x,
+        bars: context.bars,
+        snappedBars: context.snappedBars,
+        snapStep,
+        barWidth: barWidthRef.current,
+      });
+      console.log('[CUT_INPUT] clip passed to splitClipAtBar', {
+        id: clip?.id,
+        start: clip?.start,
+        length: clip?.length,
+        type: clip?.type,
+        trim_start_seconds: clip?.trim_start_seconds,
+      });
+      console.log('[CUT_INPUT] rendered vs source clip', {
+        rendered: {
+          id: clip?.id,
+          start: clip?.start,
+          length: clip?.length,
+        },
+        source: sourceClipRow
+          ? {
+            id: sourceClipRow.id,
+            start: sourceClipRow.start,
+            length: sourceClipRow.length,
+          }
+          : null,
+      });
+      splitClipAtBar(trackId, clip, context.bars, snapStep);
       return;
     }
     if (editTool === 'slip') {
@@ -7109,13 +7368,18 @@ export default function StuuShell() {
     beginClipInteraction(event, 'move', trackId, clip);
   }
 
-  function handleClipResizePointerDown(event, trackId, clip) {
-    if (editTool === 'draw' || editTool === 'paint') {
-      beginClipInteraction(event, 'resize', trackId, clip);
+  function handleClipResizePointerDown(event, trackId, clip, edge = 'end') {
+    if (event.button !== 0) {
       return;
     }
     event.preventDefault();
     event.stopPropagation();
+    if (editTool === 'slip') {
+      return;
+    }
+    const clipKey = getClipSelectionKey(trackId, clip.id);
+    applyClipSelection([clipKey], { additive: false, toggle: false });
+    beginClipInteraction(event, 'resize', trackId, clip, { edge });
   }
 
   function beginFadeHandleInteraction(which, event, trackId, clip) {
@@ -7246,6 +7510,35 @@ export default function StuuShell() {
             start: Math.max(0, snapToGrid(clipInteraction.start + deltaBars, snapStep)),
             length: clipInteraction.length,
           };
+        } else if (clipInteraction.mode === 'resize-left') {
+          const bpm = Number(clipInteraction.bpm) || 128;
+          let nextStart = snapToGrid(clipInteraction.start + deltaBars, snapStep);
+          let nextLength = snapToGrid(clipInteraction.length - deltaBars, snapStep);
+          let nextTrim = clipInteraction.trimStart + barsToSeconds(deltaBars, bpm, timeSignature);
+          nextStart = Math.max(0, nextStart);
+          nextLength = Math.max(snapStep, nextLength);
+          nextTrim = Math.max(0, nextTrim);
+          const sourceDur = clipInteraction.sourceDurationSeconds;
+          if (sourceDur != null && Number.isFinite(sourceDur)) {
+            let lenSec = (Math.max(snapStep, nextLength) * BEATS_PER_BAR * 60) / bpm;
+            const maxTrim = Math.max(0, sourceDur - lenSec);
+            if (nextTrim > maxTrim) {
+              nextTrim = maxTrim;
+            }
+            lenSec = (Math.max(snapStep, nextLength) * BEATS_PER_BAR * 60) / bpm;
+            if (nextTrim + lenSec > sourceDur + 1e-6) {
+              const minLenSec = (snapStep * BEATS_PER_BAR * 60) / bpm;
+              const targetLenSec = Math.max(minLenSec, sourceDur - nextTrim);
+              const targetLenBars = (targetLenSec * bpm) / (60 * BEATS_PER_BAR);
+              nextLength = Math.max(snapStep, snapToGrid(targetLenBars, snapStep));
+            }
+          }
+          next[clipInteraction.clipId] = {
+            trackId: clipInteraction.trackId,
+            start: nextStart,
+            length: nextLength,
+            trimStart: nextTrim,
+          };
         } else {
           next[clipInteraction.clipId] = {
             trackId: clipInteraction.trackId,
@@ -7265,6 +7558,14 @@ export default function StuuShell() {
             trackId: clipInteraction.trackId,
             clipId: clipInteraction.clipId,
             start: draft.start,
+          });
+        } else if (clipInteraction.mode === 'resize-left') {
+          emitMutation('clip:resize', {
+            trackId: clipInteraction.trackId,
+            clipId: clipInteraction.clipId,
+            length: draft.length,
+            start: draft.start,
+            trim_start_seconds: draft.trimStart,
           });
         } else {
           emitMutation('clip:resize', {
@@ -7290,7 +7591,7 @@ export default function StuuShell() {
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
     };
-  }, [clipInteraction, emitMutation, snapStep]);
+  }, [clipInteraction, emitMutation, snapStep, timeSignature]);
 
   const contextMenuTrack = trackContextMenu
     ? (arrangementTrackMap.get(trackContextMenu.trackId) || null)
@@ -7328,12 +7629,9 @@ export default function StuuShell() {
     }
     return [];
   }, [arrangementTracks]);
+  /* Master peak: max over mix tracks from engine rows — not gated on clips (FL-style: live bus / FX / ext input). */
   const mixMasterPeak = useMemo(() => {
     return mixTracks.reduce((maxPeak, track) => {
-      const hasClips = Array.isArray(track.clips) && track.clips.length > 0;
-      if (!hasClips) {
-        return maxPeak;
-      }
       const trackPeak = clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1);
       return Math.max(maxPeak, trackPeak);
     }, 0);
@@ -8426,8 +8724,7 @@ export default function StuuShell() {
                       >
                         {arrangementTracks.map((track, trackIndex) => {
                           const meter = meters[track.track_id];
-                          const hasClips = Array.isArray(track.clips) && track.clips.length > 0;
-                          const isHot = hasClips && (meter?.peak || 0) > 0.12;
+                          const isHot = track.exists && (meter?.peak || 0) > 0.12;
                           const isChainEnabled = track.chain_enabled !== false;
                           const isSelected = multiSelectMode
                             ? selectedTrackIdSet.has(track.track_id)
@@ -8520,7 +8817,7 @@ export default function StuuShell() {
                                   <LevelMeter
                                     variant="arrangement"
                                     ariaLabel={`Track ${track.track_id} Pegel`}
-                                    value={hasClips ? clamp(Number(meter?.peak) || 0, 0, 1) : 0}
+                                    value={clamp(Number(meter?.peak) || 0, 0, 1)}
                                   />
                                   <span className="arrangement-track-index">{track.track_id}</span>
                                   {editingTrackId === track.track_id ? (
@@ -9292,7 +9589,9 @@ export default function StuuShell() {
                                 }}
                               >
                                 <div className="timeline-row-playhead" />
-                                {clips.map((clip) => {
+                                {(() => {
+                                  const arrangementClipBpm = Number(state?.project?.bpm) || 128;
+                                  return clips.map((clip) => {
                                   const renderedClip = getRenderedClip(track.track_id, clip);
                                   const patternId = getPatternId(renderedClip);
                                   const clipLabel = getClipDisplayLabel(renderedClip);
@@ -9301,6 +9600,38 @@ export default function StuuShell() {
                                   const clipLength = Number(renderedClip.length) || 1;
                                   const clipLeft = clipStart * barWidth;
                                   const clipWidth = Math.max(14, clipLength * barWidth);
+                                  {
+                                    const dbg = splitDebugSessionRef.current;
+                                    const dbgActive = clipType === 'audio'
+                                      && dbg.until > Date.now()
+                                      && dbg.trackId != null
+                                      && Number(dbg.trackId) === Number(track.track_id)
+                                      && dbg.clipIds
+                                      && (dbg.clipIds.has(String(clip.id)) || dbg.clipIds.has(String(renderedClip?.id)));
+                                    if (dbgActive) {
+                                      const clipKeyDbg = getClipSelectionKey(track.track_id, clip.id);
+                                      console.log('[RENDER_CLIP_POSITION]', {
+                                        trackId: track.track_id,
+                                        sourceClip: {
+                                          id: clip?.id,
+                                          start: clip?.start,
+                                          length: clip?.length,
+                                          trim_start_seconds: clip?.trim_start_seconds,
+                                        },
+                                        renderedClip: {
+                                          id: renderedClip?.id,
+                                          start: renderedClip?.start,
+                                          length: renderedClip?.length,
+                                          trim_start_seconds: renderedClip?.trim_start_seconds,
+                                        },
+                                        displayOverride: clipDisplayOverrides?.[clipKeyDbg] || null,
+                                        draft: clipDrafts?.[clip.id] || null,
+                                        barWidth,
+                                        clipLeft,
+                                        clipWidth,
+                                      });
+                                    }
+                                  }
                                   const clipKey = getClipSelectionKey(track.track_id, clip.id);
                                   const isClipSelected = selectedClipKeySet.has(clipKey);
                                   const isClipMuted = clipMuteOverrides[clipKey] === true || renderedClip?.muted === true;
@@ -9318,8 +9649,14 @@ export default function StuuShell() {
                                     ? renderedClip.key.trim()
                                     : '';
                                   const rawPeaks = clipType === 'audio' ? getClipWaveformPeaks(renderedClip) : [];
+                                  const windowedPeaks = clipType === 'audio' && rawPeaks.length > 0
+                                    ? getVisibleWaveformPeaks(renderedClip, { bpm: arrangementClipBpm, timeSignature })
+                                    : [];
+                                  const peaksForAdaptive = clipType === 'audio'
+                                    ? (windowedPeaks.length > 0 ? windowedPeaks : (rawPeaks.length > 0 ? rawPeaks : PLACEHOLDER_WAVEFORM_PEAKS))
+                                    : [];
                                   const waveformPeaks = clipType === 'audio'
-                                    ? getAdaptiveWaveformPeaks(rawPeaks.length > 0 ? rawPeaks : PLACEHOLDER_WAVEFORM_PEAKS, clipWidth)
+                                    ? getAdaptiveWaveformPeaks(peaksForAdaptive, clipWidth)
                                     : [];
                                   const waveformPolygonPoints = waveformPeaks.length > 0 ? getWaveformPolygonPoints(waveformPeaks) : '';
                                   const audioMissingFile = clipType === 'audio' && !(renderedClip?.source_path || renderedClip?.sourcePath);
@@ -9424,6 +9761,12 @@ export default function StuuShell() {
                                           </div>
                                           <div className="timeline-clip-waveform-wrap">
                                             <div
+                                              className="clip-resize-handle clip-resize-handle-left"
+                                              onPointerDown={(event) => {
+                                                handleClipResizePointerDown(event, track.track_id, renderedClip, 'start');
+                                              }}
+                                            />
+                                            <div
                                               className={`timeline-clip-waveform ${waveformPolygonPoints ? 'has-waveform' : 'is-empty'}`}
                                               aria-hidden="true"
                                             >
@@ -9435,9 +9778,9 @@ export default function StuuShell() {
                                               ) : null}
                                             </div>
                                             <div
-                                              className="clip-resize-handle"
+                                              className="clip-resize-handle clip-resize-handle-right"
                                               onPointerDown={(event) => {
-                                                handleClipResizePointerDown(event, track.track_id, renderedClip);
+                                                handleClipResizePointerDown(event, track.track_id, renderedClip, 'end');
                                               }}
                                             />
                                           </div>
@@ -9454,16 +9797,17 @@ export default function StuuShell() {
                                             </span>
                                           ) : null}
                                           <div
-                                            className="clip-resize-handle"
+                                            className="clip-resize-handle clip-resize-handle-right"
                                             onPointerDown={(event) => {
-                                              handleClipResizePointerDown(event, track.track_id, renderedClip);
+                                              handleClipResizePointerDown(event, track.track_id, renderedClip, 'end');
                                             }}
                                           />
                                         </>
                                       )}
                                     </div>
                                   );
-                                })}
+                                });
+                                })()}
                               </div>
                             );
                           })}
@@ -9916,7 +10260,7 @@ export default function StuuShell() {
                                   {audioOutputDevices.length === 0 ? (
                                     <option value="">
                                       {connection === 'online' && state?.nativeTransport
-                                        ? '— Keine Geräte (Tracktion-Backend nötig) —'
+                                        ? '— Keine Ausgabegeräte gemeldet —'
                                         : '— Keine Geräte (Native offline) —'}
                                     </option>
                                   ) : (
@@ -9932,8 +10276,9 @@ export default function StuuShell() {
                                 </select>
                               </label>
                               {connection === 'online' && state?.nativeTransport && audioOutputDevices.length === 0 ? (
-                                <p className="settings-audio-hint settings-audio-hint-warning">
-                                  Für echte Audio-Geräte das <strong>Tracktion-Backend</strong> einrichten: <code>STUU_NATIVE_VENDOR_DIR</code> auf einen Klon von <code>tracktion_engine</code> setzen und App neu starten. Siehe <code>apps/native-engine/README.md</code>.
+                                <p className="settings-audio-hint">
+                                  Die Native-Engine ist verbunden, hat aber noch keine Ausgabegeräte geliefert.
+                                  Einstellungen schließen und erneut öffnen oder kurz warten; bei dauerhaft leerer Liste die Engine-Logs prüfen (Antwort auf <code>audio:get-outputs</code>).
                                 </p>
                               ) : (
                                 <p className="settings-audio-hint">
@@ -10387,10 +10732,7 @@ export default function StuuShell() {
                       {mixTracks.map((track) => {
                         const trackMix = track.mix || createDefaultTrackMix(track.track_id);
                         const trackNodes = vstNodesByTrack.get(track.track_id) || [];
-                        const hasClips = Array.isArray(track.clips) && track.clips.length > 0;
-                        const meterPeak = hasClips
-                          ? clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1)
-                          : 0;
+                        const meterPeak = clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1);
                         const isSelected = track.track_id === mixSelectedTrackId;
 
                         return (
@@ -10469,17 +10811,47 @@ export default function StuuShell() {
                             ) : null}
 
                             <label className="mix-strip-pan">
-                              <span>PAN</span>
-                              <input
-                                type="range"
-                                min={-1}
-                                max={1}
-                                step={0.01}
-                                value={trackMix.pan}
-                                onChange={(event) => setPan(track.track_id, event.target.value)}
-                                onPointerDown={(event) => event.stopPropagation()}
-                              />
-                              <strong>{`${toPanMagnitudePercent(trackMix.pan)} ${getPanSideLabel(trackMix.pan)}`}</strong>
+                              <span>Pan</span>
+                              <div className="arrangement-track-pan-range">
+                                <em>L</em>
+                                <span
+                                  className="arrangement-pan-slider-shell"
+                                  style={getPanFillRange(trackMix.pan)}
+                                >
+                                  <input
+                                    type="range"
+                                    className="arrangement-pan-slider"
+                                    min={-1}
+                                    max={1}
+                                    step={0.01}
+                                    value={trackMix.pan}
+                                    onChange={(event) => setPan(track.track_id, event.target.value)}
+                                    onPointerDown={(event) => event.stopPropagation()}
+                                    aria-label={`Pan Track ${track.track_id}`}
+                                  />
+                                </span>
+                                <em>R</em>
+                              </div>
+                              <div className="mix-strip-pan-value-edit">
+                                <span className="mix-strip-pan-value-side mix-strip-pan-value-side-left" aria-hidden="true">
+                                  {toPanPercent(trackMix.pan) < 0 ? 'L' : ''}
+                                </span>
+                                <input
+                                  type="number"
+                                  className="arrangement-track-value-input"
+                                  min={0}
+                                  max={100}
+                                  step={1}
+                                  value={toPanMagnitudePercent(trackMix.pan)}
+                                  onChange={(event) => setPanPercent(track.track_id, event.target.value, trackMix.pan)}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  aria-label={`Pan Wert Mix Track ${track.track_id} (${getPanSideLabel(trackMix.pan)})`}
+                                />
+                                <span className="mix-strip-pan-value-side mix-strip-pan-value-side-right" aria-hidden="true">
+                                  {toPanPercent(trackMix.pan) > 0 ? 'R' : ''}
+                                </span>
+                              </div>
                             </label>
 
                             <div className="mix-strip-fader-wrap">
@@ -10494,7 +10866,24 @@ export default function StuuShell() {
                                 onPointerDown={(event) => event.stopPropagation()}
                               />
                             </div>
-                            <div className="mix-strip-db">{formatVolumeDbLabel(trackMix.volume)}</div>
+                            <div className="mix-strip-db mix-strip-db-editable">
+                              <div className="mix-strip-db-inner">
+                                <input
+                                  type="number"
+                                  className="arrangement-track-value-input mix-strip-db-input"
+                                  min={MIN_VOLUME_DB}
+                                  max={MAX_VOLUME_DB}
+                                  step={0.1}
+                                  value={toVolumeDbInput(trackMix.volume)}
+                                  onChange={(event) => setVolumeDb(track.track_id, event.target.value)}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  aria-label={`Mix Volume dB Track ${track.track_id}`}
+                                  title={formatVolumeDbLabel(trackMix.volume)}
+                                />
+                                <span className="mix-strip-db-suffix">dB</span>
+                              </div>
+                            </div>
 
                             <MixStripChain
                               trackId={track.track_id}
