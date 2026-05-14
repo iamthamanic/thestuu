@@ -12,6 +12,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -764,6 +765,41 @@ MsgValue makeTickEvent(const TransportCore& transport) {
   });
 }
 
+/**
+ * Mixer commands: track id 0 = master bus.
+ * Matches engine `resolveMixerSocketTrackId`: prefer `trackId` so `0` is not shadowed; then `track_id`.
+ * If a key exists but the value is null/empty (MessagePack nil), skip it — legacy `asInt(..., 1)` would
+ * wrongly resolve to track 1 so master fader moves could hit the first audio track.
+ */
+static int32_t parseMixerCommandTrackId(const MsgValue::Object& payload) {
+  auto tryReadMixerTrackIdField = [](const MsgValue::Object& object, const char* key) -> std::optional<int32_t> {
+    const auto it = object.find(key);
+    if (it == object.end()) {
+      return std::nullopt;
+    }
+    const MsgValue& field = it->second;
+    if (std::holds_alternative<std::monostate>(field.value)
+        || std::holds_alternative<bool>(field.value)
+        || std::holds_alternative<std::string>(field.value)
+        || std::holds_alternative<MsgValue::Object>(field.value)
+        || std::holds_alternative<MsgValue::Array>(field.value)) {
+      return std::nullopt;
+    }
+    const int64_t v = asInt(&field, -1);
+    if (v < 0 || v > 500000) {
+      return std::nullopt;
+    }
+    return static_cast<int32_t>(v);
+  };
+  if (auto camel = tryReadMixerTrackIdField(payload, "trackId")) {
+    return *camel;
+  }
+  if (auto snake = tryReadMixerTrackIdField(payload, "track_id")) {
+    return *snake;
+  }
+  return 1;
+}
+
 MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport) {
   const int64_t id = asInt(getField(request, "id"), 0);
   const std::string type = asString(getField(request, "type"));
@@ -1063,12 +1099,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       return makeErrorResponse(id, "vst:load requires plugin_uid");
     }
 
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
 
     thestuu::native::LoadPluginResult result;
     std::string error;
@@ -1083,12 +1114,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       return makeErrorResponse(id, "vst:editor:open requires payload");
     }
 
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const int32_t pluginIndex = static_cast<int32_t>(
       asInt(
         getField(*payload, "plugin_index"),
@@ -1096,7 +1122,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       )
     );
 
-    if (trackId <= 0 || pluginIndex < 0) {
+    if (trackId < 0 || pluginIndex < 0) {
       return makeErrorResponse(id, "vst:editor:open requires track_id and plugin_index");
     }
 
@@ -1170,12 +1196,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       return makeErrorResponse(id, "vst:param:set requires payload");
     }
 
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const int32_t pluginIndex = static_cast<int32_t>(
       asInt(
         getField(*payload, "plugin_index"),
@@ -1270,12 +1291,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     if (payload == nullptr) {
       return makeErrorResponse(id, "track:set-mute requires payload");
     }
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const bool mute = asBool(getField(*payload, "mute"), false);
     std::string error;
     if (!thestuu::native::setTrackMute(trackId, mute, error)) {
@@ -1291,12 +1307,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     if (payload == nullptr) {
       return makeErrorResponse(id, "track:set-solo requires payload");
     }
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const bool solo = asBool(getField(*payload, "solo"), false);
     std::string error;
     if (!thestuu::native::setTrackSolo(trackId, solo, error)) {
@@ -1312,12 +1323,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     if (payload == nullptr) {
       return makeErrorResponse(id, "track:set-volume requires payload");
     }
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const double volume = asDouble(getField(*payload, "volume"), 0.85);
     std::string error;
     if (!thestuu::native::setTrackVolume(trackId, volume, error)) {
@@ -1333,12 +1339,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     if (payload == nullptr) {
       return makeErrorResponse(id, "track:set-pan requires payload");
     }
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const double pan = asDouble(getField(*payload, "pan"), 0.0);
     std::string error;
     if (!thestuu::native::setTrackPan(trackId, pan, error)) {
@@ -1354,12 +1355,7 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     if (payload == nullptr) {
       return makeErrorResponse(id, "track:set-record-arm requires payload");
     }
-    const int32_t trackId = static_cast<int32_t>(
-      asInt(
-        getField(*payload, "track_id"),
-        asInt(getField(*payload, "trackId"), 1)
-      )
-    );
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
     const bool armed = asBool(getField(*payload, "record_armed"), asBool(getField(*payload, "recordArmed"), false));
     std::string error;
     if (!thestuu::native::setTrackRecordArm(trackId, armed, error)) {

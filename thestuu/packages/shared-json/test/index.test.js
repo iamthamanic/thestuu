@@ -192,3 +192,24 @@ test('mixer flags and pan/volume survive parse roundtrip', () => {
   assert.equal(trackOne?.pan, -0.35);
   assert.equal(trackOne?.volume, 0.93);
 });
+
+test('mixer drops bogus master row (track_id 0); master stays in master_mix', () => {
+  const raw = {
+    version: '1.0.0-alpha',
+    project_name: 'Mixer Master Split',
+    bpm: 120,
+    playlist: [{ track_id: 1, name: 'A', clips: [] }],
+    mixer: [
+      { track_id: 0, volume: 0.2, pan: 0.5, mute: false, solo: false, record_armed: false },
+      { track_id: 1, volume: 0.7, pan: -0.1, mute: true, solo: false, record_armed: false },
+    ],
+    master_mix: { volume: 0.9, pan: 0.25, mute: false, chain_enabled: true },
+  };
+
+  const parsed = parseProject(JSON.stringify(raw));
+  assert.equal(parsed.mixer.length, 1);
+  assert.equal(parsed.mixer[0].track_id, 1);
+  assert.equal(parsed.mixer[0].volume, 0.7);
+  assert.equal(parsed.master_mix.volume, 0.9);
+  assert.equal(parsed.master_mix.pan, 0.25);
+});

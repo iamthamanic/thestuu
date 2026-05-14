@@ -45,6 +45,7 @@ import { createEngineSocket } from '../lib/socket';
 import { getMeterMap } from '../lib/meter-map';
 import LevelMeter from './LevelMeter';
 import MixStripChain from './MixStripChain';
+import { normalizeMasterMix } from '@thestuu/shared-json';
 
 function ExtractStemsIcon({ size = 24, strokeWidth = 2, ...props }) {
   return (
@@ -917,6 +918,7 @@ const FALLBACK_STATE = {
     patterns: [],
     playlist: [],
     mixer: [],
+    master_mix: { volume: 1, pan: 0, mute: false, chain_enabled: true },
   },
   selectedProjectFile: 'welcome.stu',
   history: {
@@ -2242,8 +2244,30 @@ function getPanFillRange(pan) {
 }
 
 function resolveNodeTrackId(node) {
-  const trackId = Number(node?.track_id ?? node?.trackId);
-  return Number.isInteger(trackId) && trackId > 0 ? trackId : null;
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'track_id')) {
+    const v = Number(node.track_id);
+    if (v === 0) {
+      return 0;
+    }
+    if (Number.isInteger(v) && v > 0) {
+      return v;
+    }
+    return null;
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'trackId')) {
+    const v = Number(node.trackId);
+    if (v === 0) {
+      return 0;
+    }
+    if (Number.isInteger(v) && v > 0) {
+      return v;
+    }
+    return null;
+  }
+  return null;
 }
 
 function resolveNodePluginIndex(node, fallback = 0) {
@@ -2357,6 +2381,10 @@ export default function StuuShell() {
     width: DEFAULT_BAR_WIDTH,
     showNodes: true,
   });
+
+  /** Mix / Edit volume+pan: local `applyLocal*` on every input; one engine commit on pointer release (FL-style, avoids emitState storms). */
+  const mixLevelDragSessionRef = useRef(null);
+  const mixLevelDragDetachRef = useRef(null);
 
   const [connection, setConnection] = useState('connecting');
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
@@ -2867,7 +2895,49 @@ export default function StuuShell() {
             : [],
         })));
       }
-      setState(payload);
+      const session = mixLevelDragSessionRef.current;
+      let mergedPayload = payload;
+      if (session && isObject(payload) && isObject(payload.project)) {
+        const project = { ...payload.project };
+        let touched = false;
+        if (session.kind === 'volume') {
+          if (session.trackId === 0) {
+            const mm = normalizeMasterMix(project.master_mix);
+            project.master_mix = { ...mm, volume: session.lastValue };
+            touched = true;
+          } else {
+            const mixer = Array.isArray(project.mixer)
+              ? project.mixer.map((e) => (isObject(e) ? { ...e } : e))
+              : [];
+            const i = mixer.findIndex((e) => isObject(e) && Number(e.track_id) === session.trackId);
+            if (i >= 0) {
+              mixer[i] = { ...mixer[i], volume: session.lastValue };
+              project.mixer = mixer;
+              touched = true;
+            }
+          }
+        } else if (session.kind === 'pan') {
+          if (session.trackId === 0) {
+            const mm = normalizeMasterMix(project.master_mix);
+            project.master_mix = { ...mm, pan: session.lastValue };
+            touched = true;
+          } else {
+            const mixer = Array.isArray(project.mixer)
+              ? project.mixer.map((e) => (isObject(e) ? { ...e } : e))
+              : [];
+            const i = mixer.findIndex((e) => isObject(e) && Number(e.track_id) === session.trackId);
+            if (i >= 0) {
+              mixer[i] = { ...mixer[i], pan: session.lastValue };
+              project.mixer = mixer;
+              touched = true;
+            }
+          }
+        }
+        if (touched) {
+          mergedPayload = { ...payload, project };
+        }
+      }
+      setState(mergedPayload);
       setTrackChainEnabledOverrides({});
     });
     socket.on('engine:meter', (payload) => setMeters(getMeterMap(payload)));
@@ -3193,6 +3263,7 @@ export default function StuuShell() {
 
   const playlist = state?.project?.playlist ?? FALLBACK_STATE.project.playlist;
   const mixer = state?.project?.mixer ?? FALLBACK_STATE.project.mixer;
+  const masterMix = useMemo(() => normalizeMasterMix(state?.project?.master_mix), [state?.project?.master_mix]);
   const patterns = state?.project?.patterns ?? FALLBACK_STATE.project.patterns;
   const playlistTrackMap = useMemo(() => {
     const map = new Map();
@@ -3719,7 +3790,7 @@ export default function StuuShell() {
     const map = new Map();
     for (const [nodeIndex, node] of vstNodes.entries()) {
       const trackId = resolveNodeTrackId(node);
-      if (!Number.isInteger(trackId) || trackId <= 0) {
+      if (!Number.isInteger(trackId) || trackId < 0) {
         continue;
       }
       if (!map.has(trackId)) {
@@ -3747,6 +3818,13 @@ export default function StuuShell() {
 
     return map;
   }, [vstNodes]);
+  const mixMasterNodes = useMemo(() => vstNodesByTrack.get(0) || [], [vstNodesByTrack]);
+  const mixMasterChainEnabled = useMemo(() => {
+    if (trackChainEnabledOverrides[0] !== undefined) {
+      return trackChainEnabledOverrides[0] !== false;
+    }
+    return masterMix.chain_enabled !== false;
+  }, [trackChainEnabledOverrides, masterMix.chain_enabled]);
   const inspectorNodeParameters = useMemo(() => {
     if (!inspectorNode || inspectorNode.type !== 'vst_instrument') {
       return [];
@@ -3991,13 +4069,13 @@ export default function StuuShell() {
   }, [existingClipKeySet]);
 
   useEffect(() => {
-    if (openTrackPluginPicker && !existingTrackIds.includes(openTrackPluginPicker.trackId)) {
+    if (openTrackPluginPicker && openTrackPluginPicker.trackId !== 0 && !existingTrackIds.includes(openTrackPluginPicker.trackId)) {
       setOpenTrackPluginPicker(null);
     }
   }, [openTrackPluginPicker, existingTrackIds]);
 
   useEffect(() => {
-    if (trackChainModalTrackId !== null && !existingTrackIds.includes(trackChainModalTrackId)) {
+    if (trackChainModalTrackId !== null && trackChainModalTrackId !== 0 && !existingTrackIds.includes(trackChainModalTrackId)) {
       setTrackChainModalTrackId(null);
     }
   }, [trackChainModalTrackId, existingTrackIds]);
@@ -4009,7 +4087,7 @@ export default function StuuShell() {
   }, [multiSelectMode]);
 
   useEffect(() => {
-    if (activeTab === 'Edit') {
+    if (activeTab === 'Edit' || activeTab === 'Mix') {
       return;
     }
     setOpenTrackPluginPicker(null);
@@ -5520,7 +5598,177 @@ export default function StuuShell() {
     });
   }
 
+  function applyLocalMasterMix(patch) {
+    if (!isObject(patch)) {
+      return;
+    }
+    setState((previousState) => {
+      const baseState = isObject(previousState) ? previousState : FALLBACK_STATE;
+      const baseProject = isObject(baseState.project) ? baseState.project : FALLBACK_STATE.project;
+      const current = normalizeMasterMix(baseProject.master_mix);
+      return {
+        ...baseState,
+        project: {
+          ...baseProject,
+          master_mix: { ...current, ...patch },
+        },
+      };
+    });
+  }
+
+  function detachMixLevelDragWindowListeners() {
+    if (typeof mixLevelDragDetachRef.current === 'function') {
+      mixLevelDragDetachRef.current();
+      mixLevelDragDetachRef.current = null;
+    }
+  }
+
+  function finalizeMixLevelDragFromSession() {
+    detachMixLevelDragWindowListeners();
+    const session = mixLevelDragSessionRef.current;
+    mixLevelDragSessionRef.current = null;
+    if (!session) {
+      return;
+    }
+    if (session.kind === 'volume') {
+      if (session.trackId === 0) {
+        emitMutation('track:set-volume', { trackId: 0, volume: session.lastValue });
+      } else {
+        ensureTrackExists(session.trackId, () => {
+          emitMutation('track:set-volume', { trackId: session.trackId, volume: session.lastValue });
+        });
+      }
+    } else if (session.kind === 'pan') {
+      if (session.trackId === 0) {
+        emitMutation('track:set-pan', { trackId: 0, pan: session.lastValue });
+      } else {
+        ensureTrackExists(session.trackId, () => {
+          emitMutation('track:set-pan', { trackId: session.trackId, pan: session.lastValue });
+        });
+      }
+    }
+  }
+
+  function beginMixLevelPointerDrag(kind, trackId, initialValue) {
+    if ((kind !== 'volume' && kind !== 'pan') || !Number.isInteger(trackId) || trackId < 0) {
+      return;
+    }
+    const existing = mixLevelDragSessionRef.current;
+    if (existing && existing.kind === kind && existing.trackId === trackId) {
+      existing.lastValue = initialValue;
+      return;
+    }
+    if (existing) {
+      finalizeMixLevelDragFromSession();
+    } else {
+      detachMixLevelDragWindowListeners();
+    }
+    mixLevelDragSessionRef.current = { kind, trackId, lastValue: initialValue };
+    const onPointerEnd = () => {
+      finalizeMixLevelDragFromSession();
+    };
+    window.addEventListener('pointerup', onPointerEnd, true);
+    window.addEventListener('pointercancel', onPointerEnd, true);
+    mixLevelDragDetachRef.current = () => {
+      window.removeEventListener('pointerup', onPointerEnd, true);
+      window.removeEventListener('pointercancel', onPointerEnd, true);
+    };
+  }
+
+  function handleMixVolumeSliderInput(trackId, rawValue) {
+    const resolvedVolume = normalizeVolumeValue(rawValue);
+    applyLocalTrackMix(trackId, { volume: resolvedVolume });
+    const session = mixLevelDragSessionRef.current;
+    if (session && session.kind === 'volume' && session.trackId === trackId) {
+      session.lastValue = resolvedVolume;
+      return;
+    }
+    ensureTrackExists(trackId, () => {
+      emitMutation('track:set-volume', { trackId, volume: resolvedVolume });
+    });
+  }
+
+  function handleMixMasterVolumeSliderInput(rawValue) {
+    const resolvedVolume = normalizeVolumeValue(rawValue);
+    applyLocalMasterMix({ volume: resolvedVolume });
+    const session = mixLevelDragSessionRef.current;
+    if (session && session.kind === 'volume' && session.trackId === 0) {
+      session.lastValue = resolvedVolume;
+      return;
+    }
+    emitMutation('track:set-volume', { trackId: 0, volume: resolvedVolume });
+  }
+
+  function handleMixPanSliderInput(trackId, rawValue) {
+    const resolvedPan = normalizePanValue(rawValue);
+    applyLocalTrackMix(trackId, { pan: resolvedPan });
+    const session = mixLevelDragSessionRef.current;
+    if (session && session.kind === 'pan' && session.trackId === trackId) {
+      session.lastValue = resolvedPan;
+      return;
+    }
+    ensureTrackExists(trackId, () => {
+      emitMutation('track:set-pan', { trackId, pan: resolvedPan });
+    });
+  }
+
+  function handleMixMasterPanSliderInput(rawValue) {
+    const resolvedPan = normalizePanValue(rawValue);
+    applyLocalMasterMix({ pan: resolvedPan });
+    const session = mixLevelDragSessionRef.current;
+    if (session && session.kind === 'pan' && session.trackId === 0) {
+      session.lastValue = resolvedPan;
+      return;
+    }
+    emitMutation('track:set-pan', { trackId: 0, pan: resolvedPan });
+  }
+
+  function setMasterVolume(volume) {
+    finalizeMixLevelDragFromSession();
+    const resolvedVolume = normalizeVolumeValue(volume);
+    applyLocalMasterMix({ volume: resolvedVolume });
+    emitMutation('track:set-volume', { trackId: 0, volume: resolvedVolume });
+  }
+
+  function setMasterPan(pan) {
+    finalizeMixLevelDragFromSession();
+    const resolvedPan = normalizePanValue(pan);
+    applyLocalMasterMix({ pan: resolvedPan });
+    emitMutation('track:set-pan', { trackId: 0, pan: resolvedPan });
+  }
+
+  function setMasterMute(mute) {
+    applyLocalMasterMix({ mute: Boolean(mute) });
+    emitMutation('track:set-mute', { trackId: 0, mute: Boolean(mute) });
+  }
+
+  function setMasterVolumeDb(dbValue) {
+    finalizeMixLevelDragFromSession();
+    const resolvedVolume = fromVolumeDbInput(dbValue);
+    if (resolvedVolume === null) {
+      return;
+    }
+    setMasterVolume(resolvedVolume);
+  }
+
+  function setMasterPanPercent(percentValue, referencePan = 0) {
+    finalizeMixLevelDragFromSession();
+    const parsedPercent = Number(percentValue);
+    if (!Number.isFinite(parsedPercent)) {
+      return;
+    }
+    const magnitude = clamp(Math.abs(parsedPercent), 0, 100);
+    if (magnitude === 0) {
+      setMasterPan(0);
+      return;
+    }
+    const reference = Number(referencePan);
+    const sign = Number.isFinite(reference) && reference < 0 ? -1 : 1;
+    setMasterPan((magnitude / 100) * sign);
+  }
+
   function setVolume(trackId, volume) {
+    finalizeMixLevelDragFromSession();
     const resolvedVolume = normalizeVolumeValue(volume);
     applyLocalTrackMix(trackId, { volume: resolvedVolume });
     ensureTrackExists(trackId, () => {
@@ -5529,6 +5777,7 @@ export default function StuuShell() {
   }
 
   function setPan(trackId, pan) {
+    finalizeMixLevelDragFromSession();
     const resolvedPan = normalizePanValue(pan);
     applyLocalTrackMix(trackId, { pan: resolvedPan });
     ensureTrackExists(trackId, () => {
@@ -5537,6 +5786,7 @@ export default function StuuShell() {
   }
 
   function setVolumeDb(trackId, dbValue) {
+    finalizeMixLevelDragFromSession();
     const resolvedVolume = fromVolumeDbInput(dbValue);
     if (resolvedVolume === null) {
       return;
@@ -5545,6 +5795,7 @@ export default function StuuShell() {
   }
 
   function setPanPercent(trackId, percentValue, referencePan = 0) {
+    finalizeMixLevelDragFromSession();
     const parsedPercent = Number(percentValue);
     if (!Number.isFinite(parsedPercent)) {
       return;
@@ -6290,11 +6541,16 @@ export default function StuuShell() {
       return;
     }
     const requestedTrackId = Number(options.trackId ?? selectedPluginTrackId ?? selectedTrackId ?? 1);
-    const trackId = Number.isInteger(requestedTrackId) && requestedTrackId > 0 ? requestedTrackId : 1;
+    let trackId;
+    if (options.track_id === 0 || options.trackId === 0) {
+      trackId = 0;
+    } else {
+      trackId = Number.isInteger(requestedTrackId) && requestedTrackId > 0 ? requestedTrackId : 1;
+    }
     const insertIndexRaw = Number(options.insertIndex);
     const insertIndex = Number.isInteger(insertIndexRaw) && insertIndexRaw >= 0 ? insertIndexRaw : null;
 
-    ensureTrackExists(trackId, () => {
+    const runVstAdd = () => {
       setPluginLoadPending(true);
       socketRef.current?.emit('vst:add', {
         plugin_uid: pluginUid,
@@ -6314,7 +6570,14 @@ export default function StuuShell() {
         }
         appendSystemMessage(`Fehler (vst:add): ${result?.error || 'Unbekannter Fehler'}`);
       });
-    });
+    };
+
+    if (trackId === 0) {
+      runVstAdd();
+      return;
+    }
+
+    ensureTrackExists(trackId, runVstAdd);
   }
 
   function setVstNodeParameter(node, paramId, value) {
@@ -6322,10 +6585,10 @@ export default function StuuShell() {
       return;
     }
 
-    const trackId = Number(node.track_id ?? node.trackId);
-    const pluginIndex = Number(node.plugin_index ?? node.pluginIndex);
+    const trackId = resolveNodeTrackId(node);
+    const pluginIndex = resolveNodePluginIndex(node, -1);
     const nextValue = clamp(Number(value), 0, 1);
-    if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0 || !Number.isFinite(nextValue)) {
+    if (trackId == null || !Number.isInteger(pluginIndex) || pluginIndex < 0 || !Number.isFinite(nextValue)) {
       appendSystemMessage('VST-Parameter konnte nicht gesetzt werden (ungueltige Node-Metadaten).');
       return;
     }
@@ -6512,9 +6775,9 @@ export default function StuuShell() {
     if (!node || node.type !== 'vst_instrument') {
       return;
     }
-    const trackId = Number(node.track_id ?? node.trackId);
+    const trackId = resolveNodeTrackId(node);
     const pluginIndex = Number(node.plugin_index ?? node.pluginIndex);
-    if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
+    if (trackId == null || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
       return;
     }
     emitMutation('vst:bypass:set', {
@@ -6532,7 +6795,7 @@ export default function StuuShell() {
 
     const trackId = resolveNodeTrackId(node);
     const pluginIndex = resolveNodePluginIndex(node, -1);
-    if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
+    if (trackId == null || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
       appendSystemMessage('Plugin-Fenster konnte nicht geoeffnet werden (ungueltige Node-Metadaten).');
       return;
     }
@@ -6549,7 +6812,7 @@ export default function StuuShell() {
   }
 
   function setTrackChainEnabled(trackId, enabled) {
-    if (!Number.isInteger(trackId) || trackId <= 0) return;
+    if (!Number.isInteger(trackId) || trackId < 0) return;
     setTrackChainEnabledOverrides((prev) => ({ ...prev, [trackId]: enabled }));
     emitMutation('track:set-chain-enabled', { trackId, enabled });
   }
@@ -6572,7 +6835,7 @@ export default function StuuShell() {
     const resolvedToIndex = Number(toIndex);
     if (
       !Number.isInteger(resolvedTrackId)
-      || resolvedTrackId <= 0
+      || resolvedTrackId < 0
       || !Number.isInteger(resolvedFromIndex)
       || resolvedFromIndex < 0
       || !Number.isInteger(resolvedToIndex)
@@ -6591,7 +6854,7 @@ export default function StuuShell() {
   function openTrackChainModalSlotPluginPicker(trackId, slotIndex) {
     const resolvedTrackId = Number(trackId);
     const resolvedSlotIndex = Number(slotIndex);
-    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !Number.isInteger(resolvedSlotIndex) || resolvedSlotIndex < 0) {
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId < 0 || !Number.isInteger(resolvedSlotIndex) || resolvedSlotIndex < 0) {
       return;
     }
 
@@ -6603,7 +6866,7 @@ export default function StuuShell() {
   function openTrackSlotPluginPicker(trackId, slotIndex, scope = 'track') {
     const resolvedTrackId = Number(trackId);
     const resolvedSlotIndex = Number(slotIndex);
-    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !Number.isInteger(resolvedSlotIndex) || resolvedSlotIndex < 0) {
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId < 0 || !Number.isInteger(resolvedSlotIndex) || resolvedSlotIndex < 0) {
       return;
     }
     setTrackContextMenu(null);
@@ -7596,9 +7859,30 @@ export default function StuuShell() {
   const contextMenuTrack = trackContextMenu
     ? (arrangementTrackMap.get(trackContextMenu.trackId) || null)
     : null;
-  const trackChainModalTrack = trackChainModalTrackId !== null
-    ? (arrangementTrackMap.get(trackChainModalTrackId) || null)
-    : null;
+  const trackChainModalTrack = useMemo(() => {
+    if (trackChainModalTrackId === null) {
+      return null;
+    }
+    if (trackChainModalTrackId === 0) {
+      const chainOn = trackChainEnabledOverrides[0] !== undefined
+        ? Boolean(trackChainEnabledOverrides[0])
+        : masterMix.chain_enabled !== false;
+      return {
+        track_id: 0,
+        name: 'Master',
+        exists: true,
+        mix: {
+          volume: masterMix.volume,
+          pan: masterMix.pan,
+          mute: masterMix.mute,
+          solo: false,
+          record_armed: false,
+        },
+        chain_enabled: chainOn,
+      };
+    }
+    return arrangementTrackMap.get(trackChainModalTrackId) || null;
+  }, [trackChainModalTrackId, arrangementTrackMap, masterMix, trackChainEnabledOverrides]);
   const trackChainModalNodes = useMemo(() => {
     if (!trackChainModalTrack) {
       return [];
@@ -8951,7 +9235,16 @@ export default function StuuShell() {
                                     max={1.2}
                                     step={0.01}
                                     value={track.mix.volume}
-                                    onChange={(event) => setVolume(track.track_id, event.target.value)}
+                                    onPointerDown={(event) => {
+                                      event.stopPropagation();
+                                      beginMixLevelPointerDrag(
+                                        'volume',
+                                        track.track_id,
+                                        normalizeVolumeValue(event.currentTarget.value),
+                                      );
+                                    }}
+                                    onInput={(event) => handleMixVolumeSliderInput(track.track_id, event.target.value)}
+                                    onClick={(event) => event.stopPropagation()}
                                   />
                                   <div className="arrangement-track-value-edit">
                                     <input
@@ -8985,7 +9278,16 @@ export default function StuuShell() {
                                         max={1}
                                         step={0.01}
                                         value={track.mix.pan}
-                                        onChange={(event) => setPan(track.track_id, event.target.value)}
+                                        onPointerDown={(event) => {
+                                          event.stopPropagation();
+                                          beginMixLevelPointerDrag(
+                                            'pan',
+                                            track.track_id,
+                                            normalizePanValue(event.currentTarget.value),
+                                          );
+                                        }}
+                                        onInput={(event) => handleMixPanSliderInput(track.track_id, event.target.value)}
+                                        onClick={(event) => event.stopPropagation()}
                                       />
                                     </span>
                                     <em>R</em>
@@ -10719,14 +11021,144 @@ export default function StuuShell() {
                       ))}
                     </div>
                     <div className="mix-strip-row">
-                      <article className="mix-strip mix-strip-master" aria-label="Master Channel">
+                      <article
+                        className={`mix-strip mix-strip-master ${masterMix.mute ? 'track-muted' : ''}`}
+                        aria-label="Master Channel"
+                        onClick={(event) => {
+                          if (event.target.closest('input, button, textarea, select, a, label')) {
+                            return;
+                          }
+                          setTrackContextMenu(null);
+                          setOpenTrackPluginPicker(null);
+                        }}
+                        onDoubleClick={() => {
+                          setTrackChainModalTrackId(0);
+                          restoreFloatingWindow('trackChain');
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                          }
+                        }}
+                      >
                         <div className="mix-strip-head">
                           <span className="mix-strip-index">M</span>
                           <strong>Master</strong>
                         </div>
                         <LevelMeter variant="mix" value={mixMasterPeak} />
-                        <div className="mix-strip-db">0.0 dB</div>
-                        <div className="mix-strip-route">1-2</div>
+                        <div className="mix-strip-toggle-row">
+                          <button
+                            type="button"
+                            className={mixStripToggleButtonClass('mute', masterMix.mute)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setMasterMute(!masterMix.mute);
+                            }}
+                            title="Mute"
+                            aria-label="Master Mute"
+                          >
+                            <TrackMixToggleIcon action="mute" active={masterMix.mute} />
+                          </button>
+                        </div>
+                        <label className="mix-strip-pan">
+                          <span>Pan</span>
+                          <div className="arrangement-track-pan-range">
+                            <em>L</em>
+                            <span
+                              className="arrangement-pan-slider-shell"
+                              style={getPanFillRange(masterMix.pan)}
+                            >
+                              <input
+                                type="range"
+                                className="arrangement-pan-slider"
+                                min={-1}
+                                max={1}
+                                step={0.01}
+                                value={masterMix.pan}
+                                onPointerDown={(event) => {
+                                  event.stopPropagation();
+                                  beginMixLevelPointerDrag('pan', 0, normalizePanValue(event.currentTarget.value));
+                                }}
+                                onInput={(event) => handleMixMasterPanSliderInput(event.target.value)}
+                                onClick={(event) => event.stopPropagation()}
+                                aria-label="Pan Master"
+                              />
+                            </span>
+                            <em>R</em>
+                          </div>
+                          <div className="mix-strip-pan-value-edit">
+                            <span className="mix-strip-pan-value-side mix-strip-pan-value-side-left" aria-hidden="true">
+                              {toPanPercent(masterMix.pan) < 0 ? 'L' : ''}
+                            </span>
+                            <input
+                              type="number"
+                              className="arrangement-track-value-input"
+                              min={0}
+                              max={100}
+                              step={1}
+                              value={toPanMagnitudePercent(masterMix.pan)}
+                              onChange={(event) => setMasterPanPercent(event.target.value, masterMix.pan)}
+                              onClick={(event) => event.stopPropagation()}
+                              onPointerDown={(event) => event.stopPropagation()}
+                              aria-label={`Pan Wert Master (${getPanSideLabel(masterMix.pan)})`}
+                            />
+                            <span className="mix-strip-pan-value-side mix-strip-pan-value-side-right" aria-hidden="true">
+                              {toPanPercent(masterMix.pan) > 0 ? 'R' : ''}
+                            </span>
+                          </div>
+                        </label>
+                        <div className="mix-strip-fader-wrap">
+                          <input
+                            type="range"
+                            className="mix-strip-fader"
+                            min={0}
+                            max={1.2}
+                            step={0.01}
+                            value={masterMix.volume}
+                            onPointerDown={(event) => {
+                              event.stopPropagation();
+                              beginMixLevelPointerDrag('volume', 0, normalizeVolumeValue(event.currentTarget.value));
+                            }}
+                            onInput={(event) => handleMixMasterVolumeSliderInput(event.target.value)}
+                            onClick={(event) => event.stopPropagation()}
+                          />
+                        </div>
+                        <div className="mix-strip-db mix-strip-db-editable">
+                          <div className="mix-strip-db-inner">
+                            <input
+                              type="number"
+                              className="arrangement-track-value-input mix-strip-db-input"
+                              min={MIN_VOLUME_DB}
+                              max={MAX_VOLUME_DB}
+                              step={0.1}
+                              value={toVolumeDbInput(masterMix.volume)}
+                              onChange={(event) => setMasterVolumeDb(event.target.value)}
+                              onClick={(event) => event.stopPropagation()}
+                              onPointerDown={(event) => event.stopPropagation()}
+                              aria-label="Mix Volume dB Master"
+                              title={formatVolumeDbLabel(masterMix.volume)}
+                            />
+                            <span className="mix-strip-db-suffix">dB</span>
+                          </div>
+                        </div>
+                        <MixStripChain
+                          trackId={0}
+                          trackNodes={mixMasterNodes}
+                          chainEnabled={mixMasterChainEnabled}
+                          pluginNameByUid={pluginNameByUid}
+                          resolveNodePluginDisplayName={resolveNodePluginDisplayName}
+                          formatTrackChainPluginName={formatTrackChainPluginName}
+                          resolveTracktionPluginUiMeta={resolveTracktionPluginUiMeta}
+                          buildPluginHelpTooltip={buildPluginHelpTooltip}
+                          openTrackChainModalSlotPluginPicker={openTrackChainModalSlotPluginPicker}
+                          setInspector={setInspector}
+                          openVstNodeEditor={openVstNodeEditor}
+                          setVstNodeBypassed={setVstNodeBypassed}
+                          removeVstNode={removeVstNode}
+                          reorderTrackVstNodes={reorderTrackVstNodes}
+                        />
                       </article>
 
                       {mixTracks.map((track) => {
@@ -10739,7 +11171,10 @@ export default function StuuShell() {
                           <article
                             key={`mix_strip_${track.track_id}`}
                             className={`mix-strip ${isSelected ? 'active' : ''} ${trackMix.mute ? 'track-muted' : ''} ${trackMix.solo ? 'track-soloed' : ''}`}
-                            onClick={() => {
+                            onClick={(event) => {
+                              if (event.target.closest('input, button, textarea, select, a, label')) {
+                                return;
+                              }
                               setTrackContextMenu(null);
                               setOpenTrackPluginPicker(null);
                               setInspector({ type: 'track', trackId: track.track_id });
@@ -10825,8 +11260,16 @@ export default function StuuShell() {
                                     max={1}
                                     step={0.01}
                                     value={trackMix.pan}
-                                    onChange={(event) => setPan(track.track_id, event.target.value)}
-                                    onPointerDown={(event) => event.stopPropagation()}
+                                    onPointerDown={(event) => {
+                                      event.stopPropagation();
+                                      beginMixLevelPointerDrag(
+                                        'pan',
+                                        track.track_id,
+                                        normalizePanValue(event.currentTarget.value),
+                                      );
+                                    }}
+                                    onInput={(event) => handleMixPanSliderInput(track.track_id, event.target.value)}
+                                    onClick={(event) => event.stopPropagation()}
                                     aria-label={`Pan Track ${track.track_id}`}
                                   />
                                 </span>
@@ -10862,8 +11305,16 @@ export default function StuuShell() {
                                 max={1.2}
                                 step={0.01}
                                 value={trackMix.volume}
-                                onChange={(event) => setVolume(track.track_id, event.target.value)}
-                                onPointerDown={(event) => event.stopPropagation()}
+                                onPointerDown={(event) => {
+                                  event.stopPropagation();
+                                  beginMixLevelPointerDrag(
+                                    'volume',
+                                    track.track_id,
+                                    normalizeVolumeValue(event.currentTarget.value),
+                                  );
+                                }}
+                                onInput={(event) => handleMixVolumeSliderInput(track.track_id, event.target.value)}
+                                onClick={(event) => event.stopPropagation()}
                               />
                             </div>
                             <div className="mix-strip-db mix-strip-db-editable">

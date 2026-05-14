@@ -327,7 +327,20 @@ function normalizeTrack(track, trackIndex) {
 
 function normalizeMixerEntry(entry, index = 0) {
   const safeEntry = isObject(entry) ? entry : {};
-  const trackId = Math.max(1, asInteger(safeEntry.track_id, index + 1));
+  const hasTrackIdKey =
+    Object.prototype.hasOwnProperty.call(safeEntry, 'track_id')
+    || Object.prototype.hasOwnProperty.call(safeEntry, 'trackId');
+  let trackId;
+  if (hasTrackIdKey) {
+    const parsed = asInteger(safeEntry.track_id ?? safeEntry.trackId, NaN);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      /* Master bus lives in `master_mix`, not in `mixer`. Drop bogus track_id 0 / negative rows. */
+      return null;
+    }
+    trackId = parsed;
+  } else {
+    trackId = index + 1;
+  }
   return {
     track_id: trackId,
     volume: clamp(asNumber(safeEntry.volume, 0.85), 0, 1.2),
@@ -335,6 +348,17 @@ function normalizeMixerEntry(entry, index = 0) {
     mute: asBoolean(safeEntry.mute, false),
     solo: asBoolean(safeEntry.solo, false),
     record_armed: asBoolean(safeEntry.record_armed ?? safeEntry.recordArmed, false),
+  };
+}
+
+/** Master bus mix (not a playlist track). Persisted on project as `master_mix`. */
+export function normalizeMasterMix(value) {
+  const safe = isObject(value) ? value : {};
+  return {
+    volume: clamp(asNumber(safe.volume, 1), 0, 1.2),
+    pan: clamp(asNumber(safe.pan, 0), -1, 1),
+    mute: asBoolean(safe.mute, false),
+    chain_enabled: asBoolean(safe.chain_enabled ?? safe.chainEnabled, true),
   };
 }
 
@@ -375,7 +399,9 @@ function normalizeNode(node, index = 0) {
   const safeNode = isObject(node) ? node : {};
   const id = isNonEmptyString(safeNode.id) ? safeNode.id.trim() : `node_${index + 1}`;
   const type = isNonEmptyString(safeNode.type) ? safeNode.type.trim() : 'node';
-  const trackId = asInteger(safeNode.track_id ?? safeNode.trackId, NaN);
+  const rawTrackId = safeNode.track_id ?? safeNode.trackId;
+  const hasExplicitTrackId = rawTrackId !== undefined && rawTrackId !== null && String(rawTrackId).trim() !== '';
+  const trackId = hasExplicitTrackId ? asInteger(rawTrackId, NaN) : NaN;
   const pluginIndex = asInteger(safeNode.plugin_index ?? safeNode.pluginIndex, NaN);
   const params = isObject(safeNode.params)
     ? Object.fromEntries(
@@ -394,7 +420,7 @@ function normalizeNode(node, index = 0) {
     type,
     ...(isNonEmptyString(safeNode.plugin) ? { plugin: safeNode.plugin.trim() } : {}),
     ...(isNonEmptyString(safeNode.plugin_uid) ? { plugin_uid: safeNode.plugin_uid.trim() } : {}),
-    ...(Number.isInteger(trackId) && trackId > 0 ? { track_id: trackId } : {}),
+    ...(Number.isInteger(trackId) && trackId >= 0 ? { track_id: trackId } : {}),
     ...(Number.isInteger(pluginIndex) && pluginIndex >= 0 ? { plugin_index: pluginIndex } : {}),
     ...(safeNode.bypassed !== undefined ? { bypassed: asBoolean(safeNode.bypassed, false) } : {}),
     params,
@@ -471,8 +497,37 @@ export function normalizeProject(project) {
     nodes: Array.isArray(source.nodes) ? source.nodes.map((node, index) => normalizeNode(node, index)) : [],
     patterns,
     playlist,
-    mixer: Array.isArray(source.mixer) ? source.mixer.map((entry, index) => normalizeMixerEntry(entry, index)) : [],
+    mixer: Array.isArray(source.mixer)
+      ? source.mixer
+        .map((entry, index) => normalizeMixerEntry(entry, index))
+        .filter((entry) => entry != null)
+      : [],
+    master_mix: normalizeMasterMix(source.master_mix ?? source.masterMix),
   };
+}
+
+function validateMasterMix(entry, errors) {
+  if (entry === undefined) {
+    return;
+  }
+  if (!isObject(entry)) {
+    errors.push('master_mix must be an object');
+    return;
+  }
+  const volume = asNumber(entry.volume, NaN);
+  if (!Number.isFinite(volume) || volume < 0 || volume > 1.2) {
+    errors.push('master_mix.volume must be between 0 and 1.2');
+  }
+  const pan = asNumber(entry.pan, NaN);
+  if (!Number.isFinite(pan) || pan < -1 || pan > 1) {
+    errors.push('master_mix.pan must be between -1 and 1');
+  }
+  if (entry.mute !== undefined && typeof entry.mute !== 'boolean') {
+    errors.push('master_mix.mute must be a boolean');
+  }
+  if (entry.chain_enabled !== undefined && typeof entry.chain_enabled !== 'boolean') {
+    errors.push('master_mix.chain_enabled must be a boolean');
+  }
 }
 
 function validatePattern(pattern, patternIndex, errors) {
@@ -676,8 +731,12 @@ function validateNode(node, nodeIndex, errors) {
     errors.push(`nodes[${nodeIndex}].type must be a non-empty string`);
   }
 
-  if (node.track_id !== undefined && (!Number.isInteger(node.track_id) || node.track_id <= 0)) {
-    errors.push(`nodes[${nodeIndex}].track_id must be a positive integer`);
+  if (node.track_id !== undefined) {
+    if (!Number.isInteger(node.track_id) || node.track_id < 0) {
+      errors.push(`nodes[${nodeIndex}].track_id must be a non-negative integer`);
+    } else if (node.track_id === 0 && isNonEmptyString(node.type) && node.type.trim() !== 'vst_instrument') {
+      errors.push(`nodes[${nodeIndex}].track_id 0 (master bus) is only allowed for vst_instrument nodes`);
+    }
   }
 
   if (node.plugin_index !== undefined && (!Number.isInteger(node.plugin_index) || node.plugin_index < 0)) {
@@ -901,6 +960,8 @@ export function validateProject(project) {
       validateMixerEntry(entry, mixerIndex, errors);
     }
   }
+
+  validateMasterMix(project.master_mix, errors);
 
   return { ok: errors.length === 0, errors };
 }

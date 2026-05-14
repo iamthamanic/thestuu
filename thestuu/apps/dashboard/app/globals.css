@@ -1663,6 +1663,7 @@ body {
   background: transparent;
   position: relative;
   z-index: 1;
+  touch-action: none;
 }
 
 .arrangement-pan-slider::-webkit-slider-runnable-track {
@@ -3761,6 +3762,7 @@ body {
   top: 0;
   bottom: 0;
   width: 2px;
+  z-index: 20;
   background: rgba(168, 85, 247, 0.9);
   pointer-events: none;
 }
@@ -4607,9 +4609,10 @@ body {
 }
 
 .mix-strip-ruler-item.master {
-  flex: 0 0 80px;
-  width: 80px;
-  min-width: 80px;
+  /* Same column width as .mix-strip so ruler "M" aligns with master controls (fader is 108px wide in layout). */
+  flex: 0 0 120px;
+  width: 120px;
+  min-width: 120px;
   border-right: 1px solid rgba(255, 255, 255, 0.12);
 }
 
@@ -4636,6 +4639,9 @@ body {
   gap: 6px;
   user-select: none;
   cursor: pointer;
+  /* Rotated range inputs can spill into the next column; clip so the neighbour strip does not receive drags. */
+  overflow-x: clip;
+  position: relative;
 }
 
 .mix-strip.active {
@@ -4693,8 +4699,8 @@ body {
 .mix-strip-master {
   cursor: default;
   flex: 0 0 auto;
-  width: 80px;
-  min-width: 80px;
+  width: 120px;
+  min-width: 120px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(8, 10, 14, 0.44));
   border-right-color: rgba(255, 255, 255, 0.14);
 }
@@ -4871,6 +4877,7 @@ body {
   height: 20px;
   transform: rotate(-90deg);
   transform-origin: center;
+  touch-action: none;
 }
 
 .mix-strip-db {

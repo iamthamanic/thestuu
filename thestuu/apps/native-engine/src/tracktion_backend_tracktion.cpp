@@ -4973,8 +4973,8 @@ bool isTrackUtilityPlugin(tracktion::engine::Plugin* plugin) {
       || dynamic_cast<tracktion::engine::LevelMeterPlugin*>(plugin) != nullptr;
 }
 
-tracktion::engine::Plugin* getTrackPluginByVisibleIndex(
-  tracktion::engine::AudioTrack& track,
+tracktion::engine::Plugin* getPluginByVisibleIndexForList(
+  tracktion::engine::PluginList& pluginList,
   int32_t visiblePluginIndex,
   int32_t& actualPluginIndex,
   std::string& error
@@ -4988,8 +4988,8 @@ tracktion::engine::Plugin* getTrackPluginByVisibleIndex(
   }
 
   int32_t visibleIndex = 0;
-  for (int32_t rawIndex = 0; rawIndex < track.pluginList.size(); ++rawIndex) {
-    auto* plugin = track.pluginList[rawIndex];
+  for (int32_t rawIndex = 0; rawIndex < pluginList.size(); ++rawIndex) {
+    auto* plugin = pluginList[rawIndex];
     if (plugin == nullptr || isTrackUtilityPlugin(plugin)) {
       continue;
     }
@@ -5004,15 +5004,34 @@ tracktion::engine::Plugin* getTrackPluginByVisibleIndex(
   return nullptr;
 }
 
+tracktion::engine::Plugin* getTrackPluginByVisibleIndex(
+  tracktion::engine::AudioTrack& track,
+  int32_t visiblePluginIndex,
+  int32_t& actualPluginIndex,
+  std::string& error
+) {
+  return getPluginByVisibleIndexForList(track.pluginList, visiblePluginIndex, actualPluginIndex, error);
+}
+
 bool openPluginEditorImpl(int32_t trackId, int32_t pluginIndex, std::string& error) {
-  auto* track = getAudioTrackByIndex(trackId);
-  if (track == nullptr) {
-    error = "track_id out of range";
+  if (!requireEdit(error)) {
     return false;
   }
 
   int32_t actualPluginIndex = -1;
-  auto* plugin = getTrackPluginByVisibleIndex(*track, pluginIndex, actualPluginIndex, error);
+  tracktion::engine::Plugin* plugin = nullptr;
+  if (trackId == 0) {
+    gState->edit->ensureMasterTrack();
+    auto& list = gState->edit->getMasterPluginList();
+    plugin = getPluginByVisibleIndexForList(list, pluginIndex, actualPluginIndex, error);
+  } else {
+    auto* track = getAudioTrackByIndex(trackId);
+    if (track == nullptr) {
+      error = "track_id out of range";
+      return false;
+    }
+    plugin = getTrackPluginByVisibleIndex(*track, pluginIndex, actualPluginIndex, error);
+  }
   if (plugin == nullptr) {
     return false;
   }
@@ -5735,6 +5754,21 @@ bool setTrackVolume(int32_t trackId, double volume, std::string& error) {
     error = "backend not initialised";
     return false;
   }
+  if (trackId == 0) {
+    if (!requireEdit(error)) {
+      return false;
+    }
+    gState->edit->ensureMasterTrack();
+    if (auto volPan = gState->edit->getMasterVolumePlugin()) {
+      const float pos = static_cast<float>(std::max(0.0, std::min(1.0, volume)));
+      if (std::abs(volPan->getSliderPos() - pos) < 1.0e-4f) {
+        return true;
+      }
+      volPan->setSliderPos(pos);
+      transportRebuildGraphOnly();
+    }
+    return true;
+  }
   auto* track = getAudioTrackByIndex(trackId);
   if (track == nullptr) {
     error = "track_id out of range";
@@ -5757,6 +5791,21 @@ bool setTrackPan(int32_t trackId, double pan, std::string& error) {
   if (!gState || !gState->engine) {
     error = "backend not initialised";
     return false;
+  }
+  if (trackId == 0) {
+    if (!requireEdit(error)) {
+      return false;
+    }
+    gState->edit->ensureMasterTrack();
+    if (auto volPan = gState->edit->getMasterVolumePlugin()) {
+      const float p = static_cast<float>(std::max(-1.0, std::min(1.0, pan)));
+      if (std::abs(volPan->getPan() - p) < 1.0e-4f) {
+        return true;
+      }
+      volPan->setPan(p);
+      transportRebuildGraphOnly();
+    }
+    return true;
   }
   auto* track = getAudioTrackByIndex(trackId);
   if (track == nullptr) {
@@ -5998,10 +6047,17 @@ bool loadPlugin(const std::string& pluginUid, int32_t trackId, LoadPluginResult&
   }
 
   try {
-    auto* track = getAudioTrackByIndex(trackId);
-    if (track == nullptr) {
-      error = "track_id out of range";
-      return false;
+    tracktion::engine::PluginList* targetList = nullptr;
+    if (trackId == 0) {
+      gState->edit->ensureMasterTrack();
+      targetList = &gState->edit->getMasterPluginList();
+    } else {
+      auto* track = getAudioTrackByIndex(trackId);
+      if (track == nullptr) {
+        error = "track_id out of range";
+        return false;
+      }
+      targetList = &track->pluginList;
     }
 
     tracktion::engine::Plugin::Ptr plugin;
@@ -6042,8 +6098,8 @@ bool loadPlugin(const std::string& pluginUid, int32_t trackId, LoadPluginResult&
       return false;
     }
 
-    track->pluginList.insertPlugin(plugin, track->pluginList.size(), nullptr);
-    const int pluginIndex = track->pluginList.indexOf(plugin.get());
+    targetList->insertPlugin(plugin, targetList->size(), nullptr);
+    const int pluginIndex = targetList->indexOf(plugin.get());
     if (pluginIndex < 0) {
       error = "failed to insert plugin into track";
       return false;
@@ -6183,14 +6239,20 @@ bool setPluginParameter(
   }
 
   try {
-    auto* track = getAudioTrackByIndex(trackId);
-    if (track == nullptr) {
-      error = "track_id out of range";
-      return false;
-    }
-
+    tracktion::engine::Plugin* plugin = nullptr;
     int32_t actualPluginIndex = -1;
-    auto* plugin = getTrackPluginByVisibleIndex(*track, pluginIndex, actualPluginIndex, error);
+    if (trackId == 0) {
+      gState->edit->ensureMasterTrack();
+      auto& list = gState->edit->getMasterPluginList();
+      plugin = getPluginByVisibleIndexForList(list, pluginIndex, actualPluginIndex, error);
+    } else {
+      auto* track = getAudioTrackByIndex(trackId);
+      if (track == nullptr) {
+        error = "track_id out of range";
+        return false;
+      }
+      plugin = getTrackPluginByVisibleIndex(*track, pluginIndex, actualPluginIndex, error);
+    }
     if (plugin == nullptr) {
       return false;
     }

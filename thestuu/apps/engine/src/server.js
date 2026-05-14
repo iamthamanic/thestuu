@@ -994,6 +994,23 @@ function ensureProjectArrays() {
   state.project.patterns = Array.isArray(state.project.patterns) ? state.project.patterns : [];
   state.project.mixer = Array.isArray(state.project.mixer) ? state.project.mixer : [];
   state.project.nodes = Array.isArray(state.project.nodes) ? state.project.nodes : [];
+  if (!isObject(state.project.master_mix)) {
+    state.project.master_mix = { volume: 1, pan: 0, mute: false, chain_enabled: true };
+  } else {
+    const mm = state.project.master_mix;
+    if (!Number.isFinite(Number(mm.volume))) {
+      mm.volume = 1;
+    } else {
+      mm.volume = Math.max(0, Math.min(1.2, Number(mm.volume)));
+    }
+    if (!Number.isFinite(Number(mm.pan))) {
+      mm.pan = 0;
+    } else {
+      mm.pan = Math.max(-1, Math.min(1, Number(mm.pan)));
+    }
+    mm.mute = normalizeBool(mm.mute, false);
+    mm.chain_enabled = normalizeBool(mm.chain_enabled, true);
+  }
   if (typeof state.project.metronome_enabled !== 'boolean') {
     state.project.metronome_enabled = DEFAULT_METRONOME_ENABLED;
   }
@@ -1004,6 +1021,20 @@ function ensureProjectArrays() {
   if (!Number.isInteger(countIn) || countIn < 1 || countIn > 10) {
     state.project.record_count_in_beats = 4;
   }
+
+  /** Strip invalid mixer rows (track_id < 1); dedupe by track_id so master is never aliased to track 1. */
+  const rawMixer = Array.isArray(state.project.mixer) ? state.project.mixer : [];
+  const byTrackId = new Map();
+  for (const row of rawMixer) {
+    const tid = Number(row?.track_id);
+    if (!Number.isInteger(tid) || tid < 1) {
+      continue;
+    }
+    byTrackId.set(tid, row);
+  }
+  state.project.mixer = Array.from(byTrackId.keys())
+    .sort((a, b) => a - b)
+    .map((tid) => ({ ...byTrackId.get(tid), track_id: tid }));
 }
 
 function normalizeBool(value) {
@@ -1164,6 +1195,9 @@ function resolveRequestedPluginSlotKind(value) {
 }
 
 function getOrCreateMixerEntry(trackId) {
+  if (!Number.isInteger(trackId) || trackId < 1) {
+    throw new Error(`getOrCreateMixerEntry: invalid trackId ${String(trackId)} (master uses master_mix, not mixer[])`);
+  }
   ensureProjectArrays();
   let entry = state.project.mixer.find((mixerEntry) => mixerEntry.track_id === trackId);
   if (!entry) {
@@ -1791,6 +1825,31 @@ function assertTrackId(payload) {
   return assertPositiveInteger(payload.trackId ?? payload.track_id, 'trackId');
 }
 
+/**
+ * Mixer-style socket payloads: integer track id >= 0 (0 = master bus).
+ * Prefer `trackId` when the key exists so `0` is never treated as "missing".
+ */
+function resolveMixerSocketTrackId(payload = {}) {
+  if (!isObject(payload)) {
+    return NaN;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'trackId')) {
+    const v = Number(payload.trackId);
+    if (Number.isInteger(v) && v >= 0) {
+      return v;
+    }
+    return NaN;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'track_id')) {
+    const v = Number(payload.track_id);
+    if (Number.isInteger(v) && v >= 0) {
+      return v;
+    }
+    return NaN;
+  }
+  return NaN;
+}
+
 function assertClipId(payload) {
   const raw = payload.clipId ?? payload.clip_id;
   if (raw !== undefined && raw !== null && String(raw).trim() !== '') {
@@ -1840,8 +1899,30 @@ function resolveVstNodePluginUid(node) {
 }
 
 function resolveVstNodeTrackId(node) {
-  const trackIdRaw = Number(node?.track_id ?? node?.trackId ?? 1);
-  return Number.isInteger(trackIdRaw) && trackIdRaw > 0 ? trackIdRaw : 1;
+  if (!isObject(node)) {
+    return 1;
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'track_id')) {
+    const v = Number(node.track_id);
+    if (v === 0) {
+      return 0;
+    }
+    if (Number.isInteger(v) && v > 0) {
+      return v;
+    }
+    return 1;
+  }
+  if (Object.prototype.hasOwnProperty.call(node, 'trackId')) {
+    const v = Number(node.trackId);
+    if (v === 0) {
+      return 0;
+    }
+    if (Number.isInteger(v) && v > 0) {
+      return v;
+    }
+    return 1;
+  }
+  return 1;
 }
 
 function resolveVstNodePluginIndex(node, fallback = 0) {
@@ -1851,7 +1932,7 @@ function resolveVstNodePluginIndex(node, fallback = 0) {
 
 function getSortedVstNodeEntriesForTrack(trackId) {
   const resolvedTrackId = Number(trackId);
-  if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0) {
+  if (!Number.isInteger(resolvedTrackId) || resolvedTrackId < 0) {
     return [];
   }
 
@@ -1938,7 +2019,11 @@ async function restoreNativeVstNodes({ resetEdit = false } = {}) {
       if (!isVstInstrumentNode(node)) {
         return maxTrackId;
       }
-      return Math.max(maxTrackId, resolveVstNodeTrackId(node));
+      const tid = resolveVstNodeTrackId(node);
+      if (tid === 0) {
+        return maxTrackId;
+      }
+      return Math.max(maxTrackId, tid);
     }, 1);
     const maxTrackIdFromPlaylist = (state.project.playlist || []).reduce(
       (max, t) => Math.max(max, Number(t.track_id) || 0),
@@ -2010,7 +2095,7 @@ async function restoreNativeVstNodes({ resetEdit = false } = {}) {
         ? loadedPlugin.name
         : (usedUltrasoundFallback ? 'Ultrasound' : (isNonEmptyString(node.plugin) ? node.plugin.trim() : resolvedPluginUid));
       node.plugin_uid = isNonEmptyString(loadedPlugin.uid) ? loadedPlugin.uid : resolvedPluginUid;
-      node.track_id = Number.isInteger(loadedTrackId) && loadedTrackId > 0 ? loadedTrackId : trackId;
+      node.track_id = Number.isInteger(loadedTrackId) && loadedTrackId >= 0 ? loadedTrackId : trackId;
       node.plugin_index = Number.isInteger(loadedPluginIndex) && loadedPluginIndex >= 0 ? loadedPluginIndex : 0;
 
       const parameterSchema = normalizePluginParameters(loadedPlugin.parameters);
@@ -2432,6 +2517,13 @@ async function syncNativeArrangementFromPlaylist(options = {}) {
       const p = Number.isFinite(Number(entry?.pan)) ? Number(entry.pan) : 0;
       await requestNativeTransport('track:set-pan', { track_id: trackId, pan: Math.max(-1, Math.min(1, p)) }).catch(() => {});
       await requestNativeTransport('track:set-record-arm', { track_id: trackId, record_armed: normalizeBool(entry.record_armed) }).catch(() => {});
+    }
+    const mm = state.project.master_mix;
+    if (isObject(mm)) {
+      const mvol = Number.isFinite(Number(mm.volume)) ? Number(mm.volume) : 1;
+      const mpan = Number.isFinite(Number(mm.pan)) ? Number(mm.pan) : 0;
+      await requestNativeTransport('track:set-volume', { track_id: 0, volume: Math.max(0, Math.min(1.2, mvol)) }).catch(() => {});
+      await requestNativeTransport('track:set-pan', { track_id: 0, pan: Math.max(-1, Math.min(1, mpan)) }).catch(() => {});
     }
     // Ensure Track 1 is audible when it has clips (workaround for sync leaving it silent).
     const track1 = playlist.find((t) => Number(t?.track_id) === 1);
@@ -4054,14 +4146,24 @@ io.on('connection', (socket) => {
   });
 
   socket.on('track:set-volume', (payload = {}, callback = () => {}) => {
-    const trackId = Number(payload.trackId ?? payload.track_id);
+    const trackId = resolveMixerSocketTrackId(payload);
     const volume = Number(payload.volume);
-    if (!Number.isFinite(trackId) || !Number.isFinite(volume)) {
-      respond(callback, { ok: false, error: 'trackId and volume must be numbers' });
+    if (!Number.isInteger(trackId) || trackId < 0 || !Number.isFinite(volume)) {
+      respond(callback, { ok: false, error: 'trackId (integer >= 0) and volume must be numbers' });
       return;
     }
 
     const clampedVolume = Math.max(0, Math.min(1.2, volume));
+    if (trackId === 0) {
+      ensureProjectArrays();
+      state.project.master_mix.volume = clampedVolume;
+      requestNativeTransport('track:set-volume', { track_id: 0, volume: clampedVolume })
+        .catch((err) => console.warn('[thestuu-engine] master track:set-volume native:', err instanceof Error ? err.message : String(err)));
+      emitState();
+      respond(callback, { ok: true, trackId: 0, volume: clampedVolume });
+      return;
+    }
+
     const existing = getOrCreateMixerEntry(trackId);
     existing.volume = clampedVolume;
 
@@ -4073,14 +4175,24 @@ io.on('connection', (socket) => {
   });
 
   socket.on('track:set-pan', (payload = {}, callback = () => {}) => {
-    const trackId = Number(payload.trackId ?? payload.track_id);
+    const trackId = resolveMixerSocketTrackId(payload);
     const pan = Number(payload.pan);
-    if (!Number.isFinite(trackId) || !Number.isFinite(pan)) {
-      respond(callback, { ok: false, error: 'trackId and pan must be numbers' });
+    if (!Number.isInteger(trackId) || trackId < 0 || !Number.isFinite(pan)) {
+      respond(callback, { ok: false, error: 'trackId (integer >= 0) and pan must be numbers' });
       return;
     }
 
     const clampedPan = Math.max(-1, Math.min(1, pan));
+    if (trackId === 0) {
+      ensureProjectArrays();
+      state.project.master_mix.pan = clampedPan;
+      requestNativeTransport('track:set-pan', { track_id: 0, pan: clampedPan })
+        .catch((err) => console.warn('[thestuu-engine] master track:set-pan native:', err instanceof Error ? err.message : String(err)));
+      emitState();
+      respond(callback, { ok: true, trackId: 0, pan: clampedPan });
+      return;
+    }
+
     const entry = getOrCreateMixerEntry(trackId);
     entry.pan = clampedPan;
 
@@ -4092,13 +4204,21 @@ io.on('connection', (socket) => {
   });
 
   socket.on('track:set-mute', (payload = {}, callback = () => {}) => {
-    const trackId = Number(payload.trackId ?? payload.track_id);
-    if (!Number.isFinite(trackId)) {
-      respond(callback, { ok: false, error: 'trackId must be numeric' });
+    const trackId = resolveMixerSocketTrackId(payload);
+    if (!Number.isInteger(trackId) || trackId < 0) {
+      respond(callback, { ok: false, error: 'trackId must be an integer >= 0' });
       return;
     }
 
     const muted = normalizeBool(payload.mute);
+    if (trackId === 0) {
+      ensureProjectArrays();
+      state.project.master_mix.mute = muted;
+      emitState();
+      respond(callback, { ok: true, trackId: 0, mute: muted });
+      return;
+    }
+
     const entry = getOrCreateMixerEntry(trackId);
     entry.mute = muted;
 
@@ -4110,9 +4230,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('track:set-solo', (payload = {}, callback = () => {}) => {
-    const trackId = Number(payload.trackId ?? payload.track_id);
-    if (!Number.isFinite(trackId)) {
-      respond(callback, { ok: false, error: 'trackId must be numeric' });
+    const trackId = resolveMixerSocketTrackId(payload);
+    if (!Number.isInteger(trackId) || trackId < 0) {
+      respond(callback, { ok: false, error: 'trackId must be an integer >= 0' });
+      return;
+    }
+    if (trackId === 0) {
+      respond(callback, { ok: false, error: 'Solo is not defined for the master bus' });
       return;
     }
 
@@ -4128,9 +4252,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('track:set-record-arm', (payload = {}, callback = () => {}) => {
-    const trackId = Number(payload.trackId ?? payload.track_id);
-    if (!Number.isFinite(trackId)) {
-      respond(callback, { ok: false, error: 'trackId must be numeric' });
+    const trackId = resolveMixerSocketTrackId(payload);
+    if (!Number.isInteger(trackId) || trackId < 0) {
+      respond(callback, { ok: false, error: 'trackId must be an integer >= 0' });
+      return;
+    }
+    if (trackId === 0) {
+      respond(callback, { ok: false, error: 'Record arm is not defined for the master bus' });
       return;
     }
 
@@ -4413,9 +4541,22 @@ io.on('connection', (socket) => {
 
   socket.on('track:set-chain-enabled', (payload = {}, callback = () => {}) => {
     ensureProjectArrays();
-    const trackId = Number(payload.trackId ?? payload.track_id);
-    if (!Number.isInteger(trackId) || trackId <= 0) {
-      respond(callback, { ok: false, error: 'trackId is required' });
+    const trackId = resolveMixerSocketTrackId(payload);
+    if (!Number.isInteger(trackId) || trackId < 0) {
+      respond(callback, { ok: false, error: 'trackId is required (integer >= 0)' });
+      return;
+    }
+    const enabled = normalizeBool(payload.enabled ?? payload.chain_enabled, true);
+    if (trackId === 0) {
+      state.project.master_mix.chain_enabled = enabled;
+      const vstNodesOnMaster = (state.project.nodes || []).filter(
+        (node) => isVstInstrumentNode(node) && resolveVstNodeTrackId(node) === 0,
+      );
+      for (const node of vstNodesOnMaster) {
+        node.bypassed = !enabled;
+      }
+      emitState();
+      respond(callback, { ok: true, trackId: 0, chain_enabled: enabled });
       return;
     }
     const track = state.project.playlist.find((entry) => Number(entry.track_id) === trackId);
@@ -4423,7 +4564,6 @@ io.on('connection', (socket) => {
       respond(callback, { ok: false, error: `track "${trackId}" not found` });
       return;
     }
-    const enabled = normalizeBool(payload.enabled ?? payload.chain_enabled, true);
     track.chain_enabled = enabled;
     const vstNodesOnTrack = (state.project.nodes || []).filter(
       (node) => isVstInstrumentNode(node) && Number(node?.track_id ?? node?.trackId) === trackId,
@@ -4619,8 +4759,13 @@ io.on('connection', (socket) => {
         : (typeof payload.pluginUid === 'string' && payload.pluginUid.trim()
           ? payload.pluginUid.trim()
           : (typeof payload.plugin === 'string' && payload.plugin.trim() ? payload.plugin.trim() : 'ultrasound'));
-      const trackIdRaw = Number(payload.track_id ?? payload.trackId ?? 1);
-      const trackId = Number.isInteger(trackIdRaw) && trackIdRaw > 0 ? trackIdRaw : 1;
+      let trackId;
+      if (payload.track_id === 0 || payload.trackId === 0) {
+        trackId = 0;
+      } else {
+        const trackIdRaw = Number(payload.track_id ?? payload.trackId ?? 1);
+        trackId = Number.isInteger(trackIdRaw) && trackIdRaw > 0 ? trackIdRaw : 1;
+      }
       const insertIndexRaw = Number(payload.insert_index ?? payload.insertIndex);
       const requestedInsertIndex = Number.isInteger(insertIndexRaw) && insertIndexRaw >= 0 ? insertIndexRaw : null;
       const requestedSlotKind = resolveRequestedPluginSlotKind(payload.slot_kind ?? payload.slotKind);
@@ -4662,6 +4807,10 @@ io.on('connection', (socket) => {
       );
       const pluginKind = loadedPluginKind || pluginCatalogEntry?.kind || 'effect';
       const pluginIsInstrument = pluginKind === 'instrument';
+      if (trackId === 0 && pluginIsInstrument) {
+        respond(callback, { ok: false, error: 'Instrumente koennen nicht auf den Master-Bus geladen werden.' });
+        return;
+      }
       const loadedIsNativeFlag = parseOptionalBool(loadedPlugin?.isNative ?? loadedPlugin?.is_native);
       const pluginIsNative = typeof loadedIsNativeFlag === 'boolean'
         ? loadedIsNativeFlag
@@ -4796,7 +4945,7 @@ io.on('connection', (socket) => {
       } else {
         const trackId = Number(payload.track_id ?? payload.trackId);
         const pluginIndex = Number(payload.plugin_index ?? payload.pluginIndex);
-        if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
+        if (!Number.isInteger(trackId) || trackId < 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
           respond(callback, { ok: false, error: 'nodeId or (track_id + plugin_index) is required' });
           return;
         }
@@ -4840,7 +4989,7 @@ io.on('connection', (socket) => {
       const trackId = Number(payload.track_id ?? payload.trackId);
       const fromIndexRaw = Number(payload.from_index ?? payload.fromIndex);
       const toIndexRaw = Number(payload.to_index ?? payload.toIndex);
-      if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(fromIndexRaw) || fromIndexRaw < 0 || !Number.isInteger(toIndexRaw) || toIndexRaw < 0) {
+      if (!Number.isInteger(trackId) || trackId < 0 || !Number.isInteger(fromIndexRaw) || fromIndexRaw < 0 || !Number.isInteger(toIndexRaw) || toIndexRaw < 0) {
         respond(callback, { ok: false, error: 'track_id, from_index and to_index are required' });
         return;
       }
@@ -4894,7 +5043,7 @@ io.on('connection', (socket) => {
     } else {
       const trackId = Number(payload.track_id ?? payload.trackId);
       const pluginIndex = Number(payload.plugin_index ?? payload.pluginIndex);
-      if (!Number.isInteger(trackId) || trackId <= 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
+      if (!Number.isInteger(trackId) || trackId < 0 || !Number.isInteger(pluginIndex) || pluginIndex < 0) {
         respond(callback, { ok: false, error: 'nodeId or (track_id + plugin_index) is required' });
         return;
       }
@@ -4932,7 +5081,7 @@ io.on('connection', (socket) => {
         ? payload.param_id.trim()
         : (typeof payload.paramId === 'string' && payload.paramId.trim() ? payload.paramId.trim() : '');
 
-      if (!Number.isInteger(trackIdRaw) || trackIdRaw <= 0 || !Number.isInteger(pluginIndexRaw) || pluginIndexRaw < 0 || !Number.isFinite(valueRaw) || !paramId) {
+      if (!Number.isInteger(trackIdRaw) || trackIdRaw < 0 || !Number.isInteger(pluginIndexRaw) || pluginIndexRaw < 0 || !Number.isFinite(valueRaw) || !paramId) {
         respond(callback, { ok: false, error: 'track_id, plugin_index, param_id and value are required' });
         return;
       }
