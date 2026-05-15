@@ -121,7 +121,7 @@ export function updateNodeMeta(nodes, id, patch) {
 }
 
 /**
- * Remove node at index; its bar length is merged into the previous sibling, or into the next if it was first.
+ * Remove node at index; neighboring sections keep their bar lengths (total structure timeline shrinks).
  * Removing the last remaining node yields an empty array (no sections).
  */
 export function removeStructureNodeAt(nodes, index) {
@@ -132,22 +132,7 @@ export function removeStructureNodeAt(nodes, index) {
     return [];
   }
   const next = cloneNodes(nodes);
-  const removed = next[index];
-  const removedLen = Math.max(MIN_NODE_LENGTH, Number(removed.length) || MIN_NODE_LENGTH);
   next.splice(index, 1);
-  if (index > 0) {
-    const prev = next[index - 1];
-    next[index - 1] = {
-      ...prev,
-      length: Math.max(MIN_NODE_LENGTH, (Number(prev.length) || MIN_NODE_LENGTH) + removedLen),
-    };
-  } else {
-    const head = next[0];
-    next[0] = {
-      ...head,
-      length: Math.max(MIN_NODE_LENGTH, (Number(head.length) || MIN_NODE_LENGTH) + removedLen),
-    };
-  }
   return next;
 }
 

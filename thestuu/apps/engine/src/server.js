@@ -2484,6 +2484,33 @@ async function syncPlaylistClipsToNative() {
   return errors;
 }
 
+/** True if the track row has at least one audio clip native can sync (same criteria as syncPlaylistClipsToNative). */
+function trackHasSyncableAudioClipForNative(track) {
+  if (!track) {
+    return false;
+  }
+  const clips = Array.isArray(track.clips) ? track.clips : [];
+  for (const clip of clips) {
+    const sourcePath = isNonEmptyString(clip.source_path)
+      ? clip.source_path.trim()
+      : (isNonEmptyString(clip.sourcePath) ? clip.sourcePath.trim() : (isNonEmptyString(clip.file_path) ? clip.file_path.trim() : (isNonEmptyString(clip.filePath) ? clip.filePath.trim() : '')));
+    if (!sourcePath) {
+      continue;
+    }
+    const type = (clip.type || clip.clip_type || 'audio').toString().toLowerCase();
+    if (type !== 'audio') {
+      continue;
+    }
+    const start = Number(clip.start);
+    const length = Number(clip.length);
+    if (!Number.isFinite(start) || !Number.isFinite(length) || length <= 0) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 async function syncNativeArrangementFromPlaylist(options = {}) {
   const mergeNativeFirst = options.mergeNativeFirst !== false;
   if (!nativeTransportActive) {
@@ -2546,11 +2573,17 @@ async function syncNativeArrangementFromPlaylist(options = {}) {
       await requestNativeTransport('track:set-volume', { track_id: 0, volume: Math.max(0, Math.min(1.2, mvol)) }).catch(() => {});
       await requestNativeTransport('track:set-pan', { track_id: 0, pan: Math.max(-1, Math.min(1, mpan)) }).catch(() => {});
     }
-    // Ensure Track 1 is audible when it has clips (workaround for sync leaving it silent).
-    const track1 = playlist.find((t) => Number(t?.track_id) === 1);
-    if (track1 && Array.isArray(track1.clips) && track1.clips.length > 0) {
-      await requestNativeTransport('track:set-mute', { track_id: 1, mute: false }).catch(() => {});
-      await requestNativeTransport('track:set-volume', { track_id: 1, volume: 0.85 }).catch(() => {});
+    // Workaround: after clear+reimport, native can leave tracks silent (not only track 1), e.g. after cross-track move.
+    for (const track of playlist) {
+      const tid = Number(track?.track_id);
+      if (!Number.isInteger(tid) || tid < 1) {
+        continue;
+      }
+      if (!trackHasSyncableAudioClipForNative(track)) {
+        continue;
+      }
+      await requestNativeTransport('track:set-mute', { track_id: tid, mute: false }).catch(() => {});
+      await requestNativeTransport('track:set-volume', { track_id: tid, volume: 0.85 }).catch(() => {});
     }
     // Rebuild playback graph immediately so play works instantly (no timer wait).
     await requestNativeTransport('transport:ensure-context', {});
@@ -2565,6 +2598,13 @@ async function syncNativeArrangementFromPlaylist(options = {}) {
   } catch (error) {
     console.warn('[thestuu-engine] native arrangement sync failed:', error instanceof Error ? error.message : String(error));
   }
+}
+
+/** Whether timeline intervals [start, start+len) overlap in bar units (tolerance avoids touching-adjacent false positives). */
+function clipIntervalsOverlapBars(startA, lenA, startB, lenB, toleranceBars = 1e-5) {
+  const endA = startA + lenA;
+  const endB = startB + lenB;
+  return startA + toleranceBars < endB && startB + toleranceBars < endA;
 }
 
 /**
@@ -2627,6 +2667,21 @@ async function mergeNativeClipsIntoPlaylist() {
         sortClips(track);
         merged += 1;
       }
+      continue;
+    }
+    const overlapsPlaylistClip = track.clips.some((existing) => {
+      const ep = existing.source_path ?? existing.sourcePath ?? '';
+      if (!isNonEmptyString(ep) || ep.trim() !== sourcePath) {
+        return false;
+      }
+      const es = Number(existing.start);
+      const el = Number(existing.length);
+      if (!Number.isFinite(es) || !Number.isFinite(el) || el <= 0) {
+        return false;
+      }
+      return clipIntervalsOverlapBars(es, el, startBars, lengthBars);
+    });
+    if (overlapsPlaylistClip) {
       continue;
     }
     const name = isNonEmptyString(c.name) ? c.name.trim() : path.basename(sourcePath, path.extname(sourcePath)) || path.basename(sourcePath);
@@ -3110,7 +3165,8 @@ async function importClipFile(payload = {}) {
   }
 
   if (nativeTransportActive && !nativeImportError) {
-    await syncNativeArrangementFromPlaylist();
+    /** Do not mergeNative before clear — stale native clips duplicate playlist rows after split/right-tail import. */
+    await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
     const syncErrors = state.nativeClipSyncSummary?.lastErrors ?? [];
     if (syncErrors.length > 0) {
       console.warn('[thestuu-engine] native clip sync after import:', syncErrors.join('; '));
@@ -3592,7 +3648,14 @@ async function setSongStructureNodes(payload = {}) {
   const current = normalizeSongStructure(state.project.song_structure);
   const oldNodes = current.nodes;
   const nextNodes = payload.nodes.map((node, index) => normalizeSongStructureNode(node, index));
-  const linkEnabled = Boolean(current.playlist_link_enabled);
+  /** Client sends this on every resize/reorder so overlay/link stays on even if set-playlist-link is still in flight. */
+  const linkFlagExplicit =
+    Object.prototype.hasOwnProperty.call(payload, 'playlist_link_enabled')
+    || Object.prototype.hasOwnProperty.call(payload, 'playlistLinkEnabled');
+  const nextPlaylistLinkEnabled = linkFlagExplicit
+    ? normalizeBool(payload.playlist_link_enabled ?? payload.playlistLinkEnabled)
+    : current.playlist_link_enabled;
+  const linkEnabled = Boolean(nextPlaylistLinkEnabled);
   const geometryChanged = !songStructureGeometryEqual(oldNodes, nextNodes);
 
   let clipsMoved = false;
@@ -3601,7 +3664,7 @@ async function setSongStructureNodes(payload = {}) {
   }
 
   state.project.song_structure = normalizeSongStructure({
-    playlist_link_enabled: current.playlist_link_enabled,
+    playlist_link_enabled: nextPlaylistLinkEnabled,
     template_id: Object.prototype.hasOwnProperty.call(payload, 'template_id')
       ? payload.template_id
       : current.template_id,

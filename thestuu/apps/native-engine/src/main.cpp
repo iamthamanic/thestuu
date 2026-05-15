@@ -1536,8 +1536,8 @@ double resolveSampleRate() {
 }
 
 int resolveBufferSize() {
-  // 512 is a safer default on macOS/CoreAudio than 256 (fewer dropouts / crackle under UI + meter load).
-  constexpr int defaultBufferSize = 512;
+  // Higher default reduces realtime dropouts under UI + analyzer load; CoreAudio often handles 1024 well on laptops.
+  constexpr int defaultBufferSize = 1024;
   if (const char* envValue = std::getenv("STUU_BUFFER_SIZE")) {
     char* end = nullptr;
     const long value = std::strtol(envValue, &end, 10);

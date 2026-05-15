@@ -27,17 +27,14 @@
 
 namespace thestuu::native {
 
-class GlobalSpectrumAnalyzerTap;
-
 struct BackendState {
   std::unique_ptr<juce::ScopedJuceInitialiser_GUI> juce;
   std::unique_ptr<tracktion::engine::Engine> engine;
   std::unique_ptr<tracktion::engine::Edit> edit;
   double sampleRate = 48000.0;
-  int bufferSize = 512;
+  int bufferSize = 1024;
   std::unordered_map<std::string, juce::PluginDescription> pluginByUid;
   std::unordered_map<std::string, std::vector<PluginParameterInfo>> parameterCacheByUid;
-  std::unique_ptr<GlobalSpectrumAnalyzerTap> spectrumAnalyzerTap;
   std::atomic<int32_t> spectrumAnalyzerTargetTrackId{0};
   std::atomic<int32_t> spectrumAnalyzerTargetPluginIndex{-1};
 };
@@ -113,182 +110,6 @@ tracktion::core::TimePosition convertBeatsToTime(double beats) {
 }
 
 }  // namespace
-
-class GlobalSpectrumAnalyzerTap final : public juce::AudioIODeviceCallback {
- public:
-  static constexpr int kCaptureRingSize = 1 << 16;
-  static constexpr int kWindowSize = 2048;
-  static constexpr int kBinCount = 96;
-
-  void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
-    if (device != nullptr) {
-      sampleRateHz.store(device->getCurrentSampleRate(), std::memory_order_relaxed);
-      outputChannels.store(device->getActiveOutputChannels().countNumberOfSetBits(), std::memory_order_relaxed);
-    }
-  }
-
-  void audioDeviceStopped() override {}
-
-  void audioDeviceIOCallbackWithContext(
-    const float* const* /*inputChannelData*/,
-    int /*numInputChannels*/,
-    float* const* outputChannelData,
-    int numOutputChannels,
-    int numSamples,
-    const juce::AudioIODeviceCallbackContext& /*context*/
-  ) override {
-    if (outputChannelData == nullptr || numOutputChannels <= 0 || numSamples <= 0) {
-      return;
-    }
-
-    outputChannels.store(numOutputChannels, std::memory_order_relaxed);
-    uint64_t writePos = writeCounter.load(std::memory_order_relaxed);
-    for (int sample = 0; sample < numSamples; ++sample) {
-      float mono = 0.0F;
-      int contributingChannels = 0;
-      for (int channel = 0; channel < numOutputChannels; ++channel) {
-        const float* channelData = outputChannelData[channel];
-        if (channelData == nullptr) {
-          continue;
-        }
-        mono += channelData[sample];
-        ++contributingChannels;
-      }
-      if (contributingChannels > 1) {
-        mono /= static_cast<float>(contributingChannels);
-      }
-
-      ringBuffer[static_cast<size_t>(writePos & (kCaptureRingSize - 1))] = mono;
-      ++writePos;
-    }
-
-    writeCounter.store(writePos, std::memory_order_release);
-    lastWriteTimestampMs.store(
-      static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count()),
-      std::memory_order_relaxed
-    );
-  }
-
-  bool getSnapshot(SpectrumAnalyzerSnapshot& out) {
-    out = {};
-    const double sampleRate = sampleRateHz.load(std::memory_order_relaxed);
-    const uint64_t writePos = writeCounter.load(std::memory_order_acquire);
-    if (!std::isfinite(sampleRate) || sampleRate <= 0.0 || writePos < static_cast<uint64_t>(kWindowSize)) {
-      return false;
-    }
-
-    std::array<float, kWindowSize> window{};
-    for (int i = 0; i < kWindowSize; ++i) {
-      const uint64_t idx = writePos - static_cast<uint64_t>(kWindowSize) + static_cast<uint64_t>(i);
-      window[static_cast<size_t>(i)] = ringBuffer[static_cast<size_t>(idx & (kCaptureRingSize - 1))];
-    }
-
-    // Hann window for a smoother analyzer curve (reduces leakage).
-    for (int i = 0; i < kWindowSize; ++i) {
-      const double phase = static_cast<double>(i) / static_cast<double>(kWindowSize - 1);
-      const float hann = static_cast<float>(0.5 - 0.5 * std::cos(juce::MathConstants<double>::twoPi * phase));
-      window[static_cast<size_t>(i)] *= hann;
-    }
-
-    prepareTargetFrequencies(sampleRate);
-    if (targetFrequenciesHz.empty()) {
-      return false;
-    }
-
-    const std::vector<float> rawDb = computeSpectrumDb(window, sampleRate);
-    if (rawDb.empty()) {
-      return false;
-    }
-
-    if (smoothedDb.size() != rawDb.size()) {
-      smoothedDb = rawDb;
-    } else {
-      constexpr float riseAlpha = 0.34F;
-      constexpr float fallAlpha = 0.16F;
-      for (size_t i = 0; i < rawDb.size(); ++i) {
-        const float target = rawDb[i];
-        const float current = smoothedDb[i];
-        const float alpha = target > current ? riseAlpha : fallAlpha;
-        smoothedDb[i] = current + ((target - current) * alpha);
-      }
-    }
-
-    out.available = true;
-    out.preMirrorsPost = true;
-    out.scope = "master";
-    out.channels = "mono";
-    out.sampleRate = sampleRate;
-    out.fftSize = kWindowSize;
-    out.minDb = -96.0;
-    out.maxDb = 6.0;
-    out.timestamp = lastWriteTimestampMs.load(std::memory_order_relaxed);
-    out.freqsHz = targetFrequenciesHz;
-    out.postDb = smoothedDb;
-    out.preDb = out.postDb;
-    return true;
-  }
-
- private:
-  void prepareTargetFrequencies(double sampleRate) {
-    const double nyquist = std::max(1000.0, sampleRate * 0.5);
-    const double maxFreq = std::min(20000.0, nyquist * 0.92);
-    const double minFreq = 20.0;
-    const bool needsRebuild = targetFrequenciesHz.size() != kBinCount
-      || !std::isfinite(cachedSampleRate)
-      || std::abs(cachedSampleRate - sampleRate) > 1.0
-      || !std::isfinite(cachedMaxFreq)
-      || std::abs(cachedMaxFreq - maxFreq) > 1.0;
-    if (!needsRebuild) {
-      return;
-    }
-
-    cachedSampleRate = sampleRate;
-    cachedMaxFreq = maxFreq;
-    targetFrequenciesHz.clear();
-    targetFrequenciesHz.reserve(kBinCount);
-
-    const double ratio = maxFreq / minFreq;
-    for (int i = 0; i < kBinCount; ++i) {
-      const double t = kBinCount <= 1 ? 0.0 : static_cast<double>(i) / static_cast<double>(kBinCount - 1);
-      const double freq = minFreq * std::pow(ratio, t);
-      targetFrequenciesHz.push_back(static_cast<float>(freq));
-    }
-  }
-
-  std::vector<float> computeSpectrumDb(const std::array<float, kWindowSize>& window, double sampleRate) const {
-    std::vector<float> out;
-    out.reserve(targetFrequenciesHz.size());
-
-    for (float freqHz : targetFrequenciesHz) {
-      const double omega = juce::MathConstants<double>::twoPi * static_cast<double>(freqHz) / sampleRate;
-      const double coeff = 2.0 * std::cos(omega);
-      double sPrev = 0.0;
-      double sPrev2 = 0.0;
-      for (float sample : window) {
-        const double s = static_cast<double>(sample) + (coeff * sPrev) - sPrev2;
-        sPrev2 = sPrev;
-        sPrev = s;
-      }
-      const double power = std::max(0.0, (sPrev * sPrev) + (sPrev2 * sPrev2) - (coeff * sPrev * sPrev2));
-      const double magnitude = std::sqrt(power) / static_cast<double>(kWindowSize);
-      const double db = 20.0 * std::log10(std::max(1.0e-6, magnitude));
-      out.push_back(static_cast<float>(juce::jlimit(-96.0, 6.0, db)));
-    }
-
-    return out;
-  }
-
-  std::array<float, kCaptureRingSize> ringBuffer{};
-  std::atomic<uint64_t> writeCounter{0};
-  std::atomic<double> sampleRateHz{48000.0};
-  std::atomic<int> outputChannels{0};
-  std::atomic<int64_t> lastWriteTimestampMs{0};
-  double cachedSampleRate = 0.0;
-  double cachedMaxFreq = 0.0;
-  std::vector<float> targetFrequenciesHz;
-  std::vector<float> smoothedDb;
-};
 
 namespace {
 
@@ -5989,7 +5810,7 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
   try {
     gState = std::make_unique<BackendState>();
     gState->sampleRate = std::isfinite(config.sampleRate) && config.sampleRate > 0.0 ? config.sampleRate : 48000.0;
-    gState->bufferSize = config.bufferSize > 0 ? config.bufferSize : 512;
+    gState->bufferSize = config.bufferSize > 0 ? config.bufferSize : 1024;
 
     gState->juce = std::make_unique<juce::ScopedJuceInitialiser_GUI>();
     gState->engine = std::make_unique<tracktion::engine::Engine>(
@@ -6006,9 +5827,11 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
       auto& juceDm = deviceManager.deviceManager;
       juce::AudioDeviceManager::AudioDeviceSetup setup = juceDm.getAudioDeviceSetup();
       const int desired = gState->bufferSize;
+      // On macOS, setAudioDeviceSetup(..., true) can tear down other CoreAudio clients and force aggressive
+      // device renegotiation (crackling / "tinny" system audio while Spotify or browser plays).
       if (desired > 0 && setup.bufferSize != desired) {
         setup.bufferSize = desired;
-        const juce::String setupErr = juceDm.setAudioDeviceSetup(setup, true);
+        const juce::String setupErr = juceDm.setAudioDeviceSetup(setup, false);
         if (setupErr.isNotEmpty()) {
           std::fprintf(
             stderr,
@@ -6017,9 +5840,17 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
             setupErr.toRawUTF8());
         }
       }
+      setup = juceDm.getAudioDeviceSetup();
+      if (std::isfinite(setup.sampleRate) && setup.sampleRate > 0.0) {
+        gState->sampleRate = setup.sampleRate;
+      }
+      if (setup.bufferSize > 0) {
+        gState->bufferSize = setup.bufferSize;
+      }
     }
-    gState->spectrumAnalyzerTap = std::make_unique<GlobalSpectrumAnalyzerTap>();
-    deviceManager.deviceManager.addAudioCallback(gState->spectrumAnalyzerTap.get());
+    // Do not register a second juce::AudioIODeviceCallback for "master spectrum": JUCE mixes extra
+    // callbacks from a scratch buffer onto the real output with += ; a read-only tap leaves
+    // uninitialized samples in that scratch buffer → metallic / digital noise on system audio.
     disablePhysicalWaveInputsMonitoring();
 
     // Do not create an edit here: the device list is not ready yet (Rebuilding Wave Device List
@@ -6029,8 +5860,8 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
     info.enabled = true;
     info.tracktion = true;
     info.description =
-      "tracktion backend ready (sampleRate=" + std::to_string(static_cast<int>(config.sampleRate)) +
-      ", bufferSize=" + std::to_string(config.bufferSize) + ", defaultTracks=" +
+      "tracktion backend ready (sampleRate=" + std::to_string(static_cast<int>(gState->sampleRate)) +
+      ", bufferSize=" + std::to_string(gState->bufferSize) + ", defaultTracks=" +
       std::to_string(kDefaultTrackCount) + ")";
     error.clear();
     return true;
@@ -6047,9 +5878,6 @@ bool initialiseBackend(const BackendConfig& config, BackendRuntimeInfo& info, st
 
 void shutdownBackend() {
   clearTrackMeterSlots();
-  if (gState && gState->engine && gState->spectrumAnalyzerTap) {
-    gState->engine->getDeviceManager().deviceManager.removeAudioCallback(gState->spectrumAnalyzerTap.get());
-  }
   gState.reset();
 }
 
@@ -6714,10 +6542,7 @@ bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
     }
   }
 
-  if (!gState->spectrumAnalyzerTap) {
-    return false;
-  }
-  return gState->spectrumAnalyzerTap->getSnapshot(out);
+  return false;
 }
 
 bool setSpectrumAnalyzerTarget(int32_t trackId, int32_t pluginIndex, std::string& error) {
@@ -7170,7 +6995,7 @@ bool setAudioOutputDevice(const std::string& deviceId, std::string& error) {
       auto& dm = gState->engine->getDeviceManager();
       auto setup = dm.deviceManager.getAudioDeviceSetup();
       setup.outputDeviceName = juce::String::fromUTF8(deviceId.c_str());
-      const juce::String err = dm.deviceManager.setAudioDeviceSetup(setup, true);
+      const juce::String err = dm.deviceManager.setAudioDeviceSetup(setup, false);
       if (err.isNotEmpty()) {
         errMsg = err.toStdString();
         return;
@@ -7271,7 +7096,7 @@ bool setAudioInputDevice(const std::string& deviceId, std::string& error) {
       auto& dm = gState->engine->getDeviceManager();
       auto setup = dm.deviceManager.getAudioDeviceSetup();
       setup.inputDeviceName = juce::String::fromUTF8(deviceId.c_str());
-      const juce::String err = dm.deviceManager.setAudioDeviceSetup(setup, true);
+      const juce::String err = dm.deviceManager.setAudioDeviceSetup(setup, false);
       if (err.isNotEmpty()) {
         errMsg = err.toStdString();
         return;

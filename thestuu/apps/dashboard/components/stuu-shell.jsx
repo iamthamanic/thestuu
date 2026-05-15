@@ -1021,6 +1021,53 @@ function snapToGrid(value, grid = GRID_STEP) {
   return Number((Math.round(value / grid) * grid).toFixed(6));
 }
 
+/** Clamp pointer-derived track index to existing playlist row ids (arrangement order). */
+function clampClipMoveTargetTrackId(rawTrackId, arrangementTracks) {
+  const ids = arrangementTracks
+    .map((t) => Number(t?.track_id))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (ids.length === 0) {
+    return Number.isInteger(rawTrackId) && rawTrackId > 0 ? rawTrackId : 1;
+  }
+  const lo = Math.min(...ids);
+  const hi = Math.max(...ids);
+  const base = Number.isInteger(rawTrackId) && rawTrackId > 0 ? rawTrackId : lo;
+  return clamp(base, lo, hi);
+}
+
+/**
+ * Draft for dragging a clip: start from horizontal delta; target track from grid Y (getGridPointerContext).
+ * Pure — pass barWidth from ref.current and getGridPointerContext from the shell.
+ */
+function buildClipMoveDraft({
+  event,
+  originX,
+  originTrackId,
+  clipStartBars,
+  clipLengthBars,
+  barWidthPx,
+  snapStep,
+  arrangementTracks,
+  getGridPointerContext,
+}) {
+  if (!event || !Number.isFinite(barWidthPx) || barWidthPx <= 0) {
+    return null;
+  }
+  const deltaBars = snapToGrid((event.clientX - originX) / barWidthPx, snapStep);
+  const start = Math.max(0, snapToGrid(Number(clipStartBars) + deltaBars, snapStep));
+  const ctx = typeof getGridPointerContext === 'function' ? getGridPointerContext(event) : null;
+  const rawDest = ctx?.trackId != null && Number.isFinite(Number(ctx.trackId))
+    ? Math.floor(Number(ctx.trackId))
+    : originTrackId;
+  const trackId = clampClipMoveTargetTrackId(rawDest, arrangementTracks);
+  const len = Number(clipLengthBars);
+  return {
+    trackId,
+    start,
+    length: Number.isFinite(len) && len > 0 ? len : 1,
+  };
+}
+
 /** Bars <-> time (project start 0:00). BPM = quarter notes/min. time_signature: { numerator, denominator } (e.g. 4/4, 6/8). */
 function barsToSeconds(bars, bpm, timeSignature = DEFAULT_TIME_SIGNATURE) {
   if (!Number.isFinite(bars) || !Number.isFinite(bpm) || bpm <= 0) return 0;
@@ -2779,6 +2826,10 @@ export default function StuuShell() {
   const clipRenameColorNameInputRef = useRef(null);
   /** TEMP split debug: throttle render + engine:state logs to this track + clip ids */
   const splitDebugSessionRef = useRef({ until: 0, trackId: null, clipIds: null });
+  /** Desired Structure↔Playlist link; reapplied on each engine:state after hydration so geometry edits cannot clear it. */
+  const playlistLinkIntentRef = useRef(false);
+  /** False until first snapshot per session — then intent overrides incoming playlist_link_enabled. Reset on project switch / undo / redo. */
+  const playlistLinkIntentReadyRef = useRef(false);
   const appendConnectionLogEntry = useCallback((entry) => {
     const normalized = normalizeLiveEngineLogEntry(entry);
     if (!normalized) {
@@ -3195,7 +3246,38 @@ export default function StuuShell() {
           mergedPayload = { ...payload, project };
         }
       }
-      setState(mergedPayload);
+      setState((prev) => {
+        let next = mergedPayload;
+        if (!isObject(next)) {
+          return prev;
+        }
+        const prevFile =
+          typeof prev.selectedProjectFile === 'string' ? prev.selectedProjectFile : FALLBACK_STATE.selectedProjectFile;
+        const nextFile =
+          typeof next.selectedProjectFile === 'string' ? next.selectedProjectFile : FALLBACK_STATE.selectedProjectFile;
+        if (prevFile !== nextFile) {
+          playlistLinkIntentReadyRef.current = false;
+        }
+        const incomingSs = next.project?.song_structure;
+        if (isObject(incomingSs)) {
+          if (!playlistLinkIntentReadyRef.current) {
+            playlistLinkIntentRef.current = Boolean(incomingSs.playlist_link_enabled);
+            playlistLinkIntentReadyRef.current = true;
+          } else {
+            next = {
+              ...next,
+              project: {
+                ...next.project,
+                song_structure: {
+                  ...incomingSs,
+                  playlist_link_enabled: playlistLinkIntentRef.current,
+                },
+              },
+            };
+          }
+        }
+        return next;
+      });
       setTrackChainEnabledOverrides({});
     });
     socket.on('engine:meter', (payload) => setMeters(getMeterMap(payload)));
@@ -4504,11 +4586,11 @@ export default function StuuShell() {
   }, [appendSystemMessage]);
 
   const emitMutation = useCallback((eventName, payload, onSuccess) => {
-    if (eventName === 'clip:resize' || eventName === 'clip:import-file') {
+    if (eventName === 'clip:resize' || eventName === 'clip:import-file' || eventName === 'clip:move') {
       console.log('[MUTATION_SEND]', eventName, payload);
     }
     socketRef.current?.emit(eventName, payload, (result) => {
-      if (eventName === 'clip:resize' || eventName === 'clip:import-file') {
+      if (eventName === 'clip:resize' || eventName === 'clip:import-file' || eventName === 'clip:move') {
         console.log('[MUTATION_RESULT]', eventName, result);
       }
       if (result?.ok) {
@@ -4554,6 +4636,8 @@ export default function StuuShell() {
       };
     });
     const nextEnabled = !prevEnabled;
+    playlistLinkIntentRef.current = nextEnabled;
+    playlistLinkIntentReadyRef.current = true;
     socketRef.current.emit(
       'song-structure:set-playlist-link',
       { playlist_link_enabled: nextEnabled },
@@ -4575,6 +4659,7 @@ export default function StuuShell() {
             },
           };
         });
+        playlistLinkIntentRef.current = prevEnabled;
         appendSystemMessage(
           `Fehler (song-structure:set-playlist-link): ${result?.error || 'Unbekannter Fehler'}`,
         );
@@ -4634,6 +4719,7 @@ export default function StuuShell() {
       : [];
     emitMutation('song-structure:set-nodes', {
       nodes: plainNodes,
+      playlist_link_enabled: playlistLinkIntentRef.current,
       ...(Object.prototype.hasOwnProperty.call(meta, 'template_id') ? { template_id: meta.template_id } : {}),
       ...(Object.prototype.hasOwnProperty.call(meta, 'template_name') ? { template_name: meta.template_name } : {}),
     });
@@ -4992,6 +5078,7 @@ export default function StuuShell() {
 
     const eventName = wantsUndo ? 'project:undo' : 'project:redo';
     setHistoryMutationPending(true);
+    playlistLinkIntentReadyRef.current = false;
     socket.emit(eventName, {}, (result) => {
       setHistoryMutationPending(false);
       if (!result?.ok) {
@@ -5829,7 +5916,7 @@ export default function StuuShell() {
     emitMutation('clip:resize', { trackId, clipId: clip.id, length: leftLength, grid_step: step }, (result) => {
       console.log('[SPLIT_RESIZE_RESULT] resize callback result', result);
       const leftStored = Number.isFinite(Number(result?.length)) ? Number(result.length) : leftLength;
-      const rightStart = clipStart + leftStored;
+      const rightStart = snapToGrid(clipStart + leftStored, step);
       const rightLengthAdjusted = Math.max(step, snapToGrid(clipEnd - rightStart, step));
       const rightClipTrim = baseTrim + barsToSeconds(leftStored, splitBpm, splitTs);
       console.log('[SPLIT_CALC] post-resize math', {
@@ -8587,11 +8674,20 @@ export default function StuuShell() {
       setClipDrafts((previous) => {
         const next = { ...previous };
         if (clipInteraction.mode === 'move') {
-          next[clipInteraction.clipId] = {
-            trackId: clipInteraction.trackId,
-            start: Math.max(0, snapToGrid(clipInteraction.start + deltaBars, snapStep)),
-            length: clipInteraction.length,
-          };
+          const draft = buildClipMoveDraft({
+            event,
+            originX: clipInteraction.originX,
+            originTrackId: clipInteraction.trackId,
+            clipStartBars: clipInteraction.start,
+            clipLengthBars: clipInteraction.length,
+            barWidthPx: barWidthRef.current,
+            snapStep,
+            arrangementTracks,
+            getGridPointerContext,
+          });
+          if (draft) {
+            next[clipInteraction.clipId] = draft;
+          }
         } else if (clipInteraction.mode === 'resize-left') {
           const bpm = Number(clipInteraction.bpm) || 128;
           let nextStart = snapToGrid(clipInteraction.start + deltaBars, snapStep);
@@ -8636,11 +8732,15 @@ export default function StuuShell() {
       const draft = clipDraftsRef.current[clipInteraction.clipId];
       if (draft) {
         if (clipInteraction.mode === 'move') {
-          emitMutation('clip:move', {
+          const payload = {
             trackId: clipInteraction.trackId,
             clipId: clipInteraction.clipId,
             start: draft.start,
-          });
+          };
+          if (Number(draft.trackId) !== Number(clipInteraction.trackId)) {
+            payload.toTrackId = draft.trackId;
+          }
+          emitMutation('clip:move', payload);
         } else if (clipInteraction.mode === 'resize-left') {
           emitMutation('clip:resize', {
             trackId: clipInteraction.trackId,
@@ -8666,14 +8766,20 @@ export default function StuuShell() {
       setClipInteraction(null);
     }
 
+    function handlePointerEnd() {
+      handlePointerUp();
+    }
+
     window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointerup', handlePointerEnd);
+    window.addEventListener('pointercancel', handlePointerEnd);
 
     return () => {
       window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointerup', handlePointerEnd);
+      window.removeEventListener('pointercancel', handlePointerEnd);
     };
-  }, [clipInteraction, emitMutation, snapStep, timeSignature]);
+  }, [clipInteraction, emitMutation, snapStep, timeSignature, arrangementTracks, getGridPointerContext]);
 
   const contextMenuTrack = trackContextMenu
     ? (arrangementTrackMap.get(trackContextMenu.trackId) || null)
@@ -10802,7 +10908,32 @@ export default function StuuShell() {
                             />
                           ) : null}
                           {arrangementTracks.map((track) => {
-                            const clips = Array.isArray(track.clips) ? track.clips : [];
+                            const clipsRaw = Array.isArray(track.clips) ? track.clips : [];
+                            const moveDraft =
+                              clipInteraction?.mode === 'move' && clipInteraction?.clipId
+                                ? clipDrafts?.[clipInteraction.clipId]
+                                : null;
+                            const crossMoveActive =
+                              Boolean(moveDraft)
+                              && Number(moveDraft.trackId) !== Number(clipInteraction?.trackId);
+                            const sourceClipCross =
+                              crossMoveActive && clipInteraction?.trackId != null && clipInteraction?.clipId
+                                ? (() => {
+                                  const st = arrangementTracks.find(
+                                    (t) => Number(t.track_id) === Number(clipInteraction.trackId),
+                                  );
+                                  const arr = Array.isArray(st?.clips) ? st.clips : [];
+                                  return arr.find((c) => String(c?.id) === String(clipInteraction.clipId)) ?? null;
+                                })()
+                                : null;
+                            let clips = clipsRaw;
+                            if (crossMoveActive && sourceClipCross) {
+                              if (Number(track.track_id) === Number(clipInteraction.trackId)) {
+                                clips = clipsRaw.filter((c) => String(c?.id) !== String(clipInteraction.clipId));
+                              } else if (Number(track.track_id) === Number(moveDraft.trackId)) {
+                                clips = [...clipsRaw, sourceClipCross];
+                              }
+                            }
                             const isSelected = multiSelectMode
                               ? selectedTrackIdSet.has(track.track_id)
                               : selectedTrackId === track.track_id;

@@ -2,11 +2,13 @@
   "name": "@thestuu/dashboard",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev --port 3010 --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start --port 3010 --hostname 0.0.0.0",
     "lint": "eslint .",
+    "test": "node --test ./test/**/*.test.js",
     "typecheck": "echo 'dashboard: typecheck via next lint/build'"
   },
   "dependencies": {

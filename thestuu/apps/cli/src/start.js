@@ -414,7 +414,7 @@ async function ensureHomeFiles(stuuHome, requestedProject) {
           default_project: projectName,
           audio: {
             sample_rate: 48000,
-            buffer_size: 512,
+            buffer_size: 1024,
           },
         },
         null,

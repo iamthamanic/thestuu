@@ -513,7 +513,7 @@ export function normalizeSongStructure(value) {
   return {
     template_id: isNonEmptyString(source.template_id) ? source.template_id.trim() : null,
     template_name: isNonEmptyString(source.template_name) ? source.template_name.trim() : null,
-    playlist_link_enabled: asBoolean(source.playlist_link_enabled, false),
+    playlist_link_enabled: asBoolean(source.playlist_link_enabled ?? source.playlistLinkEnabled, false),
     nodes,
   };
 }
