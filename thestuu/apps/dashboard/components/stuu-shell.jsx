@@ -2387,6 +2387,16 @@ function resolveClipSelectionKey(key) {
   return { trackId, clipId: clipPart.trim() };
 }
 
+function findClipOnPlaylistTrack(playlist, trackId, clipId) {
+  const list = Array.isArray(playlist) ? playlist : [];
+  const track = list.find((t) => Number(t?.track_id) === Number(trackId));
+  if (!track || !Array.isArray(track.clips)) {
+    return null;
+  }
+  const idStr = String(clipId);
+  return track.clips.find((c) => String(c?.id) === idStr) || null;
+}
+
 function TrackActionIcon({ action }) {
   if (action === 'record') return <Circle size={14} strokeWidth={2.5} className="track-action-icon-record" aria-hidden="true" />;
   if (action === 'import') return <Download size={14} strokeWidth={2} aria-hidden="true" />;
@@ -2826,6 +2836,8 @@ export default function StuuShell() {
   const clipRenameColorNameInputRef = useRef(null);
   /** TEMP split debug: throttle render + engine:state logs to this track + clip ids */
   const splitDebugSessionRef = useRef({ until: 0, trackId: null, clipIds: null });
+  /** In-app audio clip duplicate buffer (Cmd/Ctrl+C, Cmd/Ctrl+V; Linux uses Ctrl like Windows). Not the OS clipboard. */
+  const audioClipClipboardRef = useRef(/** @type {{ items: { sourceTrackId: number; clip: object }[] } | null} */ (null));
   /** Desired Structure↔Playlist link; reapplied on each engine:state after hydration so geometry edits cannot clear it. */
   const playlistLinkIntentRef = useRef(false);
   /** False until first snapshot per session — then intent overrides incoming playlist_link_enabled. Reset on project switch / undo / redo. */
@@ -5175,6 +5187,103 @@ export default function StuuShell() {
           }
           return;
         }
+        if (activeTab === 'Edit') {
+          const playlist = state?.project?.playlist;
+          if (key === 'c') {
+            const nextItems = [];
+            for (const keyEntry of selectedClipKeys) {
+              const resolved = resolveClipSelectionKey(keyEntry);
+              if (!resolved) {
+                continue;
+              }
+              const clip = findClipOnPlaylistTrack(playlist, resolved.trackId, resolved.clipId);
+              if (!clip || normalizeClipType(clip.type) !== 'audio') {
+                continue;
+              }
+              const sourcePath = clip.source_path ?? clip.sourcePath;
+              if (!isNonEmptyString(sourcePath)
+                || !isNonEmptyString(clip.source_name)
+                || !isNonEmptyString(clip.source_format)) {
+                continue;
+              }
+              let snapshot;
+              try {
+                snapshot = JSON.parse(JSON.stringify(clip));
+              } catch {
+                continue;
+              }
+              nextItems.push({ sourceTrackId: resolved.trackId, clip: snapshot });
+            }
+            if (nextItems.length > 0) {
+              event.preventDefault();
+              audioClipClipboardRef.current = { items: nextItems };
+              return;
+            }
+          }
+          if (key === 'v') {
+            const buf = audioClipClipboardRef.current;
+            const bufItems = buf?.items;
+            if (Array.isArray(bufItems) && bufItems.length > 0) {
+              event.preventDefault();
+              const existingArrangementTracks = arrangementTracks.filter((t) => t.exists);
+              let pasteTrackId = null;
+              for (const tid of selectedTrackIds) {
+                const n = Number(tid);
+                if (!Number.isInteger(n) || n <= 0) {
+                  continue;
+                }
+                if (existingArrangementTracks.some((t) => t.track_id === n)) {
+                  pasteTrackId = n;
+                  break;
+                }
+              }
+              if (pasteTrackId === null) {
+                const firstSel = selectedClipKeys[0];
+                const fromClip = firstSel ? resolveClipSelectionKey(firstSel) : null;
+                if (fromClip && existingArrangementTracks.some((t) => t.track_id === fromClip.trackId)) {
+                  pasteTrackId = fromClip.trackId;
+                }
+              }
+              if (pasteTrackId === null && bufItems[0]) {
+                const fallback = Number(bufItems[0].sourceTrackId);
+                if (Number.isInteger(fallback) && fallback > 0
+                  && existingArrangementTracks.some((t) => t.track_id === fallback)) {
+                  pasteTrackId = fallback;
+                }
+              }
+              if (pasteTrackId === null && existingArrangementTracks[0]) {
+                pasteTrackId = existingArrangementTracks[0].track_id;
+              }
+              if (pasteTrackId === null) {
+                appendSystemMessage('Audio einfuegen: kein gueltiger Ziel-Track.');
+                return;
+              }
+              const clampedTrackId = clampClipMoveTargetTrackId(pasteTrackId, arrangementTracks);
+              let cursorStart = snapToGrid(Math.max(0, getCurrentTransportBars()), snapStep);
+              for (const entry of bufItems) {
+                const clip = entry?.clip;
+                if (!isObject(clip)) {
+                  continue;
+                }
+                const lenRaw = Number(clip.length);
+                const lengthBars = Number.isFinite(lenRaw) && lenRaw > 0
+                  ? snapToGrid(lenRaw, snapStep)
+                  : Math.max(GRID_STEP, snapStep);
+                const trimStart = getEffectiveAudioTrimStartForWaveform(clip);
+                createImportedClipFromSource(
+                  clampedTrackId,
+                  clip,
+                  cursorStart,
+                  lengthBars,
+                  undefined,
+                  { trim_start_seconds: trimStart, grid_step: snapStep },
+                );
+                cursorStart = snapToGrid(cursorStart + lengthBars, snapStep);
+              }
+              return;
+            }
+          }
+        }
       }
       if (event.key === 'Escape') {
         setOpenTrackMenuId(null);
@@ -5196,7 +5305,7 @@ export default function StuuShell() {
           activateToolFromShortcut('slice');
           return;
         }
-        if (key === 'v') {
+        if (key === 'v' && !event.metaKey && !event.ctrlKey) {
           activateToolFromShortcut('select');
           return;
         }
@@ -5245,7 +5354,24 @@ export default function StuuShell() {
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [activeTab, state?.playing, selectedClipKeys, selectedStructureNodeId, handleStructureRemoveNodeById, emitMutation, triggerProjectRedo, triggerProjectUndo, importTrackRenamePrompt, resolveImportTrackRenamePrompt]);
+  }, [
+    activeTab,
+    state?.playing,
+    state?.project?.playlist,
+    selectedClipKeys,
+    selectedTrackIds,
+    arrangementTracks,
+    snapStep,
+    getCurrentTransportBars,
+    selectedStructureNodeId,
+    handleStructureRemoveNodeById,
+    emitMutation,
+    triggerProjectRedo,
+    triggerProjectUndo,
+    importTrackRenamePrompt,
+    resolveImportTrackRenamePrompt,
+    appendSystemMessage,
+  ]);
 
   useEffect(() => {
     if (!clipRenameColorPrompt) {
