@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createDefaultProject, parseProject, serializeProject, validateProject } from '../src/index.js';
+import {
+  computeStructureStarts,
+  createDefaultProject,
+  getStructureTotalBars,
+  normalizeSongStructure,
+  parseProject,
+  serializeProject,
+  validateProject,
+} from '../src/index.js';
 
 test('legacy project clips stay compatible and generate pattern stubs', () => {
   const legacyProject = {
@@ -212,4 +220,61 @@ test('mixer drops bogus master row (track_id 0); master stays in master_mix', ()
   assert.equal(parsed.mixer[0].volume, 0.7);
   assert.equal(parsed.master_mix.volume, 0.9);
   assert.equal(parsed.master_mix.pan, 0.25);
+});
+
+test('default project has empty song_structure', () => {
+  const project = createDefaultProject('Structure Default');
+  assert.deepEqual(project.song_structure, {
+    template_id: null,
+    template_name: null,
+    playlist_link_enabled: false,
+    nodes: [],
+  });
+});
+
+test('song_structure roundtrip and computeStarts', () => {
+  const project = createDefaultProject('Structure Roundtrip');
+  project.song_structure = {
+    template_id: 'tpl_pop',
+    template_name: 'Pop Standard',
+    nodes: [
+      { id: 'str_1', title: 'Intro', note: '8 bars', color: '#e879a8', length: 8 },
+      { id: 'str_2', title: 'Verse', note: '', color: '#7dd3fc', length: 16 },
+    ],
+  };
+
+  const parsed = parseProject(serializeProject(project));
+  assert.equal(parsed.song_structure.template_id, 'tpl_pop');
+  assert.equal(parsed.song_structure.nodes.length, 2);
+  assert.equal(parsed.song_structure.nodes[0].title, 'Intro');
+  assert.deepEqual(computeStructureStarts(parsed.song_structure.nodes), [0, 8]);
+  assert.equal(getStructureTotalBars(parsed.song_structure.nodes), 24);
+});
+
+test('normalizeSongStructure strips unknown fields and fixes defaults', () => {
+  const normalized = normalizeSongStructure({
+    nodes: [{ length: 4, extra: true }],
+  });
+  assert.equal(normalized.nodes.length, 1);
+  assert.equal(normalized.nodes[0].title, 'Section');
+  assert.equal(normalized.nodes[0].color, '#7dd3fc');
+  assert.equal(normalized.nodes[0].length, 4);
+  assert.equal(normalized.nodes[0].extra, undefined);
+  assert.equal(normalized.playlist_link_enabled, false);
+});
+
+test('normalizeSongStructure playlist_link_enabled accepts explicit boolean', () => {
+  assert.equal(normalizeSongStructure({ playlist_link_enabled: true }).playlist_link_enabled, true);
+  assert.equal(normalizeSongStructure({ playlist_link_enabled: false }).playlist_link_enabled, false);
+});
+
+test('validateProject rejects duplicate structure node ids', () => {
+  const project = createDefaultProject('Structure Invalid');
+  project.song_structure.nodes = [
+    { id: 'dup', title: 'A', note: '', color: '#111111', length: 4 },
+    { id: 'dup', title: 'B', note: '', color: '#222222', length: 4 },
+  ];
+  const result = validateProject(project);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes('unique')));
 });

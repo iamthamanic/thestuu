@@ -15,6 +15,10 @@ const IMPORTABLE_MIDI_EXTENSIONS = new Set(['mid', 'midi']);
 const IMPORTABLE_EXTENSIONS = new Set([...IMPORTABLE_AUDIO_EXTENSIONS, ...IMPORTABLE_MIDI_EXTENSIONS]);
 const DEFAULT_PLAYLIST_SHOW_TRACK_NODES = true;
 const MAX_WAVEFORM_PEAKS = 2048;
+const MIN_STRUCTURE_NODE_LENGTH = 1;
+const DEFAULT_STRUCTURE_NODE_TITLE = 'Section';
+const DEFAULT_STRUCTURE_NODE_COLOR = '#7dd3fc';
+const STRUCTURE_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 
 function isObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -292,6 +296,17 @@ function normalizeClip(clip, trackId, clipIndex) {
     }
   }
 
+  let clipGain = null;
+  if (!patternId && clipType === 'audio') {
+    const rawGain = safeClip.gain ?? safeClip.clip_gain ?? safeClip.clipGain;
+    if (rawGain !== undefined && rawGain !== null && String(rawGain).trim() !== '') {
+      const gainValue = asNumber(rawGain, NaN);
+      if (Number.isFinite(gainValue)) {
+        clipGain = clamp(gainValue, 0, 2);
+      }
+    }
+  }
+
   return {
     id,
     start,
@@ -306,6 +321,7 @@ function normalizeClip(clip, trackId, clipIndex) {
     ...(waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
     ...(sourcePath ? { source_path: sourcePath } : {}),
     ...(trimStartSeconds !== null ? { trim_start_seconds: Number(trimStartSeconds.toFixed(6)) } : {}),
+    ...(clipGain !== null ? { gain: Number(clipGain.toFixed(4)) } : {}),
   };
 }
 
@@ -470,6 +486,111 @@ function normalizeTimeSignature(value) {
   return { numerator, denominator };
 }
 
+function normalizeStructureColor(value) {
+  if (typeof value === 'string' && STRUCTURE_COLOR_PATTERN.test(value.trim())) {
+    return value.trim().toLowerCase();
+  }
+  return DEFAULT_STRUCTURE_NODE_COLOR;
+}
+
+export function normalizeSongStructureNode(node, index = 0) {
+  const source = isObject(node) ? node : {};
+  const id = isNonEmptyString(source.id) ? source.id.trim() : `str_${index + 1}`;
+  const length = clamp(asNumber(source.length, MIN_STRUCTURE_NODE_LENGTH), MIN_STRUCTURE_NODE_LENGTH, MAX_PLAYLIST_VIEW_BARS);
+  return {
+    id,
+    title: isNonEmptyString(source.title) ? source.title.trim() : DEFAULT_STRUCTURE_NODE_TITLE,
+    note: typeof source.note === 'string' ? source.note.trim() : '',
+    color: normalizeStructureColor(source.color),
+    length: Number(length.toFixed(6)),
+  };
+}
+
+export function normalizeSongStructure(value) {
+  const source = isObject(value) ? value : {};
+  const rawNodes = Array.isArray(source.nodes) ? source.nodes : [];
+  const nodes = rawNodes.map((node, index) => normalizeSongStructureNode(node, index));
+  return {
+    template_id: isNonEmptyString(source.template_id) ? source.template_id.trim() : null,
+    template_name: isNonEmptyString(source.template_name) ? source.template_name.trim() : null,
+    playlist_link_enabled: asBoolean(source.playlist_link_enabled, false),
+    nodes,
+  };
+}
+
+export function computeStructureStarts(nodes) {
+  if (!Array.isArray(nodes)) {
+    return [];
+  }
+  const starts = [];
+  let cursor = 0;
+  for (const node of nodes) {
+    starts.push(cursor);
+    cursor += asNumber(node?.length, 0);
+  }
+  return starts;
+}
+
+export function getStructureTotalBars(nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    return 0;
+  }
+  return nodes.reduce((sum, node) => sum + asNumber(node?.length, 0), 0);
+}
+
+function validateSongStructure(songStructure, errors) {
+  if (songStructure === undefined) {
+    return;
+  }
+  if (!isObject(songStructure)) {
+    errors.push('song_structure must be an object');
+    return;
+  }
+  if (songStructure.template_id !== null && songStructure.template_id !== undefined && !isNonEmptyString(songStructure.template_id)) {
+    errors.push('song_structure.template_id must be a non-empty string or null');
+  }
+  if (songStructure.template_name !== null && songStructure.template_name !== undefined && !isNonEmptyString(songStructure.template_name)) {
+    errors.push('song_structure.template_name must be a non-empty string or null');
+  }
+  if (!Array.isArray(songStructure.nodes)) {
+    errors.push('song_structure.nodes must be an array');
+    return;
+  }
+  if (
+    songStructure.playlist_link_enabled !== undefined
+    && typeof songStructure.playlist_link_enabled !== 'boolean'
+  ) {
+    errors.push('song_structure.playlist_link_enabled must be a boolean');
+  }
+  const nodeIds = new Set();
+  for (const [nodeIndex, node] of songStructure.nodes.entries()) {
+    if (!isObject(node)) {
+      errors.push(`song_structure.nodes[${nodeIndex}] must be an object`);
+      continue;
+    }
+    if (!isNonEmptyString(node.id)) {
+      errors.push(`song_structure.nodes[${nodeIndex}].id must be a non-empty string`);
+    } else if (nodeIds.has(node.id)) {
+      errors.push(`song_structure.nodes[${nodeIndex}].id must be unique`);
+    } else {
+      nodeIds.add(node.id);
+    }
+    if (!isNonEmptyString(node.title)) {
+      errors.push(`song_structure.nodes[${nodeIndex}].title must be a non-empty string`);
+    }
+    if (typeof node.note !== 'string') {
+      errors.push(`song_structure.nodes[${nodeIndex}].note must be a string`);
+    }
+    if (!STRUCTURE_COLOR_PATTERN.test(node.color)) {
+      errors.push(`song_structure.nodes[${nodeIndex}].color must be a #RRGGBB hex color`);
+    }
+    const length = asNumber(node.length, NaN);
+    if (!Number.isFinite(length) || length < MIN_STRUCTURE_NODE_LENGTH) {
+      errors.push(`song_structure.nodes[${nodeIndex}].length must be at least ${MIN_STRUCTURE_NODE_LENGTH}`);
+    }
+  }
+}
+
 export function normalizeProject(project) {
   const source = isObject(project) ? project : {};
   const playlist = Array.isArray(source.playlist) ? source.playlist.map((track, index) => normalizeTrack(track, index)) : [];
@@ -503,6 +624,7 @@ export function normalizeProject(project) {
         .filter((entry) => entry != null)
       : [],
     master_mix: normalizeMasterMix(source.master_mix ?? source.masterMix),
+    song_structure: normalizeSongStructure(source.song_structure ?? source.songStructure),
   };
 }
 
@@ -962,6 +1084,7 @@ export function validateProject(project) {
   }
 
   validateMasterMix(project.master_mix, errors);
+  validateSongStructure(project.song_structure, errors);
 
   return { ok: errors.length === 0, errors };
 }

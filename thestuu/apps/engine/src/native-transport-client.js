@@ -115,7 +115,7 @@ export class NativeTransportClient extends EventEmitter {
     this.pending.clear();
   }
 
-  async request(cmd, payload = {}) {
+  async request(cmd, payload = {}, options = {}) {
     if (!this.connected || !this.socket) {
       throw new Error('native transport is not connected');
     }
@@ -129,12 +129,15 @@ export class NativeTransportClient extends EventEmitter {
     };
 
     const frame = encodeFrame(message);
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : this.requestTimeoutMs;
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`native transport request timeout: ${cmd}`));
-      }, this.requestTimeoutMs);
+      }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
       this.socket.write(frame, (error) => {

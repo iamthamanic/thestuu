@@ -5432,22 +5432,84 @@ bool scanExternalPluginFormats(std::string& error) {
   auto& pm = gState->engine->getPluginManager();
   pm.setUsesSeparateProcessForScanning(false);
 
+  std::fprintf(
+      stderr,
+      "[thestuu-native] vst:scan: start (formats=%d, separateProcessForScanning=0). "
+      "macOS reference: VST3 in ~/Library/Audio/Plug-Ins/VST3 and /Library/Audio/Plug-Ins/VST3; "
+      "AU as .component in ~/Library/Audio/Plug-Ins/Components and /Library/Audio/Plug-Ins/Components. "
+      "JUCE may report 0 default paths for AU (OS-driven scan).\n",
+      pm.pluginFormatManager.getNumFormats());
+
   for (int i = 0; i < pm.pluginFormatManager.getNumFormats(); ++i) {
     auto* format = pm.pluginFormatManager.getFormat(i);
     if (format == nullptr || !format->canScanForPlugins()) {
       continue;
     }
 
-    const auto defaultLocations = format->getDefaultLocationsToSearch();
-    const auto files = format->searchPathsForPlugins(defaultLocations, true, false);
+    try {
+      const juce::FileSearchPath defaultLocations = format->getDefaultLocationsToSearch();
+      const juce::String formatName = format->getName();
+      std::fprintf(
+          stderr,
+          "[thestuu-native] vst:scan: format \"%s\" defaultLocations path count=%d\n",
+          formatName.toRawUTF8(),
+          defaultLocations.getNumPaths());
+      for (int pi = 0; pi < defaultLocations.getNumPaths(); ++pi) {
+        const juce::File root(defaultLocations[pi]);
+        std::fprintf(
+            stderr,
+            "[thestuu-native] vst:scan:   [%d] %s exists=%d isDir=%d\n",
+            pi,
+            root.getFullPathName().toRawUTF8(),
+            root.exists() ? 1 : 0,
+            root.isDirectory() ? 1 : 0);
+      }
 
-    for (const auto& fileOrIdentifier : files) {
-      juce::OwnedArray<juce::PluginDescription> found;
-      pm.knownPluginList.scanAndAddFile(fileOrIdentifier, true, found, *format);
+      const auto files = format->searchPathsForPlugins(defaultLocations, true, false);
+      std::fprintf(
+          stderr,
+          "[thestuu-native] vst:scan: format \"%s\" searchPathsForPlugins candidates=%d\n",
+          formatName.toRawUTF8(),
+          files.size());
+
+      for (const auto& fileOrIdentifier : files) {
+        try {
+          juce::OwnedArray<juce::PluginDescription> found;
+          pm.knownPluginList.scanAndAddFile(fileOrIdentifier, true, found, *format);
+        } catch (const std::exception& ex) {
+          std::fprintf(
+              stderr,
+              "[thestuu-native] vst:scan: skip file \"%s\": %s\n",
+              fileOrIdentifier.toStdString().c_str(),
+              ex.what());
+        } catch (...) {
+          std::fprintf(
+              stderr,
+              "[thestuu-native] vst:scan: skip file \"%s\" (non-std exception)\n",
+              fileOrIdentifier.toStdString().c_str());
+        }
+      }
+    } catch (const std::exception& ex) {
+      const std::string formatName = format->getName().toStdString();
+      std::fprintf(
+          stderr,
+          "[thestuu-native] vst:scan: format scan issue (%s): %s\n",
+          formatName.c_str(),
+          ex.what());
+    } catch (...) {
+      const std::string formatName = format->getName().toStdString();
+      std::fprintf(stderr, "[thestuu-native] vst:scan: format scan issue (%s, unknown)\n", formatName.c_str());
     }
   }
 
   pm.knownPluginList.scanFinished();
+  {
+    const auto types = pm.knownPluginList.getTypes();
+    std::fprintf(
+        stderr,
+        "[thestuu-native] vst:scan: scanFinished; knownPluginList types=%zu\n",
+        static_cast<size_t>(types.size()));
+  }
   error.clear();
   return true;
 }
@@ -5465,22 +5527,61 @@ PluginInfo makeUltrasoundInfo() {
 }
 
 void appendTracktionCorePluginInfos(std::vector<PluginInfo>& plugins) {
-  if (!gState || !gState->engine || !gState->edit) {
+  if (!gState || !gState->engine) {
     return;
   }
 
+  const bool haveEdit = gState->edit != nullptr;
+
   for (const auto& spec : kTracktionCorePluginSpecs) {
-    PluginInfo info;
-    info.name = spec.displayName;
-    info.uid = spec.uid;
-    info.type = tracktion::engine::PluginManager::builtInPluginFormatName;
-    info.kind = spec.isInstrument ? "instrument" : "effect";
-    info.isInstrument = spec.isInstrument;
-    info.isNative = true;
-    const auto description = createTracktionCorePluginDescription(spec);
-    info.parameters = collectBuiltInPluginParameters(spec.xmlTypeName, description);
-    gState->parameterCacheByUid[info.uid] = info.parameters;
-    plugins.push_back(std::move(info));
+    try {
+      PluginInfo info;
+      info.name = spec.displayName;
+      info.uid = spec.uid;
+      info.type = tracktion::engine::PluginManager::builtInPluginFormatName;
+      info.kind = spec.isInstrument ? "instrument" : "effect";
+      info.isInstrument = spec.isInstrument;
+      info.isNative = true;
+      const auto description = createTracktionCorePluginDescription(spec);
+      if (haveEdit) {
+        info.parameters = collectBuiltInPluginParameters(spec.xmlTypeName, description);
+      } else {
+        info.parameters = {};
+      }
+      gState->parameterCacheByUid[info.uid] = info.parameters;
+      plugins.push_back(std::move(info));
+    } catch (const std::exception& ex) {
+      std::fprintf(
+          stderr,
+          "[thestuu-native] vst:scan: skip built-in \"%s\": %s (using metadata-only row)\n",
+          spec.displayName,
+          ex.what());
+      PluginInfo info;
+      info.name = spec.displayName;
+      info.uid = spec.uid;
+      info.type = tracktion::engine::PluginManager::builtInPluginFormatName;
+      info.kind = spec.isInstrument ? "instrument" : "effect";
+      info.isInstrument = spec.isInstrument;
+      info.isNative = true;
+      info.parameters = {};
+      gState->parameterCacheByUid[info.uid] = info.parameters;
+      plugins.push_back(std::move(info));
+    } catch (...) {
+      std::fprintf(
+          stderr,
+          "[thestuu-native] vst:scan: skip built-in \"%s\" (unknown; using metadata-only row)\n",
+          spec.displayName);
+      PluginInfo info;
+      info.name = spec.displayName;
+      info.uid = spec.uid;
+      info.type = tracktion::engine::PluginManager::builtInPluginFormatName;
+      info.kind = spec.isInstrument ? "instrument" : "effect";
+      info.isInstrument = spec.isInstrument;
+      info.isNative = true;
+      info.parameters = {};
+      gState->parameterCacheByUid[info.uid] = info.parameters;
+      plugins.push_back(std::move(info));
+    }
   }
 }
 }  // namespace
@@ -5657,7 +5758,7 @@ static tracktion::engine::WaveInputDevice* getPhysicalWaveInForRecording() {
   return chosen;
 }
 
-/** Match RecordingDemo setup: enable physical wave inputs and set monitor mode so recording receives audio. */
+/** Enable physical inputs for recording. Monitoring stays OFF to avoid speaker→mic feedback (hum/howling). */
 static void ensurePhysicalWaveInputsReadyForRecording() {
   if (!gState || !gState->engine) return;
   auto& dm = gState->engine->getDeviceManager();
@@ -5665,7 +5766,7 @@ static void ensurePhysicalWaveInputsReadyForRecording() {
     if (auto* wip = dm.getWaveInDevice(i)) {
       if (wip->isTrackDevice()) continue;
       wip->setStereoPair(false);
-      wip->setMonitorMode(tracktion::engine::InputDevice::MonitorMode::automatic);
+      wip->setMonitorMode(tracktion::engine::InputDevice::MonitorMode::off);
       wip->setEnabled(true);
     }
   }
@@ -5984,6 +6085,7 @@ bool scanPlugins(std::vector<PluginInfo>& plugins, std::string& error) {
 
   try {
     if (!scanExternalPluginFormats(error)) {
+      std::fprintf(stderr, "[thestuu-native] vst:scan: scanExternalPluginFormats failed: %s\n", error.c_str());
       return false;
     }
 
@@ -5991,30 +6093,47 @@ bool scanPlugins(std::vector<PluginInfo>& plugins, std::string& error) {
     gState->parameterCacheByUid.clear();
 
     const auto known = gState->engine->getPluginManager().knownPluginList.getTypes();
+    std::fprintf(
+        stderr,
+        "[thestuu-native] vst:scan: building catalog from %zu known external type(s)\n",
+        static_cast<size_t>(known.size()));
     plugins.reserve(static_cast<size_t>(known.size() + kTracktionCorePluginSpecs.size() + 1));
 
     for (const auto& desc : known) {
-      PluginInfo info;
-      info.name = desc.name.toStdString();
-      info.uid = desc.createIdentifierString().toStdString();
-      info.type = desc.pluginFormatName.toStdString();
-      info.isInstrument = desc.isInstrument;
-      info.kind = info.isInstrument ? "instrument" : "effect";
-      info.isNative = false;
-      gState->pluginByUid.emplace(info.uid, desc);
+      try {
+        PluginInfo info;
+        info.name = desc.name.toStdString();
+        info.uid = desc.createIdentifierString().toStdString();
+        info.type = desc.pluginFormatName.toStdString();
+        info.isInstrument = desc.isInstrument;
+        info.kind = info.isInstrument ? "instrument" : "effect";
+        info.isNative = false;
+        gState->pluginByUid.emplace(info.uid, desc);
 
-      juce::String createError;
-      if (auto instance = gState->engine->getPluginManager().createPluginInstance(
-            desc,
-            gState->sampleRate,
-            gState->bufferSize,
-            createError
-          )) {
-        info.parameters = collectAudioProcessorParameters(*instance);
+        juce::String createError;
+        if (auto instance = gState->engine->getPluginManager().createPluginInstance(
+              desc,
+              gState->sampleRate,
+              gState->bufferSize,
+              createError
+            )) {
+          info.parameters = collectAudioProcessorParameters(*instance);
+        }
+
+        gState->parameterCacheByUid[info.uid] = info.parameters;
+        plugins.push_back(std::move(info));
+      } catch (const std::exception& ex) {
+        std::fprintf(
+            stderr,
+            "[thestuu-native] vst:scan: skip external plugin \"%s\": %s\n",
+            desc.name.toStdString().c_str(),
+            ex.what());
+      } catch (...) {
+        std::fprintf(
+            stderr,
+            "[thestuu-native] vst:scan: skip external plugin \"%s\" (non-std exception)\n",
+            desc.name.toStdString().c_str());
       }
-
-      gState->parameterCacheByUid[info.uid] = info.parameters;
-      plugins.push_back(std::move(info));
     }
 
     appendTracktionCorePluginInfos(plugins);
@@ -6023,15 +6142,32 @@ bool scanPlugins(std::vector<PluginInfo>& plugins, std::string& error) {
     gState->parameterCacheByUid[ultrasound.uid] = ultrasound.parameters;
     plugins.push_back(std::move(ultrasound));
 
+    if (plugins.empty()) {
+      std::fprintf(
+          stderr,
+          "[thestuu-native] vst:scan: catalog unexpectedly empty after scan; restoring built-ins + Ultrasound\n");
+      appendTracktionCorePluginInfos(plugins);
+      auto fallback = makeUltrasoundInfo();
+      gState->parameterCacheByUid[fallback.uid] = fallback.parameters;
+      plugins.push_back(std::move(fallback));
+    }
+
+    std::fprintf(
+        stderr,
+        "[thestuu-native] vst:scan: complete catalog size=%zu (includes built-ins + Ultrasound)\n",
+        plugins.size());
+
     error.clear();
     return true;
   } catch (const std::exception& ex) {
     error = ex.what();
     plugins.clear();
+    std::fprintf(stderr, "[thestuu-native] vst:scan failed (std::exception): %s\n", error.c_str());
     return false;
   } catch (...) {
     error = "unknown error during vst:scan";
     plugins.clear();
+    std::fprintf(stderr, "[thestuu-native] vst:scan failed (non-std exception)\n");
     return false;
   }
 }
@@ -6754,8 +6890,12 @@ static void transportRebuildGraphOnlyImpl() {
   }
   auto& transport = gState->edit->getTransport();
   const bool wasPlaying = transport.isPlaying();
+  const bool wasRecording = transport.isRecording();
   const auto savedPosition = transport.getPosition();
   std::fprintf(stderr, "[thestuu-native] transportRebuildGraphOnly: wasPlaying=%d\n", wasPlaying ? 1 : 0);
+  if (!wasPlaying && !wasRecording) {
+    disablePhysicalWaveInputsMonitoring();
+  }
   /* Free context so playingFlag is cleared; then rebuild. When we play(), performPlay()
    * will run (playingFlag was cleared) and start the new graph's playhead. */
   transport.freePlaybackContext();

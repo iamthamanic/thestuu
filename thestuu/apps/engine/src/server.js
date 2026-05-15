@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { constants as fsConstants, createReadStream, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +8,16 @@ import { format as formatLogArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import decode from 'audio-decode';
-import { createDefaultProject, normalizeProject, parseProject, serializeProject, validateProject } from '@thestuu/shared-json';
+import {
+  computeStructureStarts,
+  createDefaultProject,
+  normalizeProject,
+  normalizeSongStructure,
+  normalizeSongStructureNode,
+  parseProject,
+  serializeProject,
+  validateProject,
+} from '@thestuu/shared-json';
 import { NativeTransportClient } from './native-transport-client.js';
 import {
   maxPeakFromMeterRows,
@@ -21,6 +31,7 @@ const stuuHome = process.env.STUU_HOME || path.join(os.homedir(), '.thestuu');
 const projectsDir = path.join(stuuHome, 'projects');
 const defaultProjectPath = path.join(projectsDir, 'welcome.stu');
 const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
+const structureTemplatesDir = path.join(stuuHome, 'structure-templates');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
 const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
@@ -1035,6 +1046,8 @@ function ensureProjectArrays() {
   state.project.mixer = Array.from(byTrackId.keys())
     .sort((a, b) => a - b)
     .map((tid) => ({ ...byTrackId.get(tid), track_id: tid }));
+
+  state.project.song_structure = normalizeSongStructure(state.project.song_structure);
 }
 
 function normalizeBool(value) {
@@ -1165,8 +1178,11 @@ function setNativePluginCatalogCache(rawPlugins) {
   return normalizedPlugins;
 }
 
+/** VST/AU filesystem scan + instance introspection can exceed the default 2s native IPC timeout. */
+const NATIVE_VST_SCAN_TIMEOUT_MS = 600000;
+
 async function refreshNativePluginCatalogCache() {
-  const response = await requestNativeTransport('vst:scan');
+  const response = await requestNativeTransport('vst:scan', {}, { timeoutMs: NATIVE_VST_SCAN_TIMEOUT_MS });
   const plugins = Array.isArray(response?.plugins) ? response.plugins : [];
   return setNativePluginCatalogCache(plugins);
 }
@@ -1791,12 +1807,17 @@ async function requestNativeTransport(cmd, payload = {}, options = {}) {
   if (!nativeTransportClient || !nativeTransportActive) {
     throw new Error('native transport is not active');
   }
-  const response = await nativeTransportClient.request(cmd, payload);
+  const { timeoutMs, ...transportHookOptions } = isObject(options) ? options : {};
+  const nativeRequestOptions = {};
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    nativeRequestOptions.timeoutMs = timeoutMs;
+  }
+  const response = await nativeTransportClient.request(cmd, payload, nativeRequestOptions);
   if (isObject(response.transport)) {
     const snapshotOptions = {
       fromPlayResponse: cmd === 'transport.play',
       acceptBpm: cmd === 'transport.set_bpm',
-      ...(isObject(options) ? options : {}),
+      ...transportHookOptions,
     };
     applyTransportSnapshot(response.transport, snapshotOptions);
   }
@@ -3035,7 +3056,7 @@ async function importClipFile(payload = {}) {
     ...(clipType === 'audio' && sourceDurationSeconds !== null ? { source_duration_seconds: sourceDurationSeconds } : {}),
     ...(clipType === 'audio' && waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
     ...(sourcePath ? { source_path: sourcePath } : {}),
-    ...(clipType === 'audio' ? { fade_in: 0, fade_out: 0, fade_in_curve: 'linear', fade_out_curve: 'linear' } : {}),
+    ...(clipType === 'audio' ? { fade_in: 0, fade_out: 0, fade_in_curve: 'linear', fade_out_curve: 'linear', gain: 1 } : {}),
     ...(clipType === 'audio' ? { trim_start_seconds: trimStartSeconds } : {}),
   };
   track.clips.push(newClip);
@@ -3226,6 +3247,42 @@ async function resizeClip(payload = {}) {
   return out;
 }
 
+const CLIP_GAIN_MIN = 0;
+const CLIP_GAIN_MAX = 2;
+const CLIP_GAIN_DEFAULT = 1;
+
+function normalizeClipGainValue(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return CLIP_GAIN_DEFAULT;
+  }
+  return Math.min(CLIP_GAIN_MAX, Math.max(CLIP_GAIN_MIN, parsed));
+}
+
+async function setClipGain(payload = {}) {
+  const trackId = assertTrackId(payload);
+  const clipId = assertClipId(payload);
+  const track = getTrack(trackId);
+  if (!track) {
+    throw new Error(`track "${trackId}" not found`);
+  }
+  const { clip } = findClip(track, clipId);
+  if (!clip) {
+    throw new Error(`clip "${clipId}" not found on track ${trackId}`);
+  }
+  const clipType = (clip.type || clip.clip_type || 'audio').toString().toLowerCase();
+  if (clipType !== 'audio') {
+    throw new Error('gain only applies to audio clips');
+  }
+  if (payload.gain === undefined && payload.clip_gain === undefined && payload.clipGain === undefined) {
+    throw new Error('gain is required');
+  }
+  const rawGain = payload.gain ?? payload.clip_gain ?? payload.clipGain;
+  clip.gain = normalizeClipGainValue(rawGain);
+  // Per-clip gain is persisted in project JSON; native Tracktion clip gain is not wired yet.
+  return { clipId, trackId, gain: clip.gain };
+}
+
 async function setClipFade(payload = {}) {
   const trackId = assertTrackId(payload);
   const clipId = assertClipId(payload);
@@ -3398,6 +3455,233 @@ async function ensureProjectFile() {
   }
 
   resetProjectHistory();
+}
+
+async function ensureStructureTemplatesDir() {
+  await fs.mkdir(structureTemplatesDir, { recursive: true });
+}
+
+function sanitizeStructureTemplateId(id) {
+  if (typeof id !== 'string' || !id.trim()) {
+    return '';
+  }
+  const cleaned = id.trim().replace(/[^a-zA-Z0-9._-]+/g, '_');
+  return path.basename(cleaned);
+}
+
+function structureTemplateFilePath(templateId) {
+  const safeId = sanitizeStructureTemplateId(templateId);
+  if (!safeId) {
+    throw new Error('template id is required');
+  }
+  return path.join(structureTemplatesDir, `${safeId}.json`);
+}
+
+function normalizeStructureTemplateFile(data, fallbackId) {
+  const source = data && typeof data === 'object' ? data : {};
+  const id = sanitizeStructureTemplateId(source.id || fallbackId);
+  if (!id) {
+    throw new Error('invalid template id');
+  }
+  const rawNodes = Array.isArray(source.nodes) ? source.nodes : [];
+  return {
+    id,
+    name: typeof source.name === 'string' && source.name.trim() ? source.name.trim() : 'Untitled Structure',
+    note: typeof source.note === 'string' ? source.note.trim() : '',
+    modified_at: typeof source.modified_at === 'string' && source.modified_at.trim()
+      ? source.modified_at.trim()
+      : new Date().toISOString(),
+    nodes: rawNodes.map((node, index) => normalizeSongStructureNode(node, index)),
+  };
+}
+
+async function readStructureTemplate(templateId) {
+  const filePath = structureTemplateFilePath(templateId);
+  const raw = await fs.readFile(filePath, 'utf8');
+  return normalizeStructureTemplateFile(JSON.parse(raw), templateId);
+}
+
+async function writeStructureTemplate(template) {
+  const normalized = normalizeStructureTemplateFile({
+    ...template,
+    modified_at: new Date().toISOString(),
+  }, template.id);
+  const filePath = structureTemplateFilePath(normalized.id);
+  await fs.writeFile(filePath, JSON.stringify(normalized, null, 2), 'utf8');
+  return normalized;
+}
+
+function songStructureGeometryEqual(oldNodes, newNodes) {
+  if (!Array.isArray(oldNodes) || !Array.isArray(newNodes) || oldNodes.length !== newNodes.length) {
+    return false;
+  }
+  for (let i = 0; i < oldNodes.length; i += 1) {
+    if (String(oldNodes[i]?.id) !== String(newNodes[i]?.id)) {
+      return false;
+    }
+    if (Number(oldNodes[i]?.length) !== Number(newNodes[i]?.length)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function ripplePlaylistClipsForSongStructureChange(oldNodes, newNodes) {
+  if (!Array.isArray(state.project.playlist)) {
+    return false;
+  }
+  const oldStarts = computeStructureStarts(oldNodes);
+  const newStarts = computeStructureStarts(newNodes);
+  const newStartById = new Map(newNodes.map((node, i) => [node.id, newStarts[i]]));
+
+  function containingOldIndex(bar) {
+    for (let i = 0; i < oldNodes.length; i += 1) {
+      const s = oldStarts[i];
+      const len = Number(oldNodes[i]?.length);
+      const e = s + len;
+      if (bar >= s && bar < e) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  let moved = false;
+  for (const track of state.project.playlist) {
+    if (!track?.clips?.length) {
+      continue;
+    }
+    let trackTouched = false;
+    for (const clip of track.clips) {
+      const start = Number(clip.start);
+      if (!Number.isFinite(start)) {
+        continue;
+      }
+      const idx = containingOldIndex(start);
+      if (idx < 0) {
+        continue;
+      }
+      const nodeId = oldNodes[idx].id;
+      const newStartForId = newStartById.get(nodeId);
+      if (!Number.isFinite(newStartForId)) {
+        continue;
+      }
+      const oldStartNode = oldStarts[idx];
+      const delta = newStartForId - oldStartNode;
+      if (delta === 0) {
+        continue;
+      }
+      const nextStart = Math.max(0, roundToGrid(start + delta));
+      if (nextStart !== start) {
+        clip.start = nextStart;
+        moved = true;
+        trackTouched = true;
+      }
+    }
+    if (trackTouched) {
+      sortClips(track);
+    }
+  }
+  return moved;
+}
+
+async function setSongStructureNodes(payload = {}) {
+  if (!Array.isArray(payload.nodes)) {
+    throw new Error('nodes array is required');
+  }
+  const current = normalizeSongStructure(state.project.song_structure);
+  const oldNodes = current.nodes;
+  const nextNodes = payload.nodes.map((node, index) => normalizeSongStructureNode(node, index));
+  const linkEnabled = Boolean(current.playlist_link_enabled);
+  const geometryChanged = !songStructureGeometryEqual(oldNodes, nextNodes);
+
+  let clipsMoved = false;
+  if (linkEnabled && geometryChanged) {
+    clipsMoved = ripplePlaylistClipsForSongStructureChange(oldNodes, nextNodes);
+  }
+
+  state.project.song_structure = normalizeSongStructure({
+    playlist_link_enabled: current.playlist_link_enabled,
+    template_id: Object.prototype.hasOwnProperty.call(payload, 'template_id')
+      ? payload.template_id
+      : current.template_id,
+    template_name: Object.prototype.hasOwnProperty.call(payload, 'template_name')
+      ? payload.template_name
+      : current.template_name,
+    nodes: nextNodes,
+  });
+
+  if (clipsMoved) {
+    await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+  }
+
+  return { song_structure: state.project.song_structure };
+}
+
+function setSongStructurePlaylistLink(payload = {}) {
+  const enabled = normalizeBool(payload.enabled ?? payload.playlist_link_enabled ?? payload.playlistLinkEnabled);
+  const current = normalizeSongStructure(state.project.song_structure);
+  state.project.song_structure = normalizeSongStructure({
+    ...current,
+    playlist_link_enabled: enabled,
+  });
+  return { song_structure: state.project.song_structure };
+}
+
+function updateSongStructureNode(payload = {}) {
+  const nodeId = typeof payload.id === 'string' ? payload.id.trim() : '';
+  if (!nodeId) {
+    throw new Error('id is required');
+  }
+  const current = normalizeSongStructure(state.project.song_structure);
+  const index = current.nodes.findIndex((node) => node.id === nodeId);
+  if (index < 0) {
+    throw new Error(`structure node "${nodeId}" not found`);
+  }
+  const patch = {};
+  if (Object.prototype.hasOwnProperty.call(payload, 'title')) {
+    patch.title = payload.title;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'note')) {
+    patch.note = payload.note;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'color')) {
+    patch.color = payload.color;
+  }
+  const nextNodes = [...current.nodes];
+  nextNodes[index] = normalizeSongStructureNode({ ...nextNodes[index], ...patch }, index);
+  state.project.song_structure = normalizeSongStructure({ ...current, nodes: nextNodes });
+  return { song_structure: state.project.song_structure };
+}
+
+function clearSongStructure(payload = {}) {
+  const current = normalizeSongStructure(state.project.song_structure);
+  state.project.song_structure = normalizeSongStructure({
+    ...current,
+    template_id: null,
+    template_name: null,
+    nodes: [],
+  });
+  return { song_structure: state.project.song_structure };
+}
+
+function applySongStructureTemplateMeta(payload = {}) {
+  const templateId = sanitizeStructureTemplateId(payload.template_id ?? payload.templateId);
+  const templateName = typeof payload.template_name === 'string'
+    ? payload.template_name.trim()
+    : typeof payload.templateName === 'string'
+      ? payload.templateName.trim()
+      : '';
+  if (!templateId) {
+    throw new Error('template_id is required');
+  }
+  const current = normalizeSongStructure(state.project.song_structure);
+  state.project.song_structure = {
+    ...current,
+    template_id: templateId,
+    template_name: templateName || current.template_name,
+  };
+  return { song_structure: state.project.song_structure };
 }
 
 async function ensureAppPreferencesFile() {
@@ -4640,6 +4924,155 @@ io.on('connection', (socket) => {
     });
   });
 
+  bindMutation(socket, 'song-structure:set-nodes', setSongStructureNodes);
+  bindMutation(socket, 'song-structure:set-playlist-link', setSongStructurePlaylistLink);
+  bindMutation(socket, 'song-structure:update-node', updateSongStructureNode);
+  bindMutation(socket, 'song-structure:clear', clearSongStructure);
+  bindMutation(socket, 'song-structure:set-template-meta', applySongStructureTemplateMeta);
+
+  socket.on('structure-template:list', async (_payload = {}, callback = () => {}) => {
+    try {
+      await ensureStructureTemplatesDir();
+      const files = await fs.readdir(structureTemplatesDir);
+      const templates = [];
+      for (const file of files) {
+        if (!file.endsWith('.json')) {
+          continue;
+        }
+        const id = file.replace(/\.json$/i, '');
+        try {
+          const template = await readStructureTemplate(id);
+          templates.push({
+            id: template.id,
+            name: template.name,
+            note: template.note,
+            modified_at: template.modified_at,
+          });
+        } catch {
+          // skip corrupt files
+        }
+      }
+      templates.sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || ''));
+      respond(callback, { ok: true, templates });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:list failed' });
+    }
+  });
+
+  socket.on('structure-template:load', async (payload = {}, callback = () => {}) => {
+    try {
+      const templateId = sanitizeStructureTemplateId(payload.id ?? payload.template_id ?? payload.templateId);
+      if (!templateId) {
+        respond(callback, { ok: false, error: 'id is required' });
+        return;
+      }
+      const template = await readStructureTemplate(templateId);
+      respond(callback, { ok: true, template });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:load failed' });
+    }
+  });
+
+  socket.on('structure-template:save', async (payload = {}, callback = () => {}) => {
+    try {
+      const templateId = sanitizeStructureTemplateId(payload.id ?? payload.template_id ?? payload.templateId);
+      if (!templateId) {
+        respond(callback, { ok: false, error: 'id is required' });
+        return;
+      }
+      const existing = await readStructureTemplate(templateId).catch(() => null);
+      const projectStructure = normalizeSongStructure(state.project.song_structure);
+      const nodes = Array.isArray(payload.nodes)
+        ? payload.nodes.map((node, index) => normalizeSongStructureNode(node, index))
+        : projectStructure.nodes;
+      const saved = await writeStructureTemplate({
+        id: templateId,
+        name: typeof payload.name === 'string' && payload.name.trim()
+          ? payload.name.trim()
+          : existing?.name || projectStructure.template_name || 'Untitled Structure',
+        note: typeof payload.note === 'string'
+          ? payload.note.trim()
+          : existing?.note || '',
+        nodes,
+      });
+      respond(callback, { ok: true, template: saved });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:save failed' });
+    }
+  });
+
+  socket.on('structure-template:save-as-new', async (payload = {}, callback = () => {}) => {
+    try {
+      const name = typeof payload.name === 'string' && payload.name.trim()
+        ? payload.name.trim()
+        : 'Untitled Structure';
+      const templateId = sanitizeStructureTemplateId(payload.id) || `tpl_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      const projectStructure = normalizeSongStructure(state.project.song_structure);
+      const nodes = Array.isArray(payload.nodes)
+        ? payload.nodes.map((node, index) => normalizeSongStructureNode(node, index))
+        : projectStructure.nodes;
+      const saved = await writeStructureTemplate({
+        id: templateId,
+        name,
+        note: typeof payload.note === 'string' ? payload.note.trim() : '',
+        nodes,
+      });
+      respond(callback, { ok: true, template: saved });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:save-as-new failed' });
+    }
+  });
+
+  socket.on('structure-template:delete', async (payload = {}, callback = () => {}) => {
+    try {
+      const templateId = sanitizeStructureTemplateId(payload.id ?? payload.template_id ?? payload.templateId);
+      if (!templateId) {
+        respond(callback, { ok: false, error: 'id is required' });
+        return;
+      }
+      await fs.unlink(structureTemplateFilePath(templateId));
+      respond(callback, { ok: true, id: templateId });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:delete failed' });
+    }
+  });
+
+  socket.on('structure-template:export', async (payload = {}, callback = () => {}) => {
+    try {
+      const templateId = sanitizeStructureTemplateId(payload.id ?? payload.template_id ?? payload.templateId);
+      if (!templateId) {
+        respond(callback, { ok: false, error: 'id is required' });
+        return;
+      }
+      const template = await readStructureTemplate(templateId);
+      respond(callback, { ok: true, json: JSON.stringify(template, null, 2), template });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:export failed' });
+    }
+  });
+
+  socket.on('structure-template:import', async (payload = {}, callback = () => {}) => {
+    try {
+      let parsed = payload.template;
+      if (typeof payload.json === 'string' && payload.json.trim()) {
+        parsed = JSON.parse(payload.json);
+      }
+      if (!parsed || typeof parsed !== 'object') {
+        respond(callback, { ok: false, error: 'template or json is required' });
+        return;
+      }
+      const templateId = sanitizeStructureTemplateId(payload.id ?? parsed.id) || `tpl_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      const saved = await writeStructureTemplate({
+        ...parsed,
+        id: templateId,
+        name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : 'Imported Structure',
+      });
+      respond(callback, { ok: true, template: saved });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'structure-template:import failed' });
+    }
+  });
+
   socket.on('app-preferences:update', async (payload = {}, callback = () => {}) => {
     try {
       const { hasAny, patch } = normalizeAppPreferencesPatch(payload);
@@ -4748,7 +5181,9 @@ io.on('connection', (socket) => {
       const plugins = await refreshNativePluginCatalogCache();
       respond(callback, { ok: true, plugins });
     } catch (error) {
-      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'vst:scan failed' });
+      const message = error instanceof Error ? error.message : 'vst:scan failed';
+      console.warn('[thestuu-engine] vst:scan failed:', message);
+      respond(callback, { ok: false, error: message });
     }
   });
 
@@ -5284,6 +5719,7 @@ io.on('connection', (socket) => {
   bindMutation(socket, 'clip:move', moveClip);
   bindMutation(socket, 'clip:resize', resizeClip);
   bindMutation(socket, 'clip:set-fade', setClipFade);
+  bindMutation(socket, 'clip:set-gain', setClipGain);
   bindMutation(socket, 'clip:set-properties', setClipProperties);
   bindMutation(socket, 'clip:analyze-bpm-key', analyzeClipBpmKey);
   bindMutation(socket, 'clip:delete', deleteClip);
@@ -5300,6 +5736,7 @@ io.on('connection', (socket) => {
   bindMutation(socket, 'move_clip', moveClip);
   bindMutation(socket, 'resize_clip', resizeClip);
   bindMutation(socket, 'set_clip_fade', setClipFade);
+  bindMutation(socket, 'set_clip_gain', setClipGain);
   bindMutation(socket, 'set_clip_properties', setClipProperties);
   bindMutation(socket, 'analyze_clip_bpm_key', analyzeClipBpmKey);
   bindMutation(socket, 'delete_clip', deleteClip);
@@ -5389,6 +5826,7 @@ const engineTickTimer = setInterval(() => {
 
 async function boot() {
   await ensureAppPreferencesFile();
+  await ensureStructureTemplatesDir();
   await ensureProjectFile();
   await startNativeTransportBridge();
   if (!nativeTransportActive) {

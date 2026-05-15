@@ -44,7 +44,21 @@ import 'reactflow/dist/style.css';
 import { createEngineSocket } from '../lib/socket';
 import { getMeterMap } from '../lib/meter-map';
 import LevelMeter from './LevelMeter';
+import MixPlaylistOverview from './MixPlaylistOverview';
 import MixStripChain from './MixStripChain';
+import SongStructureAddMenu from './SongStructureAddMenu';
+import SongStructureLane from './SongStructureLane';
+import SongStructureNodeModal from './SongStructureNodeModal';
+import SongStructureTemplateManager from './SongStructureTemplateManager';
+import { buildPlaylistOverviewPeaks } from '../lib/playlist-overview-peaks';
+import {
+  computeStructureStarts,
+  createDefaultStructureNode,
+  insertNodeAtBoundary,
+  removeStructureNodeById,
+  reorderStructureNodes,
+  resizeNodeRight,
+} from '../lib/song-structure.js';
 import { normalizeMasterMix } from '@thestuu/shared-json';
 
 function ExtractStemsIcon({ size = 24, strokeWidth = 2, ...props }) {
@@ -182,8 +196,21 @@ const EDIT_TOOL_OPTIONS = [
   { id: 'select', label: 'Select', description: 'waehlt Clips und Bereiche aus' },
   { id: 'delete', label: 'Delete', description: 'loescht Clips per Klick oder Bereich' },
   { id: 'slice', label: 'Trim', description: 'schneidet Audio- und MIDI-Clips an der Position' },
+  { id: 'slip', label: 'Slip', description: 'verschiebt den Audio-Inhalt innerhalb des Clips' },
+  { id: 'mute', label: 'Mute', description: 'schaltet Clips stumm oder wieder an' },
   { id: 'zoom', label: 'Zoom', description: 'zoomt in einen aufgezogenen Bereich' },
 ];
+const CLIP_GAIN_MIN = 0;
+const CLIP_GAIN_MAX = 2;
+const CLIP_GAIN_DEFAULT = 1;
+/** ~0.8 dB per 4px vertical drag (FL-style clip gain tab). */
+const CLIP_GAIN_DB_PER_PIXEL = 0.2;
+const CLIP_GAIN_DB_MIN = -80;
+const CLIP_GAIN_DB_MAX = 20 * Math.log10(CLIP_GAIN_MAX);
+const FADE_CURVE_DRAG_PX_PER_STEP = 28;
+const FADE_CURVE_NODE_MIN_PX = 10;
+/** Below this fade width (px) we treat the clip as having no fade — no curve, no handles. */
+const FADE_VISIBLE_MIN_PX = 0.5;
 const DEFAULT_EDIT_TOOL = 'select';
 const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3990';
 const LIVE_ENGINE_LOG_LIMIT = 500;
@@ -919,6 +946,7 @@ const FALLBACK_STATE = {
     playlist: [],
     mixer: [],
     master_mix: { volume: 1, pan: 0, mute: false, chain_enabled: true },
+    song_structure: { template_id: null, template_name: null, playlist_link_enabled: false, nodes: [] },
   },
   selectedProjectFile: 'welcome.stu',
   history: {
@@ -1611,18 +1639,221 @@ function getAdaptiveWaveformPeaks(peaks, clipWidthPx) {
   return resampleWaveformPeaks(peaks, targetCount);
 }
 
-function getWaveformPolygonPoints(peaks) {
+function normalizeClipGain(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return CLIP_GAIN_DEFAULT;
+  }
+  return clamp(parsed, CLIP_GAIN_MIN, CLIP_GAIN_MAX);
+}
+
+function clipGainToDb(gain) {
+  const normalized = normalizeClipGain(gain);
+  if (normalized <= 0.00001) {
+    return CLIP_GAIN_DB_MIN;
+  }
+  return 20 * Math.log10(normalized);
+}
+
+function clipDbToGain(db) {
+  const parsed = Number(db);
+  if (!Number.isFinite(parsed) || parsed <= CLIP_GAIN_DB_MIN + 0.01) {
+    return CLIP_GAIN_MIN;
+  }
+  return normalizeClipGain(10 ** (parsed / 20));
+}
+
+function getClipFadeDisplayValues(clip, fadeDraftByKey, clipKey) {
+  const draft = fadeDraftByKey?.[clipKey];
+  if (draft) {
+    return {
+      fadeIn: Math.max(0, Number(draft.fadeIn) || 0),
+      fadeOut: Math.max(0, Number(draft.fadeOut) || 0),
+    };
+  }
+  return {
+    fadeIn: Math.max(0, Number(clip?.fade_in) || 0),
+    fadeOut: Math.max(0, Number(clip?.fade_out) || 0),
+  };
+}
+
+function fadeSecondsToWidthPx(fadeSeconds, barWidthPx, bpm, timeSignature = DEFAULT_TIME_SIGNATURE) {
+  const bars = secondsToBars(Math.max(0, Number(fadeSeconds) || 0), bpm, timeSignature);
+  const width = Number(barWidthPx);
+  if (!Number.isFinite(width) || width <= 0) {
+    return 0;
+  }
+  return Math.max(0, bars * width);
+}
+
+function formatClipGainDb(gain) {
+  const normalized = normalizeClipGain(gain);
+  if (normalized <= 0.00001) {
+    return '-∞ dB';
+  }
+  const db = 20 * Math.log10(normalized);
+  const sign = db >= 0 ? '+' : '';
+  return `${sign}${db.toFixed(1)} dB`;
+}
+
+function getClipFadeCurves(clip, fadeDraftByKey, clipKey) {
+  const draft = fadeDraftByKey?.[clipKey];
+  const fadeInCurve = draft?.fadeInCurve ?? clip?.fade_in_curve;
+  const fadeOutCurve = draft?.fadeOutCurve ?? clip?.fade_out_curve;
+  return {
+    fadeInCurve: FADE_CURVE_ORDER.includes(fadeInCurve) ? fadeInCurve : 'linear',
+    fadeOutCurve: FADE_CURVE_ORDER.includes(fadeOutCurve) ? fadeOutCurve : 'linear',
+  };
+}
+
+function applyFadeCurveT(t, curve) {
+  const clamped = clamp(t, 0, 1);
+  switch (curve) {
+    case 'convex':
+      return clamped * clamped;
+    case 'concave':
+      return Math.sqrt(clamped);
+    case 'sCurve':
+      return clamped * clamped * (3 - 2 * clamped);
+    default:
+      return clamped;
+  }
+}
+
+function quadBezierPoint(t, x0, y0, x1, y1, x2, y2) {
+  const u = 1 - t;
+  const tt = t * t;
+  const uu = u * u;
+  return {
+    x: uu * x0 + 2 * u * t * x1 + tt * x2,
+    y: uu * y0 + 2 * u * t * y1 + tt * y2,
+  };
+}
+
+function getFadeCurveControlY(curve) {
+  switch (curve) {
+    case 'convex':
+      return 94;
+    case 'concave':
+      return 48;
+    case 'sCurve':
+      return 62;
+    default:
+      return 74;
+  }
+}
+
+function getFadeBezierControlX(which, xSpan, curve = 'linear') {
+  const fadeCurve = FADE_CURVE_ORDER.includes(curve) ? curve : 'linear';
+  if (which === 'in') {
+    return xSpan * (fadeCurve === 'concave' ? 0.35 : fadeCurve === 'convex' ? 0.68 : 0.52);
+  }
+  const xStart = 100 - xSpan;
+  return xStart + xSpan * (fadeCurve === 'concave' ? 0.65 : fadeCurve === 'convex' ? 0.32 : 0.48);
+}
+
+function buildFadeCurvePathD(which, fadePx, wrapWidthPx, curve = 'linear') {
+  const wrapW = Math.max(1, Number(wrapWidthPx) || 1);
+  const fadeW = Math.max(0, Number(fadePx) || 0);
+  if (fadeW < FADE_VISIBLE_MIN_PX) {
+    return '';
+  }
+  const fadeCurve = FADE_CURVE_ORDER.includes(curve) ? curve : 'linear';
+  const xSpan = Math.min(99, (fadeW / wrapW) * 100);
+  const controlY = getFadeCurveControlY(fadeCurve);
+  const cx = getFadeBezierControlX(which, xSpan, fadeCurve);
+
+  if (which === 'in') {
+    return `M 0 100 Q ${cx.toFixed(2)} ${controlY}, ${xSpan.toFixed(2)} 0`;
+  }
+
+  const xStart = 100 - xSpan;
+  return `M 100 100 Q ${cx.toFixed(2)} ${controlY}, ${xStart.toFixed(2)} 0`;
+}
+
+/** Point on fade quadratic at t=0.5 — curve handle sits on the white line (FL-style). */
+function getFadeCurveNodePosition(which, fadePx, wrapWidthPx, curve = 'linear') {
+  const fadeW = Math.max(0, Number(fadePx) || 0);
+  if (fadeW < FADE_CURVE_NODE_MIN_PX) {
+    return null;
+  }
+  const wrapW = Math.max(1, Number(wrapWidthPx) || 1);
+  const fadeCurve = FADE_CURVE_ORDER.includes(curve) ? curve : 'linear';
+  const xSpan = Math.min(99, (fadeW / wrapW) * 100);
+  const controlY = getFadeCurveControlY(fadeCurve);
+  const cx = getFadeBezierControlX(which, xSpan, fadeCurve);
+
+  if (which === 'in') {
+    const pt = quadBezierPoint(0.5, 0, 100, cx, controlY, xSpan, 0);
+    return { leftPercent: pt.x, topPercent: pt.y };
+  }
+
+  const xStart = 100 - xSpan;
+  const pt = quadBezierPoint(0.5, 100, 100, cx, controlY, xStart, 0);
+  return { leftPercent: pt.x, topPercent: pt.y };
+}
+
+/** Per-sample fade envelope 0–1 across clip width (for waveform rendering). */
+function getFadeEnvelopeAtX(progress, fadeInFrac, fadeOutFrac, fadeInCurve, fadeOutCurve) {
+  let env = 1;
+  const p = clamp(progress, 0, 1);
+  if (fadeInFrac > 0 && p < fadeInFrac) {
+    env = applyFadeCurveT(p / fadeInFrac, fadeInCurve);
+  }
+  if (fadeOutFrac > 0 && p > 1 - fadeOutFrac) {
+    const t = (1 - p) / fadeOutFrac;
+    env *= applyFadeCurveT(t, fadeOutCurve);
+  }
+  return clamp(env, 0, 1);
+}
+
+function applyFadeEnvelopeToPeaks(peaks, fadeInPx, fadeOutPx, clipWidthPx, fadeInCurve, fadeOutCurve) {
+  const normalized = normalizeWaveformPeaks(peaks);
+  if (normalized.length === 0) {
+    return normalized;
+  }
+  const wrapW = Math.max(1, Number(clipWidthPx) || 1);
+  const fadeInFrac = Math.max(0, Number(fadeInPx) || 0) / wrapW;
+  const fadeOutFrac = Math.max(0, Number(fadeOutPx) || 0) / wrapW;
+  if (fadeInFrac < 0.001 && fadeOutFrac < 0.001) {
+    return normalized;
+  }
+  const last = Math.max(1, normalized.length - 1);
+  return normalized.map((peak, index) => {
+    const progress = index / last;
+    const env = getFadeEnvelopeAtX(progress, fadeInFrac, fadeOutFrac, fadeInCurve, fadeOutCurve);
+    return Number((peak * env).toFixed(4));
+  });
+}
+
+function fadeCurveFromVerticalDrag(originCurve, deltaYPx) {
+  const originIndex = FADE_CURVE_ORDER.indexOf(originCurve);
+  const safeOrigin = originIndex >= 0 ? originIndex : 0;
+  const stepOffset = Math.round(-deltaYPx / FADE_CURVE_DRAG_PX_PER_STEP);
+  const nextIndex = clamp(safeOrigin + stepOffset, 0, FADE_CURVE_ORDER.length - 1);
+  return FADE_CURVE_ORDER[nextIndex];
+}
+
+function getClipGainDisplayValue(clip, gainDraftByKey, clipKey) {
+  if (gainDraftByKey && Object.prototype.hasOwnProperty.call(gainDraftByKey, clipKey)) {
+    return normalizeClipGain(gainDraftByKey[clipKey]);
+  }
+  return normalizeClipGain(clip?.gain);
+}
+
+function getWaveformPolygonPoints(peaks, gainMultiplier = 1) {
   const normalizedPeaks = normalizeWaveformPeaks(peaks);
   if (normalizedPeaks.length === 0) {
     return '';
   }
 
+  const gainScale = clamp(Number(gainMultiplier) || 1, CLIP_GAIN_MIN, CLIP_GAIN_MAX);
   const topPoints = [];
   const bottomPoints = [];
   const lastIndex = Math.max(1, normalizedPeaks.length - 1);
   for (let index = 0; index < normalizedPeaks.length; index += 1) {
     const x = (index / lastIndex) * 100;
-    const amplitude = normalizedPeaks[index] * 44;
+    const amplitude = normalizedPeaks[index] * 44 * gainScale;
     const topY = 50 - amplitude;
     const bottomY = 50 + amplitude;
     topPoints.push(`${x.toFixed(3)},${topY.toFixed(3)}`);
@@ -2316,6 +2547,7 @@ export default function StuuShell() {
   const trackNameInputRef = useRef(null);
   const cancelTrackNameEditRef = useRef(false);
   const arrangementScrollRef = useRef(null);
+  const mixOverviewRef = useRef(null);
   const arrangementGridRef = useRef(null);
   const arrangementTrackRowsRef = useRef(null);
   const arrangementBodyRef = useRef(null);
@@ -2448,10 +2680,14 @@ export default function StuuShell() {
   const [clipDrafts, setClipDrafts] = useState({});
   const [clipDisplayOverrides, setClipDisplayOverrides] = useState({});
   const [clipInteraction, setClipInteraction] = useState(null);
-  const [fadeHandleInteraction, setFadeHandleInteraction] = useState(/** @type {{ which: 'in'|'out'; trackId: number; clipId: string; originX: number; originY: number; fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; clipLengthBars: number; clipLengthSeconds: number } | null} */ (null));
+  const [fadeHandleInteraction, setFadeHandleInteraction] = useState(/** @type {{ mode: 'length'|'curve'; which: 'in'|'out'; trackId: number; clipId: string; fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; clipLengthSeconds: number } | null} */ (null));
   const fadeHandleDraftRef = useRef(/** @type {{ fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } | null} */ (null));
-  const fadeHandleStartRef = useRef(/** @type {{ originX: number; originY: number; lastCurveCycleY: number } | null} */ (null));
+  const fadeDraftRafRef = useRef(null);
+  const fadeHandleStartRef = useRef(/** @type {{ originX: number; originY: number; originCurve: string; originFadeIn: number; originFadeOut: number } | null} */ (null));
   const [fadeDraftByKey, setFadeDraftByKey] = useState(/** @type {{ [clipKey: string]: { fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } } } */ ({}));
+  const [gainDraftByKey, setGainDraftByKey] = useState(/** @type {{ [clipKey: string]: number } } */ ({}));
+  const gainDragDraftRef = useRef(/** @type {number | null} */ (null));
+  const gainDragOriginRef = useRef(/** @type {{ originY: number; originDb: number } | null} */ (null));
   const [openTrackMenuId, setOpenTrackMenuId] = useState(null);
   const [trackAddMenuAnchor, setTrackAddMenuAnchor] = useState(/** @type {{ top: number; right: number; height: number } | null} */ (null));
   const [editingTrackId, setEditingTrackId] = useState(null);
@@ -2460,6 +2696,13 @@ export default function StuuShell() {
   const [barWidth, setBarWidth] = useState(DEFAULT_BAR_WIDTH);
   const [viewBars, setViewBars] = useState(DEFAULT_VIEW_BARS);
   const [snapMode, setSnapMode] = useState(DEFAULT_SNAP_MODE);
+  const [structureAddMenuOpen, setStructureAddMenuOpen] = useState(false);
+  const [structureNodeModal, setStructureNodeModal] = useState(/** @type {object | null} */ (null));
+  const [selectedStructureNodeId, setSelectedStructureNodeId] = useState(/** @type {string | null} */ (null));
+  const [structureTemplateManagerOpen, setStructureTemplateManagerOpen] = useState(false);
+  const [structureTemplates, setStructureTemplates] = useState(/** @type {Array<{ id: string; name: string; note?: string; modified_at?: string }>} */ ([]));
+  const structureImportInputRef = useRef(/** @type {HTMLInputElement | null} */ (null));
+  const structureMenuAnchorRef = useRef(/** @type {HTMLButtonElement | null} */ (null));
   const [showTrackNodes, setShowTrackNodes] = useState(true);
   const [arrangementViewportWidth, setArrangementViewportWidth] = useState(0);
   const [availablePlugins, setAvailablePlugins] = useState([]);
@@ -2509,6 +2752,11 @@ export default function StuuShell() {
   const [selectedPluginUid, setSelectedPluginUid] = useState(FALLBACK_VST_UID);
   const [selectedPluginTrackId, setSelectedPluginTrackId] = useState(1);
   const [pluginScanPending, setPluginScanPending] = useState(false);
+  /** Prevents auto vst:scan loops when the catalog is empty (pending toggles would retrigger effects). */
+  const nodeTabVstAutoScanDoneRef = useRef(false);
+  const settingsVstPluginsAutoScanDoneRef = useRef(false);
+  /** Clears stuck "Scanne…" if the socket ack never arrives (engine/native hang beyond server timeout). */
+  const pluginScanAckTimeoutRef = useRef(null);
   const [pluginLoadPending, setPluginLoadPending] = useState(false);
   const [historyMutationPending, setHistoryMutationPending] = useState(false);
   const [hoveredTrackId, setHoveredTrackId] = useState(null);
@@ -2848,10 +3096,20 @@ export default function StuuShell() {
       appendConnectionLogEntry({ level: 'info', text: '[thestuu-ui] socket connected' });
     };
     const handleDisconnect = () => {
+      if (pluginScanAckTimeoutRef.current) {
+        clearTimeout(pluginScanAckTimeoutRef.current);
+        pluginScanAckTimeoutRef.current = null;
+      }
+      setPluginScanPending(false);
       setConnection('offline');
       appendConnectionLogEntry({ level: 'warn', text: '[thestuu-ui] socket disconnected' });
     };
     const handleConnectError = () => {
+      if (pluginScanAckTimeoutRef.current) {
+        clearTimeout(pluginScanAckTimeoutRef.current);
+        pluginScanAckTimeoutRef.current = null;
+      }
+      setPluginScanPending(false);
       setConnection('offline');
       appendConnectionLogEntry({ level: 'error', text: '[thestuu-ui] socket connect_error' });
     };
@@ -2952,6 +3210,11 @@ export default function StuuShell() {
     });
 
     return () => {
+      if (pluginScanAckTimeoutRef.current) {
+        clearTimeout(pluginScanAckTimeoutRef.current);
+        pluginScanAckTimeoutRef.current = null;
+      }
+      setPluginScanPending(false);
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('connect_error', handleConnectError);
@@ -3398,6 +3661,31 @@ export default function StuuShell() {
     }),
     [state?.project?.time_signature],
   );
+
+  const anyTrackSolo = useMemo(
+    () => arrangementTracks.some((track) => track.exists && Boolean(track.mix?.solo)),
+    [arrangementTracks],
+  );
+
+  const playlistOverviewPeaks = useMemo(() => {
+    const bpm = Number(state?.project?.bpm) || 128;
+    return buildPlaylistOverviewPeaks({
+      tracks: arrangementTracks,
+      maxClipEnd,
+      bpm,
+      timeSignature,
+      clipMuteOverrides,
+      anyTrackSolo,
+    });
+  }, [
+    arrangementTracks,
+    maxClipEnd,
+    state?.project?.bpm,
+    timeSignature,
+    clipMuteOverrides,
+    anyTrackSolo,
+  ]);
+
   const metronomeEnabled = normalizeMetronomeEnabled(state?.project?.metronome_enabled);
   const isMetronomeRunning = metronomeEnabled && Boolean(state?.playing);
   const projectBpmForInput = useMemo(() => {
@@ -4233,6 +4521,349 @@ export default function StuuShell() {
     });
   }, [appendSystemMessage]);
 
+  const songStructure = useMemo(() => {
+    const raw = state?.project?.song_structure;
+    return {
+      template_id: raw?.template_id ?? null,
+      template_name: raw?.template_name ?? null,
+      playlist_link_enabled: Boolean(raw?.playlist_link_enabled),
+      nodes: Array.isArray(raw?.nodes) ? raw.nodes : [],
+    };
+  }, [state?.project?.song_structure]);
+
+  const handleStructurePlaylistLinkToggle = useCallback(() => {
+    if (!socketRef.current) {
+      appendSystemMessage('Socket nicht bereit — Structure-Link kann nicht umgeschaltet werden.');
+      return;
+    }
+    let prevEnabled = false;
+    setState((statePrev) => {
+      const ss = statePrev.project?.song_structure;
+      prevEnabled = Boolean(ss?.playlist_link_enabled);
+      const nextEnabled = !prevEnabled;
+      const base = isObject(ss) ? ss : {};
+      return {
+        ...statePrev,
+        project: {
+          ...statePrev.project,
+          song_structure: {
+            ...base,
+            playlist_link_enabled: nextEnabled,
+          },
+        },
+      };
+    });
+    const nextEnabled = !prevEnabled;
+    socketRef.current.emit(
+      'song-structure:set-playlist-link',
+      { playlist_link_enabled: nextEnabled },
+      (result) => {
+        if (result?.ok) {
+          return;
+        }
+        setState((statePrev) => {
+          const ss = statePrev.project?.song_structure;
+          const base = isObject(ss) ? ss : {};
+          return {
+            ...statePrev,
+            project: {
+              ...statePrev.project,
+              song_structure: {
+                ...base,
+                playlist_link_enabled: prevEnabled,
+              },
+            },
+          };
+        });
+        appendSystemMessage(
+          `Fehler (song-structure:set-playlist-link): ${result?.error || 'Unbekannter Fehler'}`,
+        );
+      },
+    );
+  }, [appendSystemMessage]);
+
+  const structurePlaylistTintSegments = useMemo(() => {
+    if (!songStructure.playlist_link_enabled || !songStructure.nodes.length) {
+      return [];
+    }
+    const starts = computeStructureStarts(songStructure.nodes);
+    return songStructure.nodes.map((node, index) => {
+      const len = Number(node?.length);
+      const lengthBars = Number.isFinite(len) ? len : 1;
+      const rgb = hexToRgbChannels(node?.color);
+      return {
+        id: String(node?.id ?? index),
+        leftPx: starts[index] * barWidth,
+        widthPx: Math.max(4, lengthBars * barWidth),
+        rgb: rgb || '125, 211, 252',
+      };
+    });
+  }, [barWidth, songStructure.nodes, songStructure.playlist_link_enabled]);
+
+  useEffect(() => {
+    if (!selectedStructureNodeId) {
+      return;
+    }
+    const exists = songStructure.nodes.some((n) => n.id === selectedStructureNodeId);
+    if (!exists) {
+      setSelectedStructureNodeId(null);
+    }
+  }, [songStructure.nodes, selectedStructureNodeId]);
+
+  const refreshStructureTemplates = useCallback(() => {
+    socketRef.current?.emit('structure-template:list', {}, (result) => {
+      if (result?.ok) {
+        setStructureTemplates(Array.isArray(result.templates) ? result.templates : []);
+      }
+    });
+  }, []);
+
+  const applyStructureNodes = useCallback((nodes, meta = {}) => {
+    if (!socketRef.current) {
+      appendSystemMessage('Socket nicht bereit — Structure-Änderung nicht möglich.');
+      return;
+    }
+    const plainNodes = Array.isArray(nodes)
+      ? nodes.map((node) => ({
+        id: String(node?.id ?? ''),
+        title: String(node?.title ?? 'Section'),
+        note: typeof node?.note === 'string' ? node.note : '',
+        color: typeof node?.color === 'string' ? node.color : '#7dd3fc',
+        length: Number(node?.length) || 1,
+      }))
+      : [];
+    emitMutation('song-structure:set-nodes', {
+      nodes: plainNodes,
+      ...(Object.prototype.hasOwnProperty.call(meta, 'template_id') ? { template_id: meta.template_id } : {}),
+      ...(Object.prototype.hasOwnProperty.call(meta, 'template_name') ? { template_name: meta.template_name } : {}),
+    });
+  }, [appendSystemMessage, emitMutation]);
+
+  const downloadStructureJsonFile = useCallback((payload, filename) => {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const handleStructureResize = useCallback((index, nextLength) => {
+    const nextNodes = resizeNodeRight(songStructure.nodes, index, nextLength, snapStep);
+    applyStructureNodes(nextNodes);
+  }, [applyStructureNodes, snapStep, songStructure.nodes]);
+
+  const handleStructureAddAtBoundary = useCallback((boundaryIndex) => {
+    const nextNodes = insertNodeAtBoundary(songStructure.nodes, boundaryIndex, snapStep);
+    applyStructureNodes(nextNodes);
+  }, [applyStructureNodes, snapStep, songStructure.nodes]);
+
+  const handleStructureLaneSelectNode = useCallback((nodeId) => {
+    setSelectedClipKeys([]);
+    setSelectedStructureNodeId(nodeId ?? null);
+  }, []);
+
+  const handleStructureNodeModalOpen = useCallback((node) => {
+    setSelectedClipKeys([]);
+    setSelectedStructureNodeId(node?.id ?? null);
+    setStructureNodeModal(node);
+  }, []);
+
+  const handleStructureReorder = useCallback((fromIndex, insertBeforeIndex) => {
+    const nextNodes = reorderStructureNodes(songStructure.nodes, fromIndex, insertBeforeIndex);
+    const prevKey = songStructure.nodes.map((n) => n?.id).join('\0');
+    const nextKey = nextNodes.map((n) => n?.id).join('\0');
+    if (prevKey === nextKey) {
+      return;
+    }
+    applyStructureNodes(nextNodes);
+  }, [applyStructureNodes, songStructure.nodes]);
+
+  const handleStructureRemoveNodeById = useCallback((nodeId) => {
+    const id = typeof nodeId === 'string' ? nodeId.trim() : '';
+    if (!id) {
+      return;
+    }
+    const nextNodes = removeStructureNodeById(songStructure.nodes, id);
+    if (nextNodes === songStructure.nodes) {
+      return;
+    }
+    applyStructureNodes(nextNodes);
+    setStructureNodeModal(null);
+    setSelectedStructureNodeId(null);
+  }, [applyStructureNodes, songStructure.nodes]);
+
+  const handleStructureKeyboardDeleteRequest = useCallback(() => {
+    if (!selectedStructureNodeId) {
+      return;
+    }
+    handleStructureRemoveNodeById(selectedStructureNodeId);
+  }, [handleStructureRemoveNodeById, selectedStructureNodeId]);
+
+  const handleStructureNodeSave = useCallback((patch) => {
+    emitMutation('song-structure:update-node', patch, () => {
+      setStructureNodeModal(null);
+    });
+  }, [emitMutation]);
+
+  const handleStructureCreateNew = useCallback(() => {
+    applyStructureNodes([createDefaultStructureNode(16)], { template_id: null, template_name: null });
+  }, [applyStructureNodes]);
+
+  const handleStructureExportJson = useCallback(() => {
+    if (songStructure.template_id) {
+      socketRef.current?.emit('structure-template:export', { id: songStructure.template_id }, (result) => {
+        if (result?.ok && result.json) {
+          downloadStructureJsonFile(JSON.parse(result.json), `${songStructure.template_id}.json`);
+        }
+      });
+      return;
+    }
+    downloadStructureJsonFile(
+      { name: 'Project Structure', nodes: songStructure.nodes },
+      'song-structure.json',
+    );
+  }, [downloadStructureJsonFile, songStructure.nodes, songStructure.template_id]);
+
+  const handleStructureImportJson = useCallback(() => {
+    structureImportInputRef.current?.click();
+  }, []);
+
+  const handleStructureImportFile = useCallback((event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) {
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || ''));
+        socketRef.current?.emit('structure-template:import', { template: parsed, json: JSON.stringify(parsed) }, (result) => {
+          if (result?.ok && result.template) {
+            appendSystemMessage(`Structure template imported: ${result.template.name}`);
+            refreshStructureTemplates();
+          } else {
+            appendSystemMessage(`Import failed: ${result?.error || 'Unknown error'}`);
+          }
+        });
+      } catch (error) {
+        appendSystemMessage(`Invalid JSON: ${error instanceof Error ? error.message : 'parse error'}`);
+      }
+    };
+    reader.readAsText(file);
+  }, [appendSystemMessage, refreshStructureTemplates]);
+
+  const handleStructureSaveAsNew = useCallback(() => {
+    const name = window.prompt('Template name', songStructure.template_name || 'My Structure');
+    if (!name?.trim()) {
+      return;
+    }
+    socketRef.current?.emit('structure-template:save-as-new', {
+      name: name.trim(),
+      nodes: songStructure.nodes,
+    }, (result) => {
+      if (result?.ok && result.template) {
+        emitMutation('song-structure:set-template-meta', {
+          template_id: result.template.id,
+          template_name: result.template.name,
+        });
+        appendSystemMessage(`Template saved: ${result.template.name}`);
+        refreshStructureTemplates();
+      }
+    });
+  }, [appendSystemMessage, emitMutation, refreshStructureTemplates, songStructure.nodes, songStructure.template_name]);
+
+  const handleStructureSaveLoadedTemplate = useCallback(() => {
+    if (!songStructure.template_id) {
+      appendSystemMessage('No template loaded — use Save as New');
+      return;
+    }
+    socketRef.current?.emit('structure-template:save', {
+      id: songStructure.template_id,
+      name: songStructure.template_name,
+      nodes: songStructure.nodes,
+    }, (result) => {
+      if (result?.ok) {
+        appendSystemMessage(`Template updated: ${result.template?.name || songStructure.template_name}`);
+        refreshStructureTemplates();
+      } else {
+        appendSystemMessage(`Save failed: ${result?.error || 'Unknown error'}`);
+      }
+    });
+  }, [appendSystemMessage, refreshStructureTemplates, songStructure.nodes, songStructure.template_id, songStructure.template_name]);
+
+  const handleStructureTemplateLoad = useCallback((tpl) => {
+    if (!tpl?.id) {
+      return;
+    }
+    socketRef.current?.emit('structure-template:load', { id: tpl.id }, (result) => {
+      if (result?.ok && result.template) {
+        applyStructureNodes(result.template.nodes, {
+          template_id: result.template.id,
+          template_name: result.template.name,
+        });
+        appendSystemMessage(`Structure loaded: ${result.template.name}`);
+        setStructureTemplateManagerOpen(false);
+      }
+    });
+  }, [appendSystemMessage, applyStructureNodes]);
+
+  const handleStructureTemplateExport = useCallback((tpl) => {
+    if (!tpl?.id) {
+      return;
+    }
+    socketRef.current?.emit('structure-template:export', { id: tpl.id }, (result) => {
+      if (result?.ok && result.template) {
+        downloadStructureJsonFile(result.template, `${tpl.id}.json`);
+      }
+    });
+  }, [downloadStructureJsonFile]);
+
+  const handleStructureTemplateEditMeta = useCallback((tpl) => {
+    if (!tpl?.id) {
+      return;
+    }
+    const name = window.prompt('Template name', tpl.name || '');
+    if (!name?.trim()) {
+      return;
+    }
+    const note = window.prompt('Template note', tpl.note || '') ?? '';
+    socketRef.current?.emit('structure-template:save', {
+      id: tpl.id,
+      name: name.trim(),
+      note: note.trim(),
+    }, (result) => {
+      if (result?.ok) {
+        refreshStructureTemplates();
+      }
+    });
+  }, [refreshStructureTemplates]);
+
+  useEffect(() => {
+    if (!structureTemplateManagerOpen) {
+      return undefined;
+    }
+    refreshStructureTemplates();
+    return undefined;
+  }, [refreshStructureTemplates, structureTemplateManagerOpen]);
+
+  useEffect(() => {
+    if (!structureAddMenuOpen) {
+      return undefined;
+    }
+    const onPointerDown = (event) => {
+      const withinTrigger = event.target.closest('[data-structure-menu-root="true"]');
+      const withinPortalMenu = event.target.closest('[data-structure-add-menu="true"]');
+      if (!withinTrigger && !withinPortalMenu) {
+        setStructureAddMenuOpen(false);
+      }
+    };
+    window.addEventListener('pointerdown', onPointerDown);
+    return () => window.removeEventListener('pointerdown', onPointerDown);
+  }, [structureAddMenuOpen]);
+
   const requestClipBpmKeyAnalysis = useCallback(({
     trackId,
     clipId,
@@ -4401,9 +5032,20 @@ export default function StuuShell() {
       if (!target.closest('[data-track-plugin-picker-root="true"]')) {
         setOpenTrackPluginPicker(null);
       }
+      if (
+        !target.closest('.structure-node')
+        && !target.closest('.structure-node-modal-overlay')
+        && !target.closest('[data-structure-add-menu="true"]')
+      ) {
+        setSelectedStructureNodeId(null);
+      }
     }
 
     function handleKeyDown(event) {
+      const activeFocusEl =
+        document.activeElement instanceof Element ? document.activeElement : null;
+      const shortcutBlockedByTyping = activeFocusEl ? isEditableTarget(activeFocusEl) : false;
+
       const activateToolFromShortcut = (nextTool) => {
         const normalized = EDIT_TOOL_OPTIONS.some((tool) => tool.id === nextTool) ? nextTool : DEFAULT_EDIT_TOOL;
         setEditTool(normalized);
@@ -4433,7 +5075,7 @@ export default function StuuShell() {
         }
         return;
       }
-      if ((event.metaKey || event.ctrlKey) && !isEditableTarget(event.target)) {
+      if ((event.metaKey || event.ctrlKey) && !shortcutBlockedByTyping) {
         const key = event.key.toLowerCase();
         const wantsUndo = key === 'z' && !event.shiftKey;
         const wantsRedo = (key === 'z' && event.shiftKey) || (!event.metaKey && event.ctrlKey && key === 'y');
@@ -4455,12 +5097,13 @@ export default function StuuShell() {
         setClipAnalyzeResultModal(null);
         setOpenTrackPluginPicker(null);
         setTrackChainModalTrackId(null);
+        setStructureNodeModal(null);
         setToolDragOverlay(null);
         toolDragRef.current = null;
         clearToolPointerSession();
         return;
       }
-      if (activeTab === 'Edit' && !isEditableTarget(event.target)) {
+      if (activeTab === 'Edit' && !shortcutBlockedByTyping) {
         const key = event.key.toLowerCase();
         if (key === 'x') {
           activateToolFromShortcut('slice');
@@ -4474,7 +5117,12 @@ export default function StuuShell() {
           activateToolFromShortcut('zoom');
           return;
         }
-        if (key === 'delete' || key === 'backspace') {
+        const wantsDelete =
+          key === 'delete'
+          || key === 'backspace'
+          || event.code === 'Delete'
+          || event.code === 'Backspace';
+        if (wantsDelete && !event.defaultPrevented) {
           if (selectedClipKeys.length > 0) {
             event.preventDefault();
             for (const keyEntry of selectedClipKeys) {
@@ -4487,9 +5135,14 @@ export default function StuuShell() {
             setSelectedClipKeys([]);
             return;
           }
+          if (selectedStructureNodeId) {
+            event.preventDefault();
+            handleStructureRemoveNodeById(selectedStructureNodeId);
+            return;
+          }
         }
       }
-      if ((event.key === ' ' || event.code === 'Space') && !isEditableTarget(event.target)) {
+      if ((event.key === ' ' || event.code === 'Space') && !shortcutBlockedByTyping) {
         event.preventDefault();
         if (state?.playing) {
           emitMutation('transport:pause', {});
@@ -4505,7 +5158,7 @@ export default function StuuShell() {
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [activeTab, state?.playing, selectedClipKeys, emitMutation, triggerProjectRedo, triggerProjectUndo, importTrackRenamePrompt, resolveImportTrackRenamePrompt]);
+  }, [activeTab, state?.playing, selectedClipKeys, selectedStructureNodeId, handleStructureRemoveNodeById, emitMutation, triggerProjectRedo, triggerProjectUndo, importTrackRenamePrompt, resolveImportTrackRenamePrompt]);
 
   useEffect(() => {
     if (!clipRenameColorPrompt) {
@@ -4602,6 +5255,57 @@ export default function StuuShell() {
     [ensureViewBars, getCurrentTransportBars],
   );
 
+  const scheduleTransportSeek = useCallback((nextBars) => {
+    if (!Number.isFinite(nextBars)) {
+      return;
+    }
+    pendingSeekBarsRef.current = nextBars;
+    if (seekAnimationFrameRef.current !== null) {
+      return;
+    }
+    seekAnimationFrameRef.current = window.requestAnimationFrame(() => {
+      seekAnimationFrameRef.current = null;
+      const bars = pendingSeekBarsRef.current;
+      pendingSeekBarsRef.current = null;
+      if (!Number.isFinite(bars)) {
+        return;
+      }
+      socketRef.current?.emit('transport:seek', { positionBars: bars });
+    });
+  }, []);
+
+  const applyMixOverviewPlayhead = useCallback(() => {
+    const overviewEl = mixOverviewRef.current;
+    if (!overviewEl) {
+      return;
+    }
+    const safeEnd = Math.max(0.001, Number(maxClipEnd) || 0);
+    const bars = getCurrentTransportBars();
+    const pct = clamp(bars / safeEnd, 0, 1) * 100;
+    overviewEl.style.setProperty('--mix-overview-playhead-pct', `${pct}%`);
+  }, [getCurrentTransportBars, maxClipEnd]);
+
+  const seekMixOverviewBars = useCallback((rawBars, { shiftKey = false } = {}) => {
+    if (!Number.isFinite(rawBars)) {
+      return;
+    }
+    const safeEnd = Math.max(0.001, Number(maxClipEnd) || 0);
+    const snapped = shiftKey ? snapToGrid(rawBars, snapStep) : rawBars;
+    const nextBars = Number(clamp(snapped, 0, safeEnd).toFixed(6));
+    playheadDragBarsRef.current = nextBars;
+    setPlayheadDragBars(nextBars);
+    scheduleTransportSeek(nextBars);
+    const overviewEl = mixOverviewRef.current;
+    if (overviewEl) {
+      const pct = clamp(nextBars / safeEnd, 0, 1) * 100;
+      overviewEl.style.setProperty('--mix-overview-playhead-pct', `${pct}%`);
+    }
+  }, [maxClipEnd, snapStep, scheduleTransportSeek]);
+
+  const clearMixOverviewPlayheadDrag = useCallback(() => {
+    setPlayheadDragBars(null);
+  }, []);
+
   useEffect(() => {
     if (viewBars < minimumViewportBars) {
       setViewBars(minimumViewportBars);
@@ -4663,18 +5367,19 @@ export default function StuuShell() {
     }
     prevTabForPlayheadRef.current = activeTab;
 
-    if (activeTab !== 'Edit') {
-      return;
+    if (activeTab === 'Edit') {
+      const scrollEl = arrangementScrollRef.current;
+      if (scrollEl) {
+        applyPlayheadToScrollEl(scrollEl);
+      }
     }
-    const scrollEl = arrangementScrollRef.current;
-    if (!scrollEl) {
-      return;
+    if (activeTab === 'Edit' || activeTab === 'Mix') {
+      applyMixOverviewPlayhead();
     }
-    applyPlayheadToScrollEl(scrollEl);
-  }, [activeTab, applyPlayheadToScrollEl]);
+  }, [activeTab, applyPlayheadToScrollEl, applyMixOverviewPlayhead]);
 
   useEffect(() => {
-    if (activeTab !== 'Edit') {
+    if (activeTab !== 'Edit' && activeTab !== 'Mix') {
       return;
     }
 
@@ -4682,16 +5387,21 @@ export default function StuuShell() {
     const MAX_SCROLL_REF_RETRIES = 24;
 
     const renderPlayhead = () => {
-      const scrollElement = arrangementScrollRef.current;
-      if (!scrollElement) {
-        if (scrollRefRetries < MAX_SCROLL_REF_RETRIES) {
-          scrollRefRetries += 1;
-          playheadAnimationFrameRef.current = window.requestAnimationFrame(renderPlayhead);
+      if (activeTab === 'Edit') {
+        const scrollElement = arrangementScrollRef.current;
+        if (!scrollElement) {
+          if (scrollRefRetries < MAX_SCROLL_REF_RETRIES) {
+            scrollRefRetries += 1;
+            playheadAnimationFrameRef.current = window.requestAnimationFrame(renderPlayhead);
+          }
+          return;
         }
-        return;
+        scrollRefRetries = 0;
+        applyPlayheadToScrollEl(scrollElement);
       }
-
-      applyPlayheadToScrollEl(scrollElement);
+      if (activeTab === 'Edit' || activeTab === 'Mix') {
+        applyMixOverviewPlayhead();
+      }
       playheadAnimationFrameRef.current = window.requestAnimationFrame(renderPlayhead);
     };
 
@@ -4702,7 +5412,7 @@ export default function StuuShell() {
         playheadAnimationFrameRef.current = null;
       }
     };
-  }, [activeTab, state?.playing, applyPlayheadToScrollEl]);
+  }, [activeTab, state?.playing, applyPlayheadToScrollEl, applyMixOverviewPlayhead]);
 
   useEffect(() => {
     const selectedProjectFile = typeof state?.selectedProjectFile === 'string'
@@ -4779,25 +5489,6 @@ export default function StuuShell() {
       ensureViewBars(barsInView);
     });
   }, [ensureViewBars]);
-
-  const scheduleTransportSeek = useCallback((nextBars) => {
-    if (!Number.isFinite(nextBars)) {
-      return;
-    }
-    pendingSeekBarsRef.current = nextBars;
-    if (seekAnimationFrameRef.current !== null) {
-      return;
-    }
-    seekAnimationFrameRef.current = window.requestAnimationFrame(() => {
-      seekAnimationFrameRef.current = null;
-      const bars = pendingSeekBarsRef.current;
-      pendingSeekBarsRef.current = null;
-      if (!Number.isFinite(bars)) {
-        return;
-      }
-      socketRef.current?.emit('transport:seek', { positionBars: bars });
-    });
-  }, []);
 
   const seekPlayheadFromPointer = useCallback((event) => {
     const scrollElement = arrangementScrollRef.current;
@@ -6496,18 +7187,44 @@ export default function StuuShell() {
 
   const scanVstPlugins = useCallback((options = {}) => {
     const silent = Boolean(options.silent);
-    if (!socketRef.current) {
-      return;
+    const socket = socketRef.current;
+    if (!socket) {
+      return false;
+    }
+    if (!socket.connected) {
+      appendSystemMessage('VST-Scan abgebrochen: Keine Verbindung zum Engine-Socket.');
+      return false;
+    }
+    if (connection !== 'online' || !state?.nativeTransport) {
+      appendSystemMessage('VST-Scan nicht moeglich: Native Engine ist nicht bereit (warte auf Transport).');
+      return false;
+    }
+
+    if (pluginScanAckTimeoutRef.current) {
+      clearTimeout(pluginScanAckTimeoutRef.current);
+      pluginScanAckTimeoutRef.current = null;
     }
 
     setPluginScanPending(true);
-    socketRef.current.emit('vst:scan', {}, (result) => {
+    /** Slightly above engine `NATIVE_VST_SCAN_TIMEOUT_MS` (600000) so the server can answer first. */
+    const clientAckSafetyMs = 615000;
+    pluginScanAckTimeoutRef.current = setTimeout(() => {
+      pluginScanAckTimeoutRef.current = null;
+      setPluginScanPending(false);
+      appendSystemMessage(
+        'VST-Scan: Keine Antwort vom Engine (Timeout). Pruefe Engine-/Native-Logs und starte die Native-Engine neu.',
+      );
+    }, clientAckSafetyMs);
+
+    socket.emit('vst:scan', {}, (result) => {
+      if (pluginScanAckTimeoutRef.current) {
+        clearTimeout(pluginScanAckTimeoutRef.current);
+        pluginScanAckTimeoutRef.current = null;
+      }
       setPluginScanPending(false);
 
       if (!result?.ok) {
-        if (!silent) {
-          appendSystemMessage(`Fehler (vst:scan): ${result?.error || 'Unbekannter Fehler'}`);
-        }
+        appendSystemMessage(`Fehler (vst:scan): ${result?.error || 'Unbekannter Fehler'}`);
         return;
       }
 
@@ -6525,7 +7242,8 @@ export default function StuuShell() {
         appendSystemMessage(`VST-Scan abgeschlossen: ${plugins.length} Plugins gefunden.`);
       }
     });
-  }, [appendSystemMessage]);
+    return true;
+  }, [appendSystemMessage, connection, state?.nativeTransport]);
 
   function addVst(options = {}) {
     const requestedSlotKind = normalizePluginKind(options.slotKind ?? options.slot_kind, null);
@@ -6882,18 +7600,38 @@ export default function StuuShell() {
   }
 
   useEffect(() => {
-    if (activeTab !== 'Node' || pluginScanPending || availablePlugins.length > 0) {
+    if (activeTab !== 'Node') {
+      nodeTabVstAutoScanDoneRef.current = false;
       return;
     }
-    scanVstPlugins({ silent: true });
-  }, [activeTab, pluginScanPending, availablePlugins.length, scanVstPlugins]);
+    if (pluginScanPending || availablePlugins.length > 0 || nodeTabVstAutoScanDoneRef.current) {
+      return;
+    }
+    if (connection !== 'online' || !state?.nativeTransport) {
+      return;
+    }
+    const started = scanVstPlugins({ silent: true });
+    if (started) {
+      nodeTabVstAutoScanDoneRef.current = true;
+    }
+  }, [activeTab, pluginScanPending, availablePlugins.length, scanVstPlugins, connection, state?.nativeTransport]);
 
   useEffect(() => {
-    if (!showSettingsModal || settingsTab !== 'VST PLUGINS' || pluginScanPending || availablePlugins.length > 0) {
+    if (!showSettingsModal || settingsTab !== 'VST PLUGINS') {
+      settingsVstPluginsAutoScanDoneRef.current = false;
       return;
     }
-    scanVstPlugins({ silent: true });
-  }, [showSettingsModal, settingsTab, pluginScanPending, availablePlugins.length, scanVstPlugins]);
+    if (pluginScanPending || availablePlugins.length > 0 || settingsVstPluginsAutoScanDoneRef.current) {
+      return;
+    }
+    if (connection !== 'online' || !state?.nativeTransport) {
+      return;
+    }
+    const started = scanVstPlugins({ silent: true });
+    if (started) {
+      settingsVstPluginsAutoScanDoneRef.current = true;
+    }
+  }, [showSettingsModal, settingsTab, pluginScanPending, availablePlugins.length, scanVstPlugins, connection, state?.nativeTransport]);
 
   function saveProject() {
     const projectWithViewState = {
@@ -7546,13 +8284,79 @@ export default function StuuShell() {
     window.addEventListener('pointercancel', handleUp);
   }
 
+  function beginClipGainInteraction(event, trackId, clip) {
+    event.preventDefault();
+    event.stopPropagation();
+    const clipKey = getClipSelectionKey(trackId, clip.id);
+    const originGain = normalizeClipGain(clip.gain);
+    const originDb = clipGainToDb(originGain);
+    gainDragOriginRef.current = { originY: event.clientY, originDb };
+    gainDragDraftRef.current = originGain;
+    setGainDraftByKey((previous) => ({ ...previous, [clipKey]: originGain }));
+
+    const handleMove = (moveEvent) => {
+      const start = gainDragOriginRef.current;
+      if (!start) {
+        return;
+      }
+      const deltaY = start.originY - moveEvent.clientY;
+      const nextDb = clamp(start.originDb + deltaY * CLIP_GAIN_DB_PER_PIXEL, CLIP_GAIN_DB_MIN, CLIP_GAIN_DB_MAX);
+      const nextGain = clipDbToGain(nextDb);
+      gainDragDraftRef.current = nextGain;
+      setGainDraftByKey((previous) => ({ ...previous, [clipKey]: nextGain }));
+    };
+
+    const handleUp = () => {
+      const draftGain = gainDragDraftRef.current;
+      if (draftGain != null) {
+        emitMutation('clip:set-gain', {
+          trackId,
+          clipId: clip.id,
+          gain: Number(draftGain.toFixed(4)),
+        });
+      }
+      gainDragDraftRef.current = null;
+      gainDragOriginRef.current = null;
+      setGainDraftByKey((previous) => {
+        const next = { ...previous };
+        delete next[clipKey];
+        return next;
+      });
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
+    };
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
+  }
+
   function handleClipPointerDown(event, trackId, clip) {
     if (event.button !== 0) {
       return;
     }
+    if (event.target.closest('.clip-fade-in-curve-handle, .clip-fade-out-curve-handle')) {
+      const which = event.target.closest('.clip-fade-in-curve-handle') ? 'in' : 'out';
+      beginFadeHandleInteraction(which, 'curve', event, trackId, clip);
+      return;
+    }
     if (event.target.closest('.clip-fade-in-handle, .clip-fade-out-handle')) {
       const which = event.target.closest('.clip-fade-in-handle') ? 'in' : 'out';
-      beginFadeHandleInteraction(which, event, trackId, clip);
+      beginFadeHandleInteraction(which, 'length', event, trackId, clip);
+      return;
+    }
+    if (event.target.closest('.clip-corner-tools, .clip-corner-button')) {
+      return;
+    }
+    const clipType = (clip?.type || clip?.clip_type || '').toString().toLowerCase();
+    if (
+      clipType === 'audio'
+      && editTool === 'select'
+      && event.target.closest('.clip-gain-handle')
+      && !event.target.closest('.clip-resize-handle, .clip-corner-tools, .clip-fade-in-handle, .clip-fade-out-handle, .clip-fade-in-curve-handle, .clip-fade-out-curve-handle')
+    ) {
+      beginClipGainInteraction(event, trackId, clip);
       return;
     }
 
@@ -7645,7 +8449,7 @@ export default function StuuShell() {
     beginClipInteraction(event, 'resize', trackId, clip, { edge });
   }
 
-  function beginFadeHandleInteraction(which, event, trackId, clip) {
+  function beginFadeHandleInteraction(which, mode, event, trackId, clip) {
     event.preventDefault();
     event.stopPropagation();
     const bpm = Number(transportSnapshotRef.current?.bpm) || 120;
@@ -7655,20 +8459,25 @@ export default function StuuShell() {
     const fadeOut = Number(clip.fade_out) || 0;
     const fadeInCurve = FADE_CURVE_ORDER.includes(clip.fade_in_curve) ? clip.fade_in_curve : 'linear';
     const fadeOutCurve = FADE_CURVE_ORDER.includes(clip.fade_out_curve) ? clip.fade_out_curve : 'linear';
+    const originCurve = which === 'in' ? fadeInCurve : fadeOutCurve;
     const clipKey = getClipSelectionKey(trackId, clip.id);
     fadeHandleDraftRef.current = { fadeIn, fadeOut, fadeInCurve, fadeOutCurve };
-    fadeHandleStartRef.current = { originX: event.clientX, originY: event.clientY, lastCurveCycleY: event.clientY };
+    fadeHandleStartRef.current = {
+      originX: event.clientX,
+      originY: event.clientY,
+      originCurve,
+      originFadeIn: fadeIn,
+      originFadeOut: fadeOut,
+    };
     setFadeHandleInteraction({
+      mode,
       which,
       trackId,
       clipId: clip.id,
-      originX: event.clientX,
-      originY: event.clientY,
       fadeIn,
       fadeOut,
       fadeInCurve,
       fadeOutCurve,
-      clipLengthBars,
       clipLengthSeconds,
     });
     setFadeDraftByKey((prev) => ({ ...prev, [clipKey]: { fadeIn, fadeOut, fadeInCurve, fadeOutCurve } }));
@@ -7686,44 +8495,54 @@ export default function StuuShell() {
       const start = fadeHandleStartRef.current;
       const draft = fadeHandleDraftRef.current;
       if (!start || !draft) return;
-      const deltaXBars = (moveEvent.clientX - start.originX) / barWidthRef.current;
-      const deltaYBars = (moveEvent.clientY - start.originY) / barWidthRef.current;
-      const snappedDeltaXBars = snapToGrid(deltaXBars, snapStep);
+
       let nextFadeIn = draft.fadeIn;
       let nextFadeOut = draft.fadeOut;
       let nextFadeInCurve = draft.fadeInCurve;
       let nextFadeOutCurve = draft.fadeOutCurve;
 
-      const curveThresholdPx = 12;
-      const deltaYFromLastCycle = moveEvent.clientY - start.lastCurveCycleY;
-
-      if (fadeHandleInteraction.which === 'in') {
-        const newFadeInBars = Math.max(0, secondsToBars(draft.fadeIn, bpm, timeSignature) + snappedDeltaXBars);
-        const newFadeInSeconds = Math.min(barsToSeconds(newFadeInBars, bpm, timeSignature), maxFadeSeconds);
-        nextFadeIn = Math.max(0, newFadeInSeconds);
-        if (Math.abs(deltaYFromLastCycle) >= curveThresholdPx) {
-          const idx = FADE_CURVE_ORDER.indexOf(draft.fadeInCurve);
-          const nextIdx = deltaYFromLastCycle < 0 ? (idx + 1) % FADE_CURVE_ORDER.length : (idx - 1 + FADE_CURVE_ORDER.length) % FADE_CURVE_ORDER.length;
-          nextFadeInCurve = FADE_CURVE_ORDER[nextIdx];
-          start.lastCurveCycleY = moveEvent.clientY;
+      if (fadeHandleInteraction.mode === 'length') {
+        const deltaXBars = (moveEvent.clientX - start.originX) / barWidthRef.current;
+        if (fadeHandleInteraction.which === 'in') {
+          const newFadeInBars = Math.max(0, secondsToBars(start.originFadeIn, bpm, timeSignature) + deltaXBars);
+          nextFadeIn = Math.min(barsToSeconds(newFadeInBars, bpm, timeSignature), maxFadeSeconds);
+        } else {
+          const newFadeOutBars = Math.max(0, secondsToBars(start.originFadeOut, bpm, timeSignature) - deltaXBars);
+          nextFadeOut = Math.min(barsToSeconds(newFadeOutBars, bpm, timeSignature), maxFadeSeconds);
         }
       } else {
-        const newFadeOutBars = Math.max(0, secondsToBars(draft.fadeOut, bpm, timeSignature) - snappedDeltaXBars);
-        const newFadeOutSeconds = Math.min(barsToSeconds(newFadeOutBars, bpm, timeSignature), maxFadeSeconds);
-        nextFadeOut = Math.max(0, newFadeOutSeconds);
-        if (Math.abs(deltaYFromLastCycle) >= curveThresholdPx) {
-          const idx = FADE_CURVE_ORDER.indexOf(draft.fadeOutCurve);
-          const nextIdx = deltaYFromLastCycle < 0 ? (idx + 1) % FADE_CURVE_ORDER.length : (idx - 1 + FADE_CURVE_ORDER.length) % FADE_CURVE_ORDER.length;
-          nextFadeOutCurve = FADE_CURVE_ORDER[nextIdx];
-          start.lastCurveCycleY = moveEvent.clientY;
+        const deltaYPx = moveEvent.clientY - start.originY;
+        if (fadeHandleInteraction.which === 'in') {
+          nextFadeInCurve = fadeCurveFromVerticalDrag(start.originCurve, deltaYPx);
+        } else {
+          nextFadeOutCurve = fadeCurveFromVerticalDrag(start.originCurve, deltaYPx);
         }
       }
 
       fadeHandleDraftRef.current = { fadeIn: nextFadeIn, fadeOut: nextFadeOut, fadeInCurve: nextFadeInCurve, fadeOutCurve: nextFadeOutCurve };
-      setFadeDraftByKey((prev) => ({ ...prev, [clipKey]: { fadeIn: nextFadeIn, fadeOut: nextFadeOut, fadeInCurve: nextFadeInCurve, fadeOutCurve: nextFadeOutCurve } }));
+      if (fadeDraftRafRef.current === null) {
+        fadeDraftRafRef.current = window.requestAnimationFrame(() => {
+          fadeDraftRafRef.current = null;
+          const live = fadeHandleDraftRef.current;
+          if (!live) return;
+          setFadeDraftByKey((prev) => ({
+            ...prev,
+            [clipKey]: {
+              fadeIn: live.fadeIn,
+              fadeOut: live.fadeOut,
+              fadeInCurve: live.fadeInCurve,
+              fadeOutCurve: live.fadeOutCurve,
+            },
+          }));
+        });
+      }
     }
 
     function handlePointerUp() {
+      if (fadeDraftRafRef.current !== null) {
+        window.cancelAnimationFrame(fadeDraftRafRef.current);
+        fadeDraftRafRef.current = null;
+      }
       const draft = fadeHandleDraftRef.current;
       if (draft) {
         emitMutation('clip:set-fade', {
@@ -7756,7 +8575,7 @@ export default function StuuShell() {
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('pointercancel', handlePointerUp);
     };
-  }, [fadeHandleInteraction, emitMutation, snapStep, timeSignature]);
+  }, [fadeHandleInteraction, emitMutation, timeSignature]);
 
   useEffect(() => {
     if (!clipInteraction) {
@@ -8798,6 +9617,15 @@ export default function StuuShell() {
                   </div>
 
                   <div className="daw-time-readout">{timeDisplay}</div>
+                  {showDawTopShell ? (
+                    <MixPlaylistOverview
+                      ref={mixOverviewRef}
+                      peaks={playlistOverviewPeaks}
+                      maxClipEndBars={maxClipEnd}
+                      onSeekBars={seekMixOverviewBars}
+                      onSeekEnd={clearMixOverviewPlayheadDrag}
+                    />
+                  ) : null}
                 </div>
               </header>
             </>
@@ -8938,6 +9766,58 @@ export default function StuuShell() {
                     aria-label="Arrangement"
                   >
                     <section className="arrangement-track-column">
+                      <div className="arrangement-structure-label-row" data-structure-menu-root="true">
+                        <button
+                          ref={structureMenuAnchorRef}
+                          type="button"
+                          className={`arrangement-structure-label-btn ${structureAddMenuOpen ? 'is-open' : ''}`}
+                          onClick={() => setStructureAddMenuOpen((open) => !open)}
+                          aria-expanded={structureAddMenuOpen}
+                          aria-haspopup="menu"
+                        >
+                          Structure
+                          <ChevronDown size={12} aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className={`arrangement-structure-link-toggle${songStructure.playlist_link_enabled ? ' is-active' : ''}`}
+                          aria-label={
+                            songStructure.playlist_link_enabled
+                              ? 'Structure mit Playlist verknüpft (klicken zum Trennen)'
+                              : 'Structure mit Playlist verknüpfen'
+                          }
+                          aria-pressed={songStructure.playlist_link_enabled}
+                          title={
+                            songStructure.playlist_link_enabled
+                              ? 'Verbunden: Sections verschieben mitzieht Clips. Klick zum Trennen.'
+                              : 'Getrennt: Klicken, um Sections mit der Playlist zu verknüpfen.'
+                          }
+                          onClick={handleStructurePlaylistLinkToggle}
+                        >
+                          <span className="arrangement-structure-link-toggle-glyph" aria-hidden="true">
+                            <span className="arrangement-structure-link-toggle-mask" />
+                          </span>
+                        </button>
+                        <SongStructureAddMenu
+                          anchorRef={structureMenuAnchorRef}
+                          open={structureAddMenuOpen}
+                          onClose={() => setStructureAddMenuOpen(false)}
+                          onSaveAsNew={handleStructureSaveAsNew}
+                          onExportJson={handleStructureExportJson}
+                          onImportJson={handleStructureImportJson}
+                          onCreateNew={handleStructureCreateNew}
+                          onOpenTemplates={() => setStructureTemplateManagerOpen(true)}
+                        />
+                        <input
+                          ref={structureImportInputRef}
+                          type="file"
+                          accept="application/json,.json"
+                          className="sr-only"
+                          tabIndex={-1}
+                          aria-hidden="true"
+                          onChange={handleStructureImportFile}
+                        />
+                      </div>
                       <div className="arrangement-track-header">
                         <div className="daw-btn-group edit-tools-group" role="toolbar" aria-label="Edit Tools">
                           <button
@@ -9799,11 +10679,46 @@ export default function StuuShell() {
                         className="arrangement-scroll"
                         onWheel={handleArrangementWheel}
                       >
+                        <SongStructureLane
+                          nodes={songStructure.nodes}
+                          barWidth={barWidth}
+                          snapStep={snapStep}
+                          timelineWidth={timelineWidth}
+                          readOnly={false}
+                          playlistLinkTintSegments={structurePlaylistTintSegments}
+                          selectedNodeId={selectedStructureNodeId}
+                          onSelectStructureNode={handleStructureLaneSelectNode}
+                          onResize={handleStructureResize}
+                          onAddAtBoundary={handleStructureAddAtBoundary}
+                          onReorder={handleStructureReorder}
+                          onPlayheadPointerDown={beginPlayheadScrub}
+                          onStructureKeyboardDelete={handleStructureKeyboardDeleteRequest}
+                          onNodeClick={handleStructureNodeModalOpen}
+                        />
+
                         <div
                           className="timeline-ruler"
                           style={{ width: `${timelineWidth}px`, minWidth: '100%' }}
                           onPointerDown={beginPlayheadScrub}
                         >
+                          {structurePlaylistTintSegments.length > 0 ? (
+                            <div
+                              className="arrangement-structure-playlist-tint arrangement-structure-playlist-tint--ruler"
+                              aria-hidden="true"
+                            >
+                              {structurePlaylistTintSegments.map((seg) => (
+                                <div
+                                  key={`struct_tint_ruler_${seg.id}`}
+                                  className="arrangement-structure-playlist-tint-strip"
+                                  style={{
+                                    left: `${seg.leftPx}px`,
+                                    width: `${seg.widthPx}px`,
+                                    background: `linear-gradient(180deg, rgba(${seg.rgb}, 0.26), rgba(${seg.rgb}, 0.07))`,
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          ) : null}
                           <div className="timeline-ruler-time-row" aria-hidden="true">
                             {timeMarkers.map(({ seconds, leftPx, label }) => (
                               <div
@@ -9859,6 +10774,24 @@ export default function StuuShell() {
                             }
                           }}
                         >
+                          {structurePlaylistTintSegments.length > 0 ? (
+                            <div
+                              className="arrangement-structure-playlist-tint arrangement-structure-playlist-tint--grid"
+                              aria-hidden="true"
+                            >
+                              {structurePlaylistTintSegments.map((seg) => (
+                                <div
+                                  key={`struct_tint_grid_${seg.id}`}
+                                  className="arrangement-structure-playlist-tint-strip"
+                                  style={{
+                                    left: `${seg.leftPx}px`,
+                                    width: `${seg.widthPx}px`,
+                                    background: `linear-gradient(180deg, rgba(${seg.rgb}, 0.11), rgba(${seg.rgb}, 0.2))`,
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          ) : null}
                           {editTool === 'slice' && slicePreviewBars != null && Number.isFinite(slicePreviewBars) ? (
                             <div
                               className="timeline-slice-line"
@@ -9957,16 +10890,61 @@ export default function StuuShell() {
                                   const peaksForAdaptive = clipType === 'audio'
                                     ? (windowedPeaks.length > 0 ? windowedPeaks : (rawPeaks.length > 0 ? rawPeaks : PLACEHOLDER_WAVEFORM_PEAKS))
                                     : [];
-                                  const waveformPeaks = clipType === 'audio'
+                                  const { fadeIn: clipFadeInSec, fadeOut: clipFadeOutSec } = clipType === 'audio'
+                                    ? getClipFadeDisplayValues(renderedClip, fadeDraftByKey, clipKey)
+                                    : { fadeIn: 0, fadeOut: 0 };
+                                  const clipFadeInPx = clipType === 'audio'
+                                    ? fadeSecondsToWidthPx(clipFadeInSec, barWidth, arrangementClipBpm, timeSignature)
+                                    : 0;
+                                  const clipFadeOutPx = clipType === 'audio'
+                                    ? fadeSecondsToWidthPx(clipFadeOutSec, barWidth, arrangementClipBpm, timeSignature)
+                                    : 0;
+                                  const { fadeInCurve: clipFadeInCurve, fadeOutCurve: clipFadeOutCurve } = clipType === 'audio'
+                                    ? getClipFadeCurves(renderedClip, fadeDraftByKey, clipKey)
+                                    : { fadeInCurve: 'linear', fadeOutCurve: 'linear' };
+                                  const waveformPeaksRaw = clipType === 'audio'
                                     ? getAdaptiveWaveformPeaks(peaksForAdaptive, clipWidth)
                                     : [];
-                                  const waveformPolygonPoints = waveformPeaks.length > 0 ? getWaveformPolygonPoints(waveformPeaks) : '';
+                                  const waveformPeaks = clipType === 'audio' && waveformPeaksRaw.length > 0
+                                    ? applyFadeEnvelopeToPeaks(
+                                      waveformPeaksRaw,
+                                      clipFadeInPx,
+                                      clipFadeOutPx,
+                                      clipWidth,
+                                      clipFadeInCurve,
+                                      clipFadeOutCurve,
+                                    )
+                                    : waveformPeaksRaw;
+                                  const clipGainValue = clipType === 'audio'
+                                    ? getClipGainDisplayValue(renderedClip, gainDraftByKey, clipKey)
+                                    : CLIP_GAIN_DEFAULT;
+                                  const isGainDragging = clipType === 'audio' && Object.prototype.hasOwnProperty.call(gainDraftByKey, clipKey);
+                                  const waveformPolygonPoints = waveformPeaks.length > 0
+                                    ? getWaveformPolygonPoints(waveformPeaks, clipGainValue)
+                                    : '';
+                                  const showFadeInUi = clipFadeInPx >= FADE_VISIBLE_MIN_PX;
+                                  const showFadeOutUi = clipFadeOutPx >= FADE_VISIBLE_MIN_PX;
+                                  const clipFadeInPath = showFadeInUi
+                                    ? buildFadeCurvePathD('in', clipFadeInPx, clipWidth, clipFadeInCurve)
+                                    : '';
+                                  const clipFadeOutPath = showFadeOutUi
+                                    ? buildFadeCurvePathD('out', clipFadeOutPx, clipWidth, clipFadeOutCurve)
+                                    : '';
+                                  const clipFadeInCurveNode = clipType === 'audio'
+                                    ? getFadeCurveNodePosition('in', clipFadeInPx, clipWidth, clipFadeInCurve)
+                                    : null;
+                                  const clipFadeOutCurveNode = clipType === 'audio'
+                                    ? getFadeCurveNodePosition('out', clipFadeOutPx, clipWidth, clipFadeOutCurve)
+                                    : null;
+                                  const clipGainDbLabel = clipType === 'audio'
+                                    ? formatClipGainDb(clipGainValue)
+                                    : '';
                                   const audioMissingFile = clipType === 'audio' && !(renderedClip?.source_path || renderedClip?.sourcePath);
 
                                   return (
                                     <div
                                       key={clip.id}
-                                      className={`timeline-clip ${clipType ? `clip-type-${clipType}` : ''} ${audioMissingFile ? 'clip-missing-file' : ''} ${isClipSelected ? 'clip-selected' : ''} ${isClipMuted ? 'clip-muted' : ''} ${clipAccentRgb ? 'has-custom-color' : ''}`}
+                                      className={`timeline-clip ${clipType ? `clip-type-${clipType}` : ''} ${audioMissingFile ? 'clip-missing-file' : ''} ${isClipSelected ? 'clip-selected' : ''} ${isClipMuted ? 'clip-muted' : ''} ${isGainDragging ? 'clip-gain-dragging' : ''} ${clipAccentRgb ? 'has-custom-color' : ''}`}
                                       style={{
                                         left: `${clipLeft}px`,
                                         width: `${clipWidth}px`,
@@ -10079,6 +11057,78 @@ export default function StuuShell() {
                                                 </svg>
                                               ) : null}
                                             </div>
+                                            {(showFadeInUi || showFadeOutUi) ? (
+                                              <div className="clip-fade-curves" aria-hidden="true">
+                                                <svg viewBox="0 0 100 100" preserveAspectRatio="none" focusable="false">
+                                                  {clipFadeInPath ? (
+                                                    <path className="clip-fade-curve clip-fade-curve-in" d={clipFadeInPath} />
+                                                  ) : null}
+                                                  {clipFadeOutPath ? (
+                                                    <path className="clip-fade-curve clip-fade-curve-out" d={clipFadeOutPath} />
+                                                  ) : null}
+                                                </svg>
+                                              </div>
+                                            ) : null}
+                                            {showFadeInUi ? (
+                                              <div
+                                                className="clip-fade-overlay clip-fade-overlay-in"
+                                                style={{ width: `${clipFadeInPx}px` }}
+                                                aria-hidden="true"
+                                              />
+                                            ) : null}
+                                            {showFadeOutUi ? (
+                                              <div
+                                                className="clip-fade-overlay clip-fade-overlay-out"
+                                                style={{ width: `${clipFadeOutPx}px` }}
+                                                aria-hidden="true"
+                                              />
+                                            ) : null}
+                                            <div
+                                              className="clip-fade-in-handle"
+                                              style={{ left: `${Math.max(0, clipFadeInPx)}px` }}
+                                              title="Fade In length — drag horizontally"
+                                              onPointerDown={(event) => {
+                                                event.stopPropagation();
+                                                beginFadeHandleInteraction('in', 'length', event, track.track_id, renderedClip);
+                                              }}
+                                            />
+                                            <div
+                                              className="clip-fade-out-handle"
+                                              style={{ left: `${Math.max(0, clipWidth - Math.max(0, clipFadeOutPx))}px` }}
+                                              title="Fade Out length — drag horizontally"
+                                              onPointerDown={(event) => {
+                                                event.stopPropagation();
+                                                beginFadeHandleInteraction('out', 'length', event, track.track_id, renderedClip);
+                                              }}
+                                            />
+                                            {clipFadeInCurveNode ? (
+                                              <div
+                                                className="clip-fade-in-curve-handle"
+                                                style={{
+                                                  left: `${clipFadeInCurveNode.leftPercent}%`,
+                                                  top: `${clipFadeInCurveNode.topPercent}%`,
+                                                }}
+                                                title="Fade In curve — drag vertically"
+                                                onPointerDown={(event) => {
+                                                  event.stopPropagation();
+                                                  beginFadeHandleInteraction('in', 'curve', event, track.track_id, renderedClip);
+                                                }}
+                                              />
+                                            ) : null}
+                                            {clipFadeOutCurveNode ? (
+                                              <div
+                                                className="clip-fade-out-curve-handle"
+                                                style={{
+                                                  left: `${clipFadeOutCurveNode.leftPercent}%`,
+                                                  top: `${clipFadeOutCurveNode.topPercent}%`,
+                                                }}
+                                                title="Fade Out curve — drag vertically"
+                                                onPointerDown={(event) => {
+                                                  event.stopPropagation();
+                                                  beginFadeHandleInteraction('out', 'curve', event, track.track_id, renderedClip);
+                                                }}
+                                              />
+                                            ) : null}
                                             <div
                                               className="clip-resize-handle clip-resize-handle-right"
                                               onPointerDown={(event) => {
@@ -10086,6 +11136,20 @@ export default function StuuShell() {
                                               }}
                                             />
                                           </div>
+                                          <div
+                                            className="clip-gain-handle"
+                                            title={`Gain: ${clipGainDbLabel} — drag vertically`}
+                                            aria-label={`Clip gain ${clipGainDbLabel}`}
+                                            onPointerDown={(event) => {
+                                              event.stopPropagation();
+                                              if (editTool === 'select') {
+                                                beginClipGainInteraction(event, track.track_id, renderedClip);
+                                              }
+                                            }}
+                                          />
+                                          <span className="clip-gain-readout" aria-live="polite">
+                                            {clipGainDbLabel}
+                                          </span>
                                         </>
                                       ) : (
                                         <>
@@ -10998,6 +12062,26 @@ export default function StuuShell() {
                       </div>
                     </div>
                   ) : null}
+                  {structureNodeModal ? (
+                    <SongStructureNodeModal
+                      node={structureNodeModal}
+                      onClose={() => setStructureNodeModal(null)}
+                      onSave={handleStructureNodeSave}
+                      onDelete={handleStructureRemoveNodeById}
+                    />
+                  ) : null}
+                  <SongStructureTemplateManager
+                    open={structureTemplateManagerOpen}
+                    templates={structureTemplates}
+                    loadedTemplateId={songStructure.template_id}
+                    onClose={() => setStructureTemplateManagerOpen(false)}
+                    onRefresh={refreshStructureTemplates}
+                    onLoad={handleStructureTemplateLoad}
+                    onSaveLoaded={handleStructureSaveLoadedTemplate}
+                    onSaveAsNew={handleStructureSaveAsNew}
+                    onExport={handleStructureTemplateExport}
+                    onEditMeta={handleStructureTemplateEditMeta}
+                  />
                 </>
               ) : null}
 
@@ -11011,6 +12095,17 @@ export default function StuuShell() {
                       <code className="mix-meter-flat-hint-code">STUU_DEBUG_METERS=1</code> erscheinen Rohdaten im Log.
                     </div>
                   ) : null}
+                  <div className="mix-structure-strip">
+                    <div className="mix-structure-strip-label">Structure</div>
+                    <SongStructureLane
+                      nodes={songStructure.nodes}
+                      barWidth={barWidth}
+                      snapStep={snapStep}
+                      timelineWidth={timelineWidth}
+                      readOnly
+                      playlistLinkTintSegments={structurePlaylistTintSegments}
+                    />
+                  </div>
                   <div className="mix-strip-scroller">
                     <div className="mix-strip-ruler" aria-hidden="true">
                       <span className="mix-strip-ruler-item master">M</span>
