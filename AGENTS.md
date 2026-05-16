@@ -49,6 +49,10 @@ HTTP/WebSocket, IPC, Prozess-Start, AI, Cloud, Import-Vorbereitung, Metadaten, r
 
 ### Legacy (Uebergang)
 
-Bestehende Node-DAW-Mutationen nur bei expliziter Migrations-Task anfassen. Keine neuen Features auf dem JSON-first-Pfad.
+Native-first flags are **opt-in** (`STUU_NATIVE_*=1`). Without flags, legacy JSON + `syncNativeArrangementFromPlaylist` still runs.
+
+`state.project` = reconciled **cache/sidecar** (patterns, view, UI). `projectHistory` = JSON undo for legacy/pattern only — disabled for arrangement when any native DAW flag is on.
+
+Do not mutate tracks/clips/mixer/timeline in JSON when native flags are enabled; `assertLegacyJsonArrangementAllowed` guards the legacy clip path.
 
 **Details:** `docs/architecture-state-authority.md` · **Refactor-Plan:** `docs/refactor-plan-daw-authority.md` · **IPC:** `docs/native-ipc.md` · **Cursor-Regel:** `.cursor/rules/daw-state-authority.mdc`

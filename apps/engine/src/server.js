@@ -39,14 +39,14 @@ const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
 const structureTemplatesDir = path.join(stuuHome, 'structure-templates');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
 const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
-/** Native-first clip ops (default on). Set STUU_NATIVE_CLIP_OPS=0 to force legacy JSON+full-sync path. */
-const nativeClipOpsEnabled = process.env.STUU_NATIVE_CLIP_OPS !== '0';
-/** Native undo/redo for arrangement (default on). Set STUU_NATIVE_EDIT_UNDO=0 for JSON projectHistory. */
-const nativeEditUndoEnabled = process.env.STUU_NATIVE_EDIT_UNDO !== '0';
-/** Native track layout ops (default on). Set STUU_NATIVE_TRACK_OPS=0 for JSON-first tracks. */
-const nativeTrackOpsEnabled = process.env.STUU_NATIVE_TRACK_OPS !== '0';
-/** Save/load: native export + JSON sidecar for patterns/view (default on). */
-const nativeProjectSidecarEnabled = process.env.STUU_NATIVE_PROJECT_SIDECAR !== '0';
+/** Opt-in: audio clip move/resize/delete via native clip.move (then reconcile cache). */
+const nativeClipOpsEnabled = process.env.STUU_NATIVE_CLIP_OPS === '1';
+/** Opt-in: project:undo/redo via Tracktion; JSON projectHistory disabled for arrangement. */
+const nativeEditUndoEnabled = process.env.STUU_NATIVE_EDIT_UNDO === '1';
+/** Opt-in: track create/delete/reorder via native track.* (then reconcile cache). */
+const nativeTrackOpsEnabled = process.env.STUU_NATIVE_TRACK_OPS === '1';
+/** Opt-in: save/load merges project.export with JSON sidecar (patterns/view). */
+const nativeProjectSidecarEnabled = process.env.STUU_NATIVE_PROJECT_SIDECAR === '1';
 /** Legacy clear+reimport sync (opt-in only). Default: targeted reconcile from native snapshots. */
 const nativeLegacySyncEnabled = process.env.STUU_NATIVE_LEGACY_SYNC === '1';
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
@@ -253,6 +253,11 @@ const state = {
   nativeClipSyncSummary: { total: 0, synced: 0, failed: 0, lastErrors: [] },
 };
 
+/**
+ * JSON undo stacks — LEGACY only. Not used for arrangement when STUU_NATIVE_EDIT_UNDO=1.
+ * Safe uses: pattern/view metadata undo when native DAW flags are off.
+ * Must NOT be treated as DAW truth for tracks/clips/mixer/timeline.
+ */
 const projectHistory = {
   undo: [],
   redo: [],
@@ -1010,9 +1015,30 @@ function getStatePayload() {
 }
 
 function emitState(options = {}) {
-  const shouldRecordHistory = options.recordHistory !== false;
-  syncProjectHistory({ record: shouldRecordHistory });
+  const wantsHistory = options.recordHistory !== false;
+  syncProjectHistory({ record: wantsHistory && shouldUseJsonProjectHistory() });
   io.emit('engine:state', getStatePayload());
+}
+
+/** Any native-first DAW domain flag enabled (all opt-in). */
+function isNativeDawModeEnabled() {
+  return nativeClipOpsEnabled || nativeEditUndoEnabled || nativeTrackOpsEnabled;
+}
+
+/** JSON projectHistory is only for legacy / pattern-view when native DAW mode is off. */
+function shouldUseJsonProjectHistory() {
+  return !nativeEditUndoEnabled && !nativeClipOpsEnabled && !nativeTrackOpsEnabled;
+}
+
+/** Forbid legacy JSON-first arrangement mutations when native clip/track ops are enabled. */
+function assertLegacyJsonArrangementAllowed(operation) {
+  if (nativeClipOpsEnabled || nativeTrackOpsEnabled) {
+    throw new Error(
+      `${operation}: legacy JSON arrangement path is disabled. `
+      + 'Set STUU_NATIVE_CLIP_OPS=1 and STUU_NATIVE_TRACK_OPS=1 (native required), '
+      + 'or unset those flags to use legacy sync.',
+    );
+  }
 }
 
 /** True when DAW transport must go through native-engine (default). Set STUU_NATIVE_TRANSPORT=0 for JS stub clock only. */
@@ -1349,7 +1375,7 @@ function trimProjectHistoryStack(stack) {
 }
 
 function syncProjectHistory({ record = true, clearRedo = true, force = false } = {}) {
-  if (nativeEditUndoEnabled) {
+  if (!shouldUseJsonProjectHistory()) {
     return;
   }
   const current = snapshotProjectForHistory();
@@ -1392,12 +1418,17 @@ function resetProjectHistory() {
 }
 
 function getProjectHistoryMeta() {
-  if (nativeEditUndoEnabled && nativeTransportActive) {
-    return { canUndo: true, canRedo: true, nativeUndo: true };
+  if (nativeEditUndoEnabled) {
+    return {
+      canUndo: Boolean(nativeTransportActive),
+      canRedo: Boolean(nativeTransportActive),
+      nativeUndo: true,
+    };
   }
   return {
     canUndo: projectHistory.undo.length > 0,
     canRedo: projectHistory.redo.length > 0,
+    jsonHistory: true,
   };
 }
 
@@ -3549,6 +3580,7 @@ async function moveClip(payload = {}) {
 
   if (destinationTrackIdRaw !== undefined) {
     if (destinationTrackId !== sourceTrackId) {
+      assertLegacyJsonArrangementAllowed('clip:move (cross-track)');
       const destinationTrack = getTrack(destinationTrackId);
       if (!destinationTrack) {
         throw new Error(`track "${destinationTrackId}" not found`);
@@ -3571,6 +3603,7 @@ async function moveClip(payload = {}) {
     throw new Error('Audio clip move requires native clip.move');
   }
 
+  assertLegacyJsonArrangementAllowed('clip:move');
   clip.start = nextStart;
   sortClips(sourceTrack);
   await reconcileNativeClipState({ mergeNativeFirst: false });
@@ -3657,6 +3690,7 @@ async function resizeClip(payload = {}) {
     throw new Error('Audio clip resize requires native clip.resize');
   }
 
+  assertLegacyJsonArrangementAllowed('clip:resize');
   await reconcileNativeClipState({ mergeNativeFirst: false });
   const out = {
     clipId,
@@ -3844,6 +3878,7 @@ async function deleteClip(payload = {}) {
     throw new Error('Audio clip delete requires native clip.delete');
   }
 
+  assertLegacyJsonArrangementAllowed('clip:delete');
   const currentLength = track.clips.length;
   track.clips = track.clips.filter((entry) => String(entry.id).trim() !== clipId);
   if (track.clips.length === currentLength) {
@@ -6195,7 +6230,7 @@ io.on('connection', (socket) => {
       if (!nativeTransportActive) {
         respond(callback, {
           ok: false,
-          error: 'Native engine is not connected.',
+          error: 'Native engine is not connected. Undo requires STUU_NATIVE_EDIT_UNDO=1 and a running native-engine.',
           history: getProjectHistoryMeta(),
         });
         return;

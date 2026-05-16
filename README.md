@@ -112,27 +112,46 @@ npm run check:daw-authority
 
 Fails if new `syncNativeArrangementFromPlaylist` or `projectHistory.*.push` usages appear outside the legacy allowlist in `apps/engine/src/server.js`. See `scripts/check-daw-authority.sh`.
 
-### Native-first DAW (engine, default on)
+### Native-first DAW flags (engine, **opt-in**)
 
-Native-first paths are **on by default**. Opt out per domain with `=0`:
+Enable for QA — default remains legacy JSON + `syncNativeArrangementFromPlaylist` until you pass acceptance below.
 
-- `STUU_NATIVE_CLIP_OPS=0` — legacy JSON clip mutation + full sync
-- `STUU_NATIVE_TRACK_OPS=0` — JSON-first track layout + `safeRestoreNativeNodes…`
-- `STUU_NATIVE_EDIT_UNDO=0` — JSON `projectHistory` undo/redo
-- `STUU_NATIVE_PROJECT_SIDECAR=0` — save/load without `project.export` merge
-- `STUU_NATIVE_LEGACY_SYNC=1` — restore `edit:clear-audio-clips` + full reimport hot path
+```bash
+export STUU_NATIVE_CLIP_OPS=1
+export STUU_NATIVE_TRACK_OPS=1
+export STUU_NATIVE_EDIT_UNDO=1
+export STUU_NATIVE_PROJECT_SIDECAR=1
+# Do NOT set unless debugging old sync:
+# export STUU_NATIVE_LEGACY_SYNC=1
+```
+
+- `STUU_NATIVE_CLIP_OPS=1` — clip move/resize/delete via Tracktion, then playlist cache reconcile
+- `STUU_NATIVE_TRACK_OPS=1` — track layout via native `track.*`
+- `STUU_NATIVE_EDIT_UNDO=1` — undo/redo via Tracktion (`projectHistory` not used for arrangement)
+- `STUU_NATIVE_PROJECT_SIDECAR=1` — save/load merges `project.export` with JSON sidecar (patterns/view)
+- `STUU_NATIVE_LEGACY_SYNC=1` — legacy clear+reimport (off by default)
 - `STUU_NATIVE_TRANSPORT=0` — JS stub transport only (dev)
 
-### QA matrix (manual, with native engine running)
+`state.project` in Node is a **read-only cache / sidecar** (patterns, view, UI metadata) reconciled from native when flags are on — not DAW truth.
 
-| Check | Verify |
-|-------|--------|
-| Transport | Play/stop/seek offline → transport disabled; no fake playhead |
-| Clips (default) | Move/resize/delete audio; playlist matches native after `engine:state` |
-| Tracks (default) | Create/delete/reorder; native track count matches UI |
-| Undo (default) | `project:undo` / `redo` via Tracktion |
-| Save/load (default) | Save `.stu`, reload; audio + patterns |
-| Legacy | With `STUU_NATIVE_LEGACY_SYNC=1`, import still uses full sync |
+### Acceptance checklist (before treating refactor as done)
+
+Run with all four flags above and **without** `STUU_NATIVE_LEGACY_SYNC`.
+
+1. Altes Projekt öffnen  
+2. Audio importieren  
+3. Clip bewegen  
+4. Clip resizen  
+5. Clip löschen  
+6. Undo  
+7. Redo  
+8. Speichern  
+9. Neu öffnen  
+10. Playback prüfen  
+11. Mixer Mute/Solo/Pan/Volume  
+12. Native Engine stoppen → UI offline, keine Fake-Transport/Mixer-Mutationen  
+
+**Akzeptanz nur wenn:** Clip-Ops + Undo mit Flags funktionieren, Legacy-Sync aus bleibt stabil, alte `.stu`-Projekte laden, Native-offline sauber.
 
 ### Starten
 
