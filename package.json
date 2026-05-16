@@ -1,9 +1,17 @@
 {
-  "name": "thestuu-root",
+  "name": "thestuu-monorepo",
+  "version": "0.1.0",
   "private": true,
-  "description": "Weiterleitung: npm run dev muss im Ordner thestuu/thestuu laufen",
+  "description": "TheStuu – start always runs Native-Engine + Engine + Dashboard via CLI",
   "scripts": {
-    "dev": "npm run dev --prefix thestuu",
-    "start": "npm run start --prefix thestuu"
-  }
+    "dev": "node apps/cli/bin/thestuu.js start",
+    "start": "node apps/cli/bin/thestuu.js start",
+    "dev:engine": "npm run start --prefix apps/engine",
+    "dev:dashboard": "npm run dev --prefix apps/dashboard",
+    "check:daw-authority": "bash scripts/check-daw-authority.sh"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
 }
