@@ -49,6 +49,9 @@ const nativeTrackOpsEnabled = process.env.STUU_NATIVE_TRACK_OPS === '1';
 const nativeProjectSidecarEnabled = process.env.STUU_NATIVE_PROJECT_SIDECAR === '1';
 /** Legacy clear+reimport sync (opt-in only). Default: targeted reconcile from native snapshots. */
 const nativeLegacySyncEnabled = process.env.STUU_NATIVE_LEGACY_SYNC === '1';
+/** Clip move/resize/delete and project import can rebuild the graph — allow longer than default IPC timeout. */
+const NATIVE_CLIP_OP_TIMEOUT_MS = 60000;
+const NATIVE_PROJECT_IO_TIMEOUT_MS = 120000;
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
 /** Opt-in only: fake random meter motion when Native has no transport.get_meters. Default off — meters stay at 0 until Native is rebuilt. */
 const meterUiFallbackEnabled = process.env.STUU_METER_UI_FALLBACK === '1';
@@ -431,6 +434,15 @@ function normalizeImportedClipType(value) {
     return normalized;
   }
   return null;
+}
+
+function normalizeClipType(value) {
+  const fromImport = normalizeImportedClipType(value);
+  if (fromImport) {
+    return fromImport;
+  }
+  const raw = value === undefined || value === null ? 'audio' : String(value).trim().toLowerCase();
+  return raw === 'midi' ? 'midi' : 'audio';
 }
 
 function extractWaveformPeaksFromDecoded(audioBuffer, sampleCount = UPLOAD_WAVEFORM_SAMPLES) {
@@ -2257,7 +2269,7 @@ async function restoreNativeVstNodes({ resetEdit = false } = {}) {
     if (nativeTransportActive && nativeProjectSidecarEnabled) {
       try {
         const importPayload = buildNativeImportFromProject(state.project);
-        await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload);
+        await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
         await reconcileFromNative({ clips: true, tracks: true, mixer: true });
       } catch (importError) {
         errors.push(importError instanceof Error ? importError.message : 'project.import failed');
@@ -3487,7 +3499,7 @@ async function reconcileFromNative(options = {}) {
     await reconcilePlaylistAudioClipsFromNative();
   }
   if (mixer && nativeTransportActive) {
-    const exportResp = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT).catch(() => null);
+    const exportResp = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT, {}, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS }).catch(() => null);
     if (exportResp && Array.isArray(exportResp.mixer)) {
       ensureProjectArrays();
       for (const row of exportResp.mixer) {
@@ -3561,13 +3573,16 @@ async function moveClip(payload = {}) {
   if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
     const sourcePath = getPlaylistClipSourcePath(clip);
     if (sourcePath && sourcePath !== LIVE_RECORDING_SOURCE_PATH) {
-      await requestNativeTransport(NATIVE_COMMANDS.CLIP_MOVE, {
+      const clipMovePayload = {
         track_id: sourceTrackId,
-        to_track_id: destinationTrackId !== sourceTrackId ? destinationTrackId : undefined,
         source_path: sourcePath,
         start: nextStart,
         old_start: Number(clip.start) || 0,
-      });
+      };
+      if (destinationTrackId !== sourceTrackId) {
+        clipMovePayload.to_track_id = destinationTrackId;
+      }
+      await requestNativeTransport(NATIVE_COMMANDS.CLIP_MOVE, clipMovePayload, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
       await reconcilePlaylistAudioClipsFromNative();
       emitState();
       return { clipId, trackId: destinationTrackId };
@@ -3665,7 +3680,7 @@ async function resizeClip(payload = {}) {
         start: Number(clip.start) || 0,
         length: clip.length,
         old_start: Number(payload.start) !== undefined ? undefined : Number(clip.start) || 0,
-      });
+      }, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
       await reconcilePlaylistAudioClipsFromNative();
       emitState();
       const out = {
@@ -3861,7 +3876,7 @@ async function deleteClip(payload = {}) {
         track_id: trackId,
         source_path: sourcePath,
         old_start: Number(clip.start) || 0,
-      });
+      }, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
       track.clips = track.clips.filter((entry) => String(entry.id).trim() !== clipId);
       await reconcilePlaylistAudioClipsFromNative();
       emitState();
@@ -4298,6 +4313,7 @@ async function startNativeTransportBridge() {
 
   nativeTransportClient = new NativeTransportClient({
     socketPath: nativeSocketPath,
+    requestTimeoutMs: 10000,
   });
 
   nativeTransportClient.on('connect', () => {
@@ -6172,8 +6188,8 @@ io.on('connection', (socket) => {
       if (nativeProjectSidecarEnabled && nativeTransportActive) {
         try {
           const importPayload = buildNativeImportFromProject(jsonProject);
-          await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload);
-          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT);
+          await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
+          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT, {}, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
           projectForApply = mergeAuthoritativeProjectState(jsonProject, nativeExport);
         } catch (sidecarError) {
           console.warn('[thestuu-engine] project:load native sidecar merge failed:', sidecarError instanceof Error ? sidecarError.message : String(sidecarError));
@@ -6186,6 +6202,7 @@ io.on('connection', (socket) => {
       if (restoreResult.failed > 0 || restoreResult.errors.length > 0) {
         console.warn('[thestuu-engine] project:load native VST restore issues:', restoreResult.errors.join(' | '));
       }
+      emitState({ recordHistory: false });
       callback({
         ok: true,
         filePath,
@@ -6362,7 +6379,7 @@ io.on('connection', (socket) => {
       let projectData = payload.project || state.project;
       if (nativeProjectSidecarEnabled && nativeTransportActive) {
         try {
-          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT);
+          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT, {}, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
           projectData = mergeAuthoritativeProjectState(projectData, nativeExport);
           state.project = projectData;
         } catch (exportError) {

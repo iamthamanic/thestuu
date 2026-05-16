@@ -6653,7 +6653,10 @@ bool moveAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request
     cv.notify_one();
   });
   std::unique_lock<std::mutex> lock(mtx);
-  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!cv.wait_for(lock, std::chrono::seconds(60), [&]() { return done.load(); })) {
+    error = "clip.move timed out waiting for message thread";
+    return false;
+  }
   return ok;
 }
 
@@ -6724,7 +6727,10 @@ bool resizeAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& reque
     cv.notify_one();
   });
   std::unique_lock<std::mutex> lock(mtx);
-  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!cv.wait_for(lock, std::chrono::seconds(60), [&]() { return done.load(); })) {
+    error = "clip.resize timed out waiting for message thread";
+    return false;
+  }
   return ok;
 }
 
@@ -6782,7 +6788,10 @@ bool deleteAudioClipBySourceOnMessageThread(int32_t trackId, const std::string& 
     cv.notify_one();
   });
   std::unique_lock<std::mutex> lock(mtx);
-  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!cv.wait_for(lock, std::chrono::seconds(60), [&]() { return done.load(); })) {
+    error = "clip.delete timed out waiting for message thread";
+    return false;
+  }
   return ok;
 }
 
