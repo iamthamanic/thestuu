@@ -18,7 +18,12 @@ import {
   serializeProject,
   validateProject,
 } from '@thestuu/shared-json';
+import { ENGINE_EVENTS, NATIVE_COMMANDS } from '@thestuu/protocol';
 import { NativeTransportClient } from './native-transport-client.js';
+import {
+  buildNativeImportFromProject,
+  mergeAuthoritativeProjectState,
+} from './authoritative-merge.js';
 import {
   maxPeakFromMeterRows,
   mergeNativeMetersPayload,
@@ -34,6 +39,14 @@ const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
 const structureTemplatesDir = path.join(stuuHome, 'structure-templates');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
 const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
+/** When true, audio clip move/resize/delete use native-engine first, then refresh playlist cache from edit:get-audio-clips. */
+const nativeClipOpsEnabled = process.env.STUU_NATIVE_CLIP_OPS === '1';
+/** When true, project:undo/redo forward to Tracktion undo manager instead of JSON projectHistory. */
+const nativeEditUndoEnabled = process.env.STUU_NATIVE_EDIT_UNDO === '1';
+/** When true, track create/delete/reorder use native-engine first, then reconcile playlist cache. */
+const nativeTrackOpsEnabled = process.env.STUU_NATIVE_TRACK_OPS === '1';
+/** When true, project save/load merges native arrangement export with JSON sidecar (patterns/view). */
+const nativeProjectSidecarEnabled = process.env.STUU_NATIVE_PROJECT_SIDECAR === '1';
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
 /** Opt-in only: fake random meter motion when Native has no transport.get_meters. Default off — meters stay at 0 until Native is rebuilt. */
 const meterUiFallbackEnabled = process.env.STUU_METER_UI_FALLBACK === '1';
@@ -998,6 +1011,46 @@ function emitState(options = {}) {
   const shouldRecordHistory = options.recordHistory !== false;
   syncProjectHistory({ record: shouldRecordHistory });
   io.emit('engine:state', getStatePayload());
+}
+
+/** True when DAW transport must go through native-engine (default). Set STUU_NATIVE_TRANSPORT=0 for JS stub clock only. */
+function isNativeTransportRequired() {
+  return nativeTransportEnabled;
+}
+
+function isDawTransportAvailable() {
+  return !isNativeTransportRequired() || nativeTransportActive;
+}
+
+function emitNativeEngineOffline(reason = 'native-disconnected') {
+  if (liveRecordMergeIntervalId != null) {
+    clearInterval(liveRecordMergeIntervalId);
+    liveRecordMergeIntervalId = null;
+    liveRecordStartBeats = null;
+  }
+  state.playing = false;
+  state.recording = false;
+  transportClock.startedAtMs = null;
+  const beats = Number(state.transport?.positionBeats);
+  if (Number.isFinite(beats)) {
+    transportClock.offsetBeats = beats;
+  }
+  nativeTransportActive = false;
+  nativeTracktionActive = false;
+  io.emit(ENGINE_EVENTS.OFFLINE, {
+    reason,
+    nativeTransport: false,
+    message: 'Native engine offline — DAW transport and audio editing are unavailable.',
+  });
+  emitState();
+  emitTransport(Date.now());
+}
+
+function emitNativeEngineReady() {
+  io.emit(ENGINE_EVENTS.READY, {
+    nativeTransport: Boolean(nativeTracktionActive),
+    nativeSocket: nativeSocketPath,
+  });
 }
 
 function ensureProjectArrays() {
@@ -2156,7 +2209,18 @@ async function restoreNativeVstNodes({ resetEdit = false } = {}) {
   }
 
   if (resetEdit) {
-    await syncNativeArrangementFromPlaylist();
+    if (nativeProjectSidecarEnabled && nativeTransportActive) {
+      try {
+        const importPayload = buildNativeImportFromProject(state.project);
+        await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload);
+        await reconcileFromNative({ clips: true, tracks: true, mixer: true });
+      } catch (importError) {
+        errors.push(importError instanceof Error ? importError.message : 'project.import failed');
+        await syncNativeArrangementFromPlaylist();
+      }
+    } else {
+      await syncNativeArrangementFromPlaylist();
+    }
     const syncErrors = state.nativeClipSyncSummary?.lastErrors ?? [];
     if (syncErrors.length > 0) {
       errors.push(...syncErrors);
@@ -3166,7 +3230,7 @@ async function importClipFile(payload = {}) {
 
   if (nativeTransportActive && !nativeImportError) {
     /** Do not mergeNative before clear — stale native clips duplicate playlist rows after split/right-tail import. */
-    await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+    await reconcileNativeClipState({ mergeNativeFirst: false });
     const syncErrors = state.nativeClipSyncSummary?.lastErrors ?? [];
     if (syncErrors.length > 0) {
       console.warn('[thestuu-engine] native clip sync after import:', syncErrors.join('; '));
@@ -3185,6 +3249,236 @@ async function importClipFile(payload = {}) {
     result.nativeImportError = nativeImportError;
   }
   return result;
+}
+
+function getPlaylistClipSourcePath(clip) {
+  const raw = clip?.source_path ?? clip?.sourcePath;
+  return isNonEmptyString(raw) ? raw.trim() : '';
+}
+
+/**
+ * Refresh audio clip start/length/track in the playlist cache from native edit:get-audio-clips.
+ * Does not clear/reimport the native edit.
+ */
+async function reconcilePlaylistAudioClipsFromNative() {
+  if (!nativeTransportActive) {
+    return;
+  }
+  const response = await requestNativeTransport(NATIVE_COMMANDS.EDIT_GET_AUDIO_CLIPS);
+  const nativeClips = Array.isArray(response?.clips) ? response.clips : [];
+  const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
+  ensureProjectArrays();
+  const nativeByPath = new Map();
+  for (const nc of nativeClips) {
+    const trackId = Number(nc.track_id ?? nc.trackId);
+    const sourcePath = isNonEmptyString(nc.source_path)
+      ? nc.source_path.trim()
+      : (isNonEmptyString(nc.sourcePath) ? nc.sourcePath.trim() : '');
+    if (!Number.isInteger(trackId) || trackId < 1 || !sourcePath) {
+      continue;
+    }
+    const startSeconds = Number(nc.start_seconds ?? nc.startSeconds);
+    const lengthSeconds = Number(nc.length_seconds ?? nc.lengthSeconds);
+    if (!Number.isFinite(startSeconds) || !Number.isFinite(lengthSeconds) || lengthSeconds <= 0) {
+      continue;
+    }
+    const startBars = Number(((startSeconds * bpm) / (60 * BEATS_PER_BAR)).toFixed(6));
+    const lengthBars = Number(((lengthSeconds * bpm) / (60 * BEATS_PER_BAR)).toFixed(6));
+    if (!nativeByPath.has(sourcePath)) {
+      nativeByPath.set(sourcePath, []);
+    }
+    nativeByPath.get(sourcePath).push({ trackId, startBars, lengthBars });
+  }
+
+  const playlist = Array.isArray(state.project.playlist) ? state.project.playlist : [];
+  for (const track of playlist) {
+    if (!Array.isArray(track?.clips)) {
+      continue;
+    }
+    const remaining = [];
+    for (const clip of track.clips) {
+      if (normalizeClipType(clip?.type) !== 'audio') {
+        remaining.push(clip);
+        continue;
+      }
+      const sourcePath = getPlaylistClipSourcePath(clip);
+      if (!sourcePath || sourcePath === LIVE_RECORDING_SOURCE_PATH) {
+        remaining.push(clip);
+        continue;
+      }
+      const candidates = nativeByPath.get(sourcePath);
+      if (!candidates || candidates.length === 0) {
+        continue;
+      }
+      const clipStart = Number(clip.start) || 0;
+      let best = candidates[0];
+      let bestDelta = Math.abs(best.startBars - clipStart);
+      for (const candidate of candidates) {
+        const delta = Math.abs(candidate.startBars - clipStart);
+        if (delta < bestDelta) {
+          best = candidate;
+          bestDelta = delta;
+        }
+      }
+      clip.start = best.startBars;
+      clip.length = best.lengthBars;
+      if (best.trackId !== Number(track.track_id)) {
+        const destTrack = getTrack(best.trackId) || (() => {
+          state.project.playlist.push(createDefaultTrackEntry(best.trackId));
+          sortProjectTrackCollections();
+          return getTrack(best.trackId);
+        })();
+        if (destTrack) {
+          destTrack.clips = Array.isArray(destTrack.clips) ? destTrack.clips : [];
+          destTrack.clips.push(clip);
+          sortClips(destTrack);
+          continue;
+        }
+      }
+      remaining.push(clip);
+    }
+    track.clips = remaining;
+    sortClips(track);
+  }
+  sortProjectTrackCollections();
+}
+
+function buildPlaylistTrackLayoutPayload() {
+  ensureProjectArrays();
+  const playlist = Array.isArray(state.project.playlist) ? state.project.playlist : [];
+  return playlist
+    .map((track) => ({
+      track_id: Number(track.track_id),
+      name: isNonEmptyString(track.name) ? track.name.trim().slice(0, TRACK_NAME_LIMIT) : `Track ${track.track_id}`,
+    }))
+    .filter((row) => Number.isInteger(row.track_id) && row.track_id > 0);
+}
+
+/**
+ * Merge native track.list into playlist/mixer (keeps pattern clips + A-metadata per track_id).
+ */
+async function reconcileTracksFromNative() {
+  if (!nativeTransportActive) {
+    return;
+  }
+  const response = await requestNativeTransport(NATIVE_COMMANDS.TRACK_LIST);
+  const nativeTracks = Array.isArray(response?.tracks) ? response.tracks : [];
+  if (nativeTracks.length === 0) {
+    return;
+  }
+
+  ensureProjectArrays();
+  const oldPlaylist = state.project.playlist;
+  const oldMixer = state.project.mixer;
+  const byId = new Map();
+  for (const track of oldPlaylist) {
+    const trackId = Number(track?.track_id);
+    if (Number.isInteger(trackId) && trackId > 0 && !byId.has(trackId)) {
+      byId.set(trackId, track);
+    }
+  }
+  const mixerById = new Map();
+  for (const entry of oldMixer) {
+    const trackId = Number(entry?.track_id);
+    if (Number.isInteger(trackId) && trackId > 0 && !mixerById.has(trackId)) {
+      mixerById.set(trackId, entry);
+    }
+  }
+
+  const nextPlaylist = [];
+  const nextMixer = [];
+  for (const row of nativeTracks) {
+    const trackId = Number(row.track_id ?? row.trackId ?? row.id);
+    if (!Number.isInteger(trackId) || trackId < 1) {
+      continue;
+    }
+    const name = isNonEmptyString(row.name) ? row.name.trim().slice(0, TRACK_NAME_LIMIT) : `Track ${trackId}`;
+    const previous = byId.get(trackId);
+    if (previous) {
+      nextPlaylist.push({
+        ...previous,
+        track_id: trackId,
+        name,
+        clips: Array.isArray(previous.clips) ? previous.clips : [],
+      });
+    } else {
+      nextPlaylist.push(createDefaultTrackEntry(trackId, name));
+    }
+    const previousMixer = mixerById.get(trackId);
+    nextMixer.push(previousMixer ? { ...previousMixer, track_id: trackId } : createDefaultMixerEntry(trackId));
+  }
+
+  state.project.playlist = nextPlaylist;
+  state.project.mixer = nextMixer;
+  sortProjectTrackCollections();
+}
+
+async function syncNativeTrackLayoutFromPlaylist() {
+  if (!nativeTransportActive) {
+    return;
+  }
+  const tracks = buildPlaylistTrackLayoutPayload();
+  if (tracks.length === 0) {
+    return;
+  }
+  await requestNativeTransport(NATIVE_COMMANDS.TRACK_SYNC_LAYOUT, { tracks });
+  await reconcileTracksFromNative();
+}
+
+/**
+ * Central reconcile entry after native writes (clips/tracks/mixer).
+ */
+async function reconcileFromNative(options = {}) {
+  const { clips = true, tracks = false, mixer = false } = options;
+  if (!nativeTransportActive) {
+    return;
+  }
+  if (tracks) {
+    await reconcileTracksFromNative();
+  }
+  if (clips && (nativeClipOpsEnabled || nativeTrackOpsEnabled)) {
+    await reconcilePlaylistAudioClipsFromNative();
+  }
+  if (mixer && nativeTransportActive) {
+    const exportResp = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT).catch(() => null);
+    if (exportResp && Array.isArray(exportResp.mixer)) {
+      ensureProjectArrays();
+      for (const row of exportResp.mixer) {
+        const trackId = Number(row.track_id ?? row.trackId);
+        if (!Number.isInteger(trackId) || trackId < 1) {
+          continue;
+        }
+        const entry = getOrCreateMixerEntry(trackId);
+        if (Number.isFinite(Number(row.volume))) {
+          entry.volume = Math.max(0, Math.min(1.2, Number(row.volume)));
+        }
+        if (Number.isFinite(Number(row.pan))) {
+          entry.pan = Math.max(-1, Math.min(1, Number(row.pan)));
+        }
+        entry.mute = normalizeBool(row.mute);
+        entry.solo = normalizeBool(row.solo);
+        entry.record_armed = normalizeBool(row.record_armed ?? row.recordArmed);
+      }
+      if (Number.isFinite(Number(exportResp.master_volume ?? exportResp.masterVolume))) {
+        ensureProjectArrays();
+        state.project.master_mix.volume = Math.max(0, Math.min(1.2, Number(exportResp.master_volume ?? exportResp.masterVolume)));
+      }
+      if (Number.isFinite(Number(exportResp.master_pan ?? exportResp.masterPan))) {
+        ensureProjectArrays();
+        state.project.master_mix.pan = Math.max(-1, Math.min(1, Number(exportResp.master_pan ?? exportResp.masterPan)));
+      }
+    }
+  }
+}
+
+/** Clip reconcile: targeted native refresh or legacy full sync. */
+async function reconcileNativeClipState(options = {}) {
+  const mergeNativeFirst = options.mergeNativeFirst !== false;
+  if (nativeClipOpsEnabled && nativeTransportActive) {
+    await reconcilePlaylistAudioClipsFromNative();
+    return;
+  }
+  await syncNativeArrangementFromPlaylist({ mergeNativeFirst });
 }
 
 async function moveClip(payload = {}) {
@@ -3207,8 +3501,27 @@ async function moveClip(payload = {}) {
   const nextStart = Math.max(0, roundToGrid(nextStartRaw));
 
   const destinationTrackIdRaw = payload.toTrackId ?? payload.to_track_id;
+  const destinationTrackId = destinationTrackIdRaw !== undefined
+    ? assertPositiveInteger(destinationTrackIdRaw, 'toTrackId')
+    : sourceTrackId;
+
+  if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
+    const sourcePath = getPlaylistClipSourcePath(clip);
+    if (sourcePath && sourcePath !== LIVE_RECORDING_SOURCE_PATH) {
+      await requestNativeTransport(NATIVE_COMMANDS.CLIP_MOVE, {
+        track_id: sourceTrackId,
+        to_track_id: destinationTrackId !== sourceTrackId ? destinationTrackId : undefined,
+        source_path: sourcePath,
+        start: nextStart,
+        old_start: Number(clip.start) || 0,
+      });
+      await reconcilePlaylistAudioClipsFromNative();
+      emitState();
+      return { clipId, trackId: destinationTrackId };
+    }
+  }
+
   if (destinationTrackIdRaw !== undefined) {
-    const destinationTrackId = assertPositiveInteger(destinationTrackIdRaw, 'toTrackId');
     if (destinationTrackId !== sourceTrackId) {
       const destinationTrack = getTrack(destinationTrackId);
       if (!destinationTrack) {
@@ -3222,14 +3535,14 @@ async function moveClip(payload = {}) {
         start: nextStart,
       });
       sortClips(destinationTrack);
-      await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+      await reconcileNativeClipState({ mergeNativeFirst: false });
       return { clipId, trackId: destinationTrackId };
     }
   }
 
   clip.start = nextStart;
   sortClips(sourceTrack);
-  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+  await reconcileNativeClipState({ mergeNativeFirst: false });
   return { clipId, trackId: sourceTrackId };
 }
 
@@ -3279,7 +3592,32 @@ async function resizeClip(payload = {}) {
     clip.length = Math.min(clip.length, Math.max(q, roundToGrid(maxLenBars, q)));
   }
 
-  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+  if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
+    const sourcePath = getPlaylistClipSourcePath(clip);
+    if (sourcePath && sourcePath !== LIVE_RECORDING_SOURCE_PATH) {
+      await requestNativeTransport(NATIVE_COMMANDS.CLIP_RESIZE, {
+        track_id: trackId,
+        source_path: sourcePath,
+        start: Number(clip.start) || 0,
+        length: clip.length,
+        old_start: Number(payload.start) !== undefined ? undefined : Number(clip.start) || 0,
+      });
+      await reconcilePlaylistAudioClipsFromNative();
+      emitState();
+      const out = {
+        clipId,
+        trackId,
+        start: Number(clip.start) || 0,
+        length: Number(clip.length) || q,
+      };
+      if (clipHasExplicitTrimStart(clip)) {
+        out.trim_start_seconds = Math.max(0, Number(clip.trim_start_seconds) || 0);
+      }
+      return out;
+    }
+  }
+
+  await reconcileNativeClipState({ mergeNativeFirst: false });
   const out = {
     clipId,
     trackId,
@@ -3378,7 +3716,7 @@ async function setClipFade(payload = {}) {
   if (payload.fade_out_curve !== undefined || payload.fadeOutCurve !== undefined) {
     clip.fade_out_curve = normalizeFadeCurve(payload.fade_out_curve ?? payload.fadeOutCurve);
   }
-  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+  await reconcileNativeClipState({ mergeNativeFirst: false });
   return { clipId, trackId };
 }
 
@@ -3437,12 +3775,32 @@ async function deleteClip(payload = {}) {
     throw new Error(`track "${trackId}" not found`);
   }
 
+  const { clip } = findClip(track, clipId);
+  if (!clip) {
+    throw new Error(`clip "${clipId}" not found on track ${trackId}`);
+  }
+
+  if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
+    const sourcePath = getPlaylistClipSourcePath(clip);
+    if (sourcePath && sourcePath !== LIVE_RECORDING_SOURCE_PATH) {
+      await requestNativeTransport(NATIVE_COMMANDS.CLIP_DELETE, {
+        track_id: trackId,
+        source_path: sourcePath,
+        old_start: Number(clip.start) || 0,
+      });
+      track.clips = track.clips.filter((entry) => String(entry.id).trim() !== clipId);
+      await reconcilePlaylistAudioClipsFromNative();
+      emitState();
+      return { clipId, trackId };
+    }
+  }
+
   const currentLength = track.clips.length;
-  track.clips = track.clips.filter((clip) => String(clip.id).trim() !== clipId);
+  track.clips = track.clips.filter((entry) => String(entry.id).trim() !== clipId);
   if (track.clips.length === currentLength) {
     throw new Error(`clip "${clipId}" not found on track ${trackId}`);
   }
-  await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+  await reconcileNativeClipState({ mergeNativeFirst: false });
   return { clipId, trackId };
 }
 
@@ -3675,7 +4033,7 @@ async function setSongStructureNodes(payload = {}) {
   });
 
   if (clipsMoved) {
-    await syncNativeArrangementFromPlaylist({ mergeNativeFirst: false });
+    await reconcileNativeClipState({ mergeNativeFirst: false });
   }
 
   return { song_structure: state.project.song_structure };
@@ -3892,14 +4250,10 @@ async function startNativeTransportBridge() {
   });
 
   nativeTransportClient.on('disconnect', () => {
-    nativeTransportActive = false;
-    nativeTracktionActive = false;
     cachedNativePluginsByUid.clear();
     latestEqAnalyzerFrame = null;
-    transportClock.offsetBeats = Number(state.transport?.positionBeats) || 0;
-    transportClock.startedAtMs = state.playing ? Date.now() : null;
-    console.warn('[thestuu-engine] native transport disconnected; using JS fallback transport clock.');
-    emitState();
+    console.warn('[thestuu-engine] native transport disconnected; DAW transport disabled until reconnect.');
+    emitNativeEngineOffline('native-disconnected');
     io.emit('engine:analyzer', { available: false, reason: 'native-disconnected' });
   });
 
@@ -3924,6 +4278,7 @@ async function startNativeTransportBridge() {
         nativeRetryTimer = null;
       }
       console.log(`[thestuu-engine] native transport connected (${nativeSocketPath})`);
+      emitNativeEngineReady();
     } catch (err) {
       // keep retrying in background
     } finally {
@@ -3936,12 +4291,14 @@ async function startNativeTransportBridge() {
       clearInterval(nativeRetryTimer);
       nativeRetryTimer = null;
     }
+    emitNativeEngineReady();
   });
 
   try {
     await nativeTransportClient.start();
     nativeTransportActive = true;
     console.log(`[thestuu-engine] native transport connected (${nativeSocketPath})`);
+    emitNativeEngineReady();
   } catch (error) {
     nativeTransportActive = false;
     console.warn('[thestuu-engine] Native-Engine nicht verbunden (alle Features benötigen sie). Retry im Hintergrund:', error instanceof Error ? error.message : error);
@@ -3952,6 +4309,7 @@ async function startNativeTransportBridge() {
         await nativeTransportClient.start();
         nativeTransportActive = true;
         console.log(`[thestuu-engine] native transport connected after spawn (${nativeSocketPath})`);
+        emitNativeEngineReady();
       } catch (retryError) {
         console.warn('[thestuu-engine] native transport still not ready after spawn:', retryError instanceof Error ? retryError.message : retryError);
       }
@@ -4322,7 +4680,7 @@ io.on('connection', (socket) => {
       + `stateBpmBefore=${stateBpmBefore.toFixed(3)} usingBpm=${desiredBpm.toFixed(3)}`,
     );
 
-    const startPlayhead = () => {
+    const startJsStubPlayhead = () => {
       state.playing = true;
       transportClock.startedAtMs = Date.now();
       transportClock.offsetBeats = state.transport?.positionBeats ?? 0;
@@ -4330,57 +4688,69 @@ io.on('connection', (socket) => {
       emitState();
       emitTransport(Date.now());
     };
+
+    if (isNativeTransportRequired() && !nativeTransportActive) {
+      respond(callback, {
+        ok: false,
+        error: 'Native engine is not connected. Start native-engine (npm run start).',
+        nativeTransport: false,
+      });
+      return;
+    }
+
     try {
       if (nativeTransportActive) {
         const anyRecordArmed = (Array.isArray(state.project.mixer) && state.project.mixer.some((e) => normalizeBool(e?.record_armed)));
         const armedTracks = anyRecordArmed ? (state.project.mixer || []).filter((e) => normalizeBool(e?.record_armed)).map((e) => e?.track_id).filter((id) => Number.isInteger(id)) : [];
         const modeRaw = typeof payload?.mode === 'string' ? payload.mode.trim().toLowerCase() : '';
         const explicitRecord = normalizeBool(payload?.record ?? payload?.recording) || modeRaw === 'record';
-        const nativeCmd = explicitRecord ? 'transport.record' : 'transport.play';
+        const nativeCmd = explicitRecord ? NATIVE_COMMANDS.TRANSPORT_RECORD : NATIVE_COMMANDS.TRANSPORT_PLAY;
         if (anyRecordArmed && !explicitRecord) {
           console.log('[thestuu-engine] transport:play → armed tracks present, but using normal playback:', armedTracks.join(','));
         }
         console.log('[thestuu-engine] transport:play → sending to native:', nativeCmd, explicitRecord && anyRecordArmed ? `(record armed tracks: ${armedTracks.join(',')})` : '');
         tickCountAfterPlay = 1;
-        // Native backends can reset tempo on play; enforce desired BPM around the play command.
-        await requestNativeTransport('transport.set_bpm', { bpm: desiredBpm }).catch((error) => {
+        await requestNativeTransport(NATIVE_COMMANDS.TRANSPORT_SET_BPM, { bpm: desiredBpm }).catch((error) => {
           console.warn('[thestuu-engine] transport:play pre-set_bpm failed:', error instanceof Error ? error.message : String(error));
         });
-        await requestNativeTransport(nativeCmd, {}, { fromPlayResponse: true });
-        await requestNativeTransport('transport.set_bpm', { bpm: desiredBpm }).catch((error) => {
+        await requestNativeTransport(nativeCmd, {}, { fromPlayResponse: true, acceptBpm: true });
+        await requestNativeTransport(NATIVE_COMMANDS.TRANSPORT_SET_BPM, { bpm: desiredBpm }).catch((error) => {
           console.warn('[thestuu-engine] transport:play post-set_bpm failed:', error instanceof Error ? error.message : String(error));
         });
         state.project.bpm = desiredBpm;
-        state.playing = true;
-        console.log('[thestuu-engine] transport:play → native OK, playing:', state.playing);
         if (state.transport && typeof state.transport.positionBeats === 'number') {
           transportClock.offsetBeats = state.transport.positionBeats;
-          transportClock.startedAtMs = Date.now();
-        } else {
-          transportClock.startedAtMs = Date.now();
-          transportClock.offsetBeats = state.transport?.positionBeats ?? 0;
+          transportClock.startedAtMs = state.playing ? Date.now() : null;
         }
-        // state.transport already set from native response; emit without overwriting
         emitState();
         emitTransport(Date.now());
         respond(callback, { ok: true, playing: state.playing });
       } else if (!state.playing) {
-        startPlayhead();
-        respond(callback, { ok: true, playing: state.playing });
+        startJsStubPlayhead();
+        respond(callback, { ok: true, playing: state.playing, stubTransport: true });
       } else {
         emitState();
         emitTransport(Date.now());
-        respond(callback, { ok: true, playing: state.playing });
+        respond(callback, { ok: true, playing: state.playing, stubTransport: true });
       }
     } catch (error) {
-      console.warn('[thestuu-engine] transport:play failed, starting UI playhead anyway:', error instanceof Error ? error.message : error);
-      if (!state.playing) startPlayhead();
-      else { emitState(); emitTransport(Date.now()); }
-      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'transport:play failed' });
+      console.warn('[thestuu-engine] transport:play failed:', error instanceof Error ? error.message : error);
+      state.playing = false;
+      emitState();
+      emitTransport(Date.now());
+      respond(callback, {
+        ok: false,
+        error: error instanceof Error ? error.message : 'transport:play failed',
+        nativeTransport: nativeTransportActive,
+      });
     }
   });
 
   socket.on('transport:pause', async (_payload = {}, callback = () => {}) => {
+    if (isNativeTransportRequired() && !nativeTransportActive) {
+      respond(callback, { ok: false, error: 'Native engine is not connected.' });
+      return;
+    }
     try {
       if (nativeTransportActive) {
         if (liveRecordMergeIntervalId != null) {
@@ -4409,6 +4779,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('transport:stop', async (_payload = {}, callback = () => {}) => {
+    if (isNativeTransportRequired() && !nativeTransportActive) {
+      respond(callback, { ok: false, error: 'Native engine is not connected.' });
+      return;
+    }
     try {
       if (nativeTransportActive) {
         if (liveRecordMergeIntervalId != null) {
@@ -4436,6 +4810,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('transport:set-bpm', async (payload = {}, callback = () => {}) => {
+    if (isNativeTransportRequired() && !nativeTransportActive) {
+      respond(callback, { ok: false, error: 'Native engine is not connected.' });
+      return;
+    }
     try {
       const nextBpm = normalizeTransportBpm(payload.bpm);
       if (nativeTransportActive) {
@@ -4459,6 +4837,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('transport:seek', async (payload = {}, callback = () => {}) => {
+    if (isNativeTransportRequired() && !nativeTransportActive) {
+      respond(callback, { ok: false, error: 'Native engine is not connected.' });
+      return;
+    }
     try {
       const positionBarsRaw = Number(payload.positionBars ?? payload.position_bars);
       const positionBeatsRaw = Number(payload.positionBeats ?? payload.position_beats);
@@ -4492,7 +4874,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('track:set-volume', (payload = {}, callback = () => {}) => {
+  socket.on('track:set-volume', async (payload = {}, callback = () => {}) => {
     const trackId = resolveMixerSocketTrackId(payload);
     const volume = Number(payload.volume);
     if (!Number.isInteger(trackId) || trackId < 0 || !Number.isFinite(volume)) {
@@ -4501,27 +4883,31 @@ io.on('connection', (socket) => {
     }
 
     const clampedVolume = Math.max(0, Math.min(1.2, volume));
-    if (trackId === 0) {
-      ensureProjectArrays();
-      state.project.master_mix.volume = clampedVolume;
-      requestNativeTransport('track:set-volume', { track_id: 0, volume: clampedVolume })
-        .catch((err) => console.warn('[thestuu-engine] master track:set-volume native:', err instanceof Error ? err.message : String(err)));
+    try {
+      if (trackId === 0) {
+        ensureProjectArrays();
+        if (nativeTransportActive) {
+          await requestNativeTransport(NATIVE_COMMANDS.TRACK_SET_VOLUME, { track_id: 0, volume: clampedVolume });
+        }
+        state.project.master_mix.volume = clampedVolume;
+        emitState();
+        respond(callback, { ok: true, trackId: 0, volume: clampedVolume });
+        return;
+      }
+
+      if (nativeTransportActive) {
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_SET_VOLUME, { track_id: trackId, volume: clampedVolume });
+      }
+      const existing = getOrCreateMixerEntry(trackId);
+      existing.volume = clampedVolume;
       emitState();
-      respond(callback, { ok: true, trackId: 0, volume: clampedVolume });
-      return;
+      respond(callback, { ok: true, trackId, volume: clampedVolume });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:set-volume failed' });
     }
-
-    const existing = getOrCreateMixerEntry(trackId);
-    existing.volume = clampedVolume;
-
-    requestNativeTransport('track:set-volume', { track_id: trackId, volume: clampedVolume })
-      .catch((err) => console.warn('[thestuu-engine] track:set-volume native:', err instanceof Error ? err.message : String(err)));
-
-    emitState();
-    respond(callback, { ok: true, trackId, volume: clampedVolume });
   });
 
-  socket.on('track:set-pan', (payload = {}, callback = () => {}) => {
+  socket.on('track:set-pan', async (payload = {}, callback = () => {}) => {
     const trackId = resolveMixerSocketTrackId(payload);
     const pan = Number(payload.pan);
     if (!Number.isInteger(trackId) || trackId < 0 || !Number.isFinite(pan)) {
@@ -4530,27 +4916,29 @@ io.on('connection', (socket) => {
     }
 
     const clampedPan = Math.max(-1, Math.min(1, pan));
-    if (trackId === 0) {
+    try {
+      if (isNativeTransportRequired() && !nativeTransportActive) {
+        respond(callback, { ok: false, error: 'Native engine is not connected.' });
+        return;
+      }
+      if (nativeTransportActive) {
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_SET_PAN, { track_id: trackId, pan: clampedPan });
+      }
       ensureProjectArrays();
-      state.project.master_mix.pan = clampedPan;
-      requestNativeTransport('track:set-pan', { track_id: 0, pan: clampedPan })
-        .catch((err) => console.warn('[thestuu-engine] master track:set-pan native:', err instanceof Error ? err.message : String(err)));
+      if (trackId === 0) {
+        state.project.master_mix.pan = clampedPan;
+      } else {
+        const entry = getOrCreateMixerEntry(trackId);
+        entry.pan = clampedPan;
+      }
       emitState();
-      respond(callback, { ok: true, trackId: 0, pan: clampedPan });
-      return;
+      respond(callback, { ok: true, trackId, pan: clampedPan });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:set-pan failed' });
     }
-
-    const entry = getOrCreateMixerEntry(trackId);
-    entry.pan = clampedPan;
-
-    requestNativeTransport('track:set-pan', { track_id: trackId, pan: clampedPan })
-      .catch((err) => console.warn('[thestuu-engine] track:set-pan native:', err instanceof Error ? err.message : String(err)));
-
-    emitState();
-    respond(callback, { ok: true, trackId, pan: clampedPan });
   });
 
-  socket.on('track:set-mute', (payload = {}, callback = () => {}) => {
+  socket.on('track:set-mute', async (payload = {}, callback = () => {}) => {
     const trackId = resolveMixerSocketTrackId(payload);
     if (!Number.isInteger(trackId) || trackId < 0) {
       respond(callback, { ok: false, error: 'trackId must be an integer >= 0' });
@@ -4558,25 +4946,31 @@ io.on('connection', (socket) => {
     }
 
     const muted = normalizeBool(payload.mute);
-    if (trackId === 0) {
-      ensureProjectArrays();
-      state.project.master_mix.mute = muted;
+    try {
+      if (isNativeTransportRequired() && !nativeTransportActive) {
+        respond(callback, { ok: false, error: 'Native engine is not connected.' });
+        return;
+      }
+      if (trackId === 0) {
+        ensureProjectArrays();
+        state.project.master_mix.mute = muted;
+        emitState();
+        respond(callback, { ok: true, trackId: 0, mute: muted });
+        return;
+      }
+      if (nativeTransportActive) {
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_SET_MUTE, { track_id: trackId, mute: muted });
+      }
+      const entry = getOrCreateMixerEntry(trackId);
+      entry.mute = muted;
       emitState();
-      respond(callback, { ok: true, trackId: 0, mute: muted });
-      return;
+      respond(callback, { ok: true, trackId, mute: muted });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:set-mute failed' });
     }
-
-    const entry = getOrCreateMixerEntry(trackId);
-    entry.mute = muted;
-
-    requestNativeTransport('track:set-mute', { track_id: trackId, mute: muted })
-      .catch((err) => console.warn('[thestuu-engine] track:set-mute native:', err instanceof Error ? err.message : String(err)));
-
-    emitState();
-    respond(callback, { ok: true, trackId, mute: muted });
   });
 
-  socket.on('track:set-solo', (payload = {}, callback = () => {}) => {
+  socket.on('track:set-solo', async (payload = {}, callback = () => {}) => {
     const trackId = resolveMixerSocketTrackId(payload);
     if (!Number.isInteger(trackId) || trackId < 0) {
       respond(callback, { ok: false, error: 'trackId must be an integer >= 0' });
@@ -4588,17 +4982,24 @@ io.on('connection', (socket) => {
     }
 
     const solo = normalizeBool(payload.solo);
-    const entry = getOrCreateMixerEntry(trackId);
-    entry.solo = solo;
-
-    requestNativeTransport('track:set-solo', { track_id: trackId, solo })
-      .catch((err) => console.warn('[thestuu-engine] track:set-solo native:', err instanceof Error ? err.message : String(err)));
-
-    emitState();
-    respond(callback, { ok: true, trackId, solo });
+    try {
+      if (isNativeTransportRequired() && !nativeTransportActive) {
+        respond(callback, { ok: false, error: 'Native engine is not connected.' });
+        return;
+      }
+      if (nativeTransportActive) {
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_SET_SOLO, { track_id: trackId, solo });
+      }
+      const entry = getOrCreateMixerEntry(trackId);
+      entry.solo = solo;
+      emitState();
+      respond(callback, { ok: true, trackId, solo });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:set-solo failed' });
+    }
   });
 
-  socket.on('track:set-record-arm', (payload = {}, callback = () => {}) => {
+  socket.on('track:set-record-arm', async (payload = {}, callback = () => {}) => {
     const trackId = resolveMixerSocketTrackId(payload);
     if (!Number.isInteger(trackId) || trackId < 0) {
       respond(callback, { ok: false, error: 'trackId must be an integer >= 0' });
@@ -4610,32 +5011,65 @@ io.on('connection', (socket) => {
     }
 
     const recordArmed = normalizeBool(payload.recordArmed ?? payload.record_armed);
-    const entry = getOrCreateMixerEntry(trackId);
-    entry.record_armed = recordArmed;
     const deviceId = typeof payload.record_input_device_id === 'string' ? payload.record_input_device_id : (payload.recordInputDeviceId ?? null);
     const deviceName = typeof payload.record_input_device_name === 'string' ? payload.record_input_device_name : (payload.recordInputDeviceName ?? null);
-    if (deviceId !== undefined) entry.record_input_device_id = deviceId || null;
-    if (deviceName !== undefined) entry.record_input_device_name = deviceName || null;
-
-    requestNativeTransport('track:set-record-arm', { track_id: trackId, record_armed: recordArmed })
-      .catch((err) => console.warn('[thestuu-engine] track:set-record-arm native:', err instanceof Error ? err.message : String(err)));
-
-    emitState();
-    respond(callback, { ok: true, trackId, record_armed: recordArmed });
+    try {
+      if (isNativeTransportRequired() && !nativeTransportActive) {
+        respond(callback, { ok: false, error: 'Native engine is not connected.' });
+        return;
+      }
+      if (nativeTransportActive) {
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_SET_RECORD_ARM, { track_id: trackId, record_armed: recordArmed });
+      }
+      const entry = getOrCreateMixerEntry(trackId);
+      entry.record_armed = recordArmed;
+      if (deviceId !== undefined) entry.record_input_device_id = deviceId || null;
+      if (deviceName !== undefined) entry.record_input_device_name = deviceName || null;
+      emitState();
+      respond(callback, { ok: true, trackId, record_armed: recordArmed });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:set-record-arm failed' });
+    }
   });
 
   socket.on('track:create', async (payload = {}, callback = () => {}) => {
     try {
       ensureProjectArrays();
+      const name = typeof payload.name === 'string' && payload.name.trim()
+        ? payload.name.trim().slice(0, TRACK_NAME_LIMIT)
+        : null;
+      const chainCollapsed = normalizeBool(payload.chainCollapsed ?? payload.chain_collapsed, true);
+
+      if (nativeTrackOpsEnabled && nativeTransportActive) {
+        const nativeResp = await requestNativeTransport(NATIVE_COMMANDS.TRACK_CREATE, {
+          name: name || undefined,
+        });
+        const nextId = Number(nativeResp?.track_id ?? nativeResp?.trackId);
+        if (!Number.isInteger(nextId) || nextId < 1) {
+          throw new Error('native track.create did not return track_id');
+        }
+        const existing = getTrack(nextId);
+        if (!existing) {
+          const nextTrack = createDefaultTrackEntry(nextId, name || `Track ${nextId}`);
+          nextTrack.chain_collapsed = chainCollapsed;
+          state.project.playlist.push(nextTrack);
+          state.project.mixer.push(createDefaultMixerEntry(nextId));
+          sortProjectTrackCollections();
+        }
+        await reconcileTracksFromNative();
+        emitState();
+        respond(callback, { ok: true, trackId: nextId, nativeTrackOps: true });
+        return;
+      }
+
       const existingIds = new Set(state.project.playlist.map((track) => Number(track.track_id)).filter((trackId) => Number.isInteger(trackId) && trackId > 0));
       const requestedTrackId = Number(payload.trackId ?? payload.track_id);
       const nextId = Number.isInteger(requestedTrackId) && requestedTrackId > 0 && !existingIds.has(requestedTrackId)
         ? requestedTrackId
         : (state.project.playlist || []).reduce((maxId, track) => Math.max(maxId, Number(track.track_id) || 0), 0) + 1;
-      const name = typeof payload.name === 'string' && payload.name.trim() ? payload.name.trim() : `Track ${nextId}`;
-      const chainCollapsed = normalizeBool(payload.chainCollapsed ?? payload.chain_collapsed, true);
+      const resolvedName = name || `Track ${nextId}`;
 
-      const nextTrack = createDefaultTrackEntry(nextId, name);
+      const nextTrack = createDefaultTrackEntry(nextId, resolvedName);
       nextTrack.chain_collapsed = chainCollapsed;
       state.project.playlist.push(nextTrack);
       const mixerEntry = state.project.mixer.find((entry) => entry.track_id === nextId);
@@ -4644,7 +5078,6 @@ io.on('connection', (socket) => {
       }
       sortProjectTrackCollections();
 
-      // Native-Edit muss mindestens so viele Tracks haben wie die Playlist, damit alle Spuren abspielen (wie bei track:insert/delete).
       const nativeSync = await safeRestoreNativeNodesAfterTrackLayoutChange();
 
       emitState();
@@ -4673,20 +5106,24 @@ io.on('connection', (socket) => {
       sortProjectTrackCollections();
       normalizeAllVstPluginIndexes();
 
-      const nativeSync = await safeRestoreNativeNodesAfterTrackLayoutChange();
+      if (nativeTrackOpsEnabled && nativeTransportActive) {
+        await syncNativeTrackLayoutFromPlaylist();
+      } else {
+        await safeRestoreNativeNodesAfterTrackLayoutChange();
+      }
 
       emitState();
       respond(callback, {
         ok: true,
         trackId: insertAtTrackId,
-        nativeSync,
+        nativeTrackOps: nativeTrackOpsEnabled && nativeTransportActive,
       });
     } catch (error) {
       respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:insert failed' });
     }
   });
 
-  socket.on('track:reorder', (payload = {}, callback = () => {}) => {
+  socket.on('track:reorder', async (payload = {}, callback = () => {}) => {
     try {
       const trackId = Number(payload.trackId ?? payload.track_id);
       const toIndexRaw = payload.toIndex ?? payload.to_index ?? payload.index;
@@ -4696,6 +5133,11 @@ io.on('connection', (socket) => {
         return;
       }
       reorderTrackInPlaylist(trackId, toIndex);
+      if (nativeTrackOpsEnabled && nativeTransportActive) {
+        const trackIds = buildPlaylistTrackLayoutPayload().map((row) => row.track_id);
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_REORDER, { track_ids: trackIds });
+        await reconcileTracksFromNative();
+      }
       emitState();
       respond(callback, { ok: true, trackId, toIndex });
     } catch (error) {
@@ -4718,14 +5160,20 @@ io.on('connection', (socket) => {
         return;
       }
 
-      reindexTracksRemovingIds([trackIdRaw]);
-      const nativeSync = await safeRestoreNativeNodesAfterTrackLayoutChange();
+      if (nativeTrackOpsEnabled && nativeTransportActive) {
+        await requestNativeTransport(NATIVE_COMMANDS.TRACK_DELETE, { track_id: trackIdRaw });
+        reindexTracksRemovingIds([trackIdRaw]);
+        await syncNativeTrackLayoutFromPlaylist();
+      } else {
+        reindexTracksRemovingIds([trackIdRaw]);
+        await safeRestoreNativeNodesAfterTrackLayoutChange();
+      }
 
       emitState();
       respond(callback, {
         ok: true,
         deletedTrackIds: [trackIdRaw],
-        nativeSync,
+        nativeTrackOps: nativeTrackOpsEnabled && nativeTransportActive,
       });
     } catch (error) {
       respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:delete failed' });
@@ -4752,14 +5200,22 @@ io.on('connection', (socket) => {
         return;
       }
 
-      reindexTracksRemovingIds(existingRequestedTrackIds);
-      const nativeSync = await safeRestoreNativeNodesAfterTrackLayoutChange();
+      if (nativeTrackOpsEnabled && nativeTransportActive) {
+        for (const trackId of existingRequestedTrackIds.sort((a, b) => b - a)) {
+          await requestNativeTransport(NATIVE_COMMANDS.TRACK_DELETE, { track_id: trackId });
+        }
+        reindexTracksRemovingIds(existingRequestedTrackIds);
+        await syncNativeTrackLayoutFromPlaylist();
+      } else {
+        reindexTracksRemovingIds(existingRequestedTrackIds);
+        await safeRestoreNativeNodesAfterTrackLayoutChange();
+      }
 
       emitState();
       respond(callback, {
         ok: true,
         deletedTrackIds: existingRequestedTrackIds,
-        nativeSync,
+        nativeTrackOps: nativeTrackOpsEnabled && nativeTransportActive,
       });
     } catch (error) {
       respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:bulk-delete failed' });
@@ -4821,14 +5277,18 @@ io.on('connection', (socket) => {
 
       sortProjectTrackCollections();
       normalizeAllVstPluginIndexes();
-      const nativeSync = await safeRestoreNativeNodesAfterTrackLayoutChange();
+      if (nativeTrackOpsEnabled && nativeTransportActive) {
+        await syncNativeTrackLayoutFromPlaylist();
+      } else {
+        await safeRestoreNativeNodesAfterTrackLayoutChange();
+      }
 
       emitState();
       respond(callback, {
         ok: true,
         sourceTrackId,
         trackId: duplicateTrackId,
-        nativeSync,
+        nativeTrackOps: nativeTrackOpsEnabled && nativeTransportActive,
       });
     } catch (error) {
       respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:duplicate failed' });
@@ -5623,7 +6083,19 @@ io.on('connection', (socket) => {
       const filePath = path.join(projectsDir, filename.endsWith('.stu') ? filename : `${filename}.stu`);
       const raw = await fs.readFile(filePath, 'utf8');
       state.selectedProjectFile = filePath;
-      const restoreResult = await applyProjectState(parseProject(raw), {
+      const jsonProject = parseProject(raw);
+      let projectForApply = jsonProject;
+      if (nativeProjectSidecarEnabled && nativeTransportActive) {
+        try {
+          const importPayload = buildNativeImportFromProject(jsonProject);
+          await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload);
+          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT);
+          projectForApply = mergeAuthoritativeProjectState(jsonProject, nativeExport);
+        } catch (sidecarError) {
+          console.warn('[thestuu-engine] project:load native sidecar merge failed:', sidecarError instanceof Error ? sidecarError.message : String(sidecarError));
+        }
+      }
+      const restoreResult = await applyProjectState(projectForApply, {
         resetEdit: true,
         resetHistory: true,
       });
@@ -5670,6 +6142,22 @@ io.on('connection', (socket) => {
   });
 
   socket.on('project:undo', async (_payload = {}, callback = () => {}) => {
+    if (nativeEditUndoEnabled && nativeTransportActive) {
+      try {
+        await requestNativeTransport(NATIVE_COMMANDS.EDIT_UNDO);
+        await reconcileFromNative({ clips: true, tracks: nativeTrackOpsEnabled, mixer: true });
+        emitState();
+        respond(callback, { ok: true, history: getProjectHistoryMeta(), nativeUndo: true });
+      } catch (error) {
+        respond(callback, {
+          ok: false,
+          error: error instanceof Error ? error.message : 'edit.undo failed',
+          history: getProjectHistoryMeta(),
+        });
+      }
+      return;
+    }
+
     const targetEntry = projectHistory.undo[projectHistory.undo.length - 1];
     if (!targetEntry) {
       respond(callback, { ok: false, error: 'nothing to undo', history: getProjectHistoryMeta() });
@@ -5711,6 +6199,22 @@ io.on('connection', (socket) => {
   });
 
   socket.on('project:redo', async (_payload = {}, callback = () => {}) => {
+    if (nativeEditUndoEnabled && nativeTransportActive) {
+      try {
+        await requestNativeTransport(NATIVE_COMMANDS.EDIT_REDO);
+        await reconcileFromNative({ clips: true, tracks: nativeTrackOpsEnabled, mixer: true });
+        emitState();
+        respond(callback, { ok: true, history: getProjectHistoryMeta(), nativeRedo: true });
+      } catch (error) {
+        respond(callback, {
+          ok: false,
+          error: error instanceof Error ? error.message : 'edit.redo failed',
+          history: getProjectHistoryMeta(),
+        });
+      }
+      return;
+    }
+
     const targetEntry = projectHistory.redo[projectHistory.redo.length - 1];
     if (!targetEntry) {
       respond(callback, { ok: false, error: 'nothing to redo', history: getProjectHistoryMeta() });
@@ -5755,7 +6259,16 @@ io.on('connection', (socket) => {
     try {
       const filename = typeof payload.filename === 'string' && payload.filename.trim() ? payload.filename.trim() : path.basename(state.selectedProjectFile);
       const filePath = path.join(projectsDir, filename.endsWith('.stu') ? filename : `${filename}.stu`);
-      const projectData = payload.project || state.project;
+      let projectData = payload.project || state.project;
+      if (nativeProjectSidecarEnabled && nativeTransportActive) {
+        try {
+          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT);
+          projectData = mergeAuthoritativeProjectState(projectData, nativeExport);
+          state.project = projectData;
+        } catch (exportError) {
+          console.warn('[thestuu-engine] project:save native export merge failed:', exportError instanceof Error ? exportError.message : String(exportError));
+        }
+      }
 
       const normalizedProject = await saveProject(filePath, projectData);
       state.selectedProjectFile = filePath;

@@ -11,6 +11,7 @@
     "typecheck": "echo 'engine: no typecheck step yet'"
   },
   "dependencies": {
+    "@thestuu/protocol": "file:../../packages/protocol",
     "@thestuu/shared-json": "file:../../packages/shared-json",
     "audio-decode": "^2.2.3",
     "msgpackr": "^1.11.5",

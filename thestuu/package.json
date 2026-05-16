@@ -7,7 +7,8 @@
     "dev": "node apps/cli/bin/thestuu.js start",
     "start": "node apps/cli/bin/thestuu.js start",
     "dev:engine": "npm run start --prefix apps/engine",
-    "dev:dashboard": "npm run dev --prefix apps/dashboard"
+    "dev:dashboard": "npm run dev --prefix apps/dashboard",
+    "check:daw-authority": "bash scripts/check-daw-authority.sh"
   },
   "workspaces": [
     "apps/*",

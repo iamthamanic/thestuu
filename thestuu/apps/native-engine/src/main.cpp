@@ -390,6 +390,13 @@ const MsgValue::Object* asObject(const MsgValue* value) {
   return std::get_if<MsgValue::Object>(&value->value);
 }
 
+const MsgValue::Array* asArray(const MsgValue* value) {
+  if (value == nullptr) {
+    return nullptr;
+  }
+  return std::get_if<MsgValue::Array>(&value->value);
+}
+
 std::string asString(const MsgValue* value, const std::string& fallback = "") {
   if (value == nullptr) {
     return fallback;
@@ -1227,6 +1234,394 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
         {"parameter", toMsgValue(parameter)},
       }
     );
+  }
+
+  if (cmd == "clip.move" || cmd == "clip:move") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "clip.move requires payload");
+    }
+    thestuu::native::ClipEditBySourceRequest request;
+    request.trackId = static_cast<int32_t>(
+      asInt(getField(*payload, "track_id"), asInt(getField(*payload, "trackId"), 1)));
+    request.toTrackId = static_cast<int32_t>(
+      asInt(getField(*payload, "to_track_id"), asInt(getField(*payload, "toTrackId"), 0)));
+    request.sourcePath = asString(getField(*payload, "source_path"));
+    if (request.sourcePath.empty()) {
+      request.sourcePath = asString(getField(*payload, "sourcePath"));
+    }
+    request.startBars = asDouble(getField(*payload, "start"), asDouble(getField(*payload, "startBars"), 0.0));
+    request.oldStartBars = asDouble(getField(*payload, "old_start"), asDouble(getField(*payload, "oldStartBars"), -1.0));
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::moveAudioClipBySourceOnMessageThread(request, error)
+      : thestuu::native::moveAudioClipBySource(request, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(request.toTrackId > 0 ? request.toTrackId : request.trackId)},
+      {"startBars", MsgValue(request.startBars)},
+    });
+  }
+
+  if (cmd == "clip.resize" || cmd == "clip:resize") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "clip.resize requires payload");
+    }
+    thestuu::native::ClipEditBySourceRequest request;
+    request.trackId = static_cast<int32_t>(
+      asInt(getField(*payload, "track_id"), asInt(getField(*payload, "trackId"), 1)));
+    request.sourcePath = asString(getField(*payload, "source_path"));
+    if (request.sourcePath.empty()) {
+      request.sourcePath = asString(getField(*payload, "sourcePath"));
+    }
+    request.startBars = asDouble(getField(*payload, "start"), asDouble(getField(*payload, "startBars"), -1.0));
+    request.lengthBars = asDouble(getField(*payload, "length"), asDouble(getField(*payload, "lengthBars"), -1.0));
+    request.oldStartBars = asDouble(getField(*payload, "old_start"), asDouble(getField(*payload, "oldStartBars"), -1.0));
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::resizeAudioClipBySourceOnMessageThread(request, error)
+      : thestuu::native::resizeAudioClipBySource(request, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(request.trackId)},
+      {"startBars", MsgValue(request.startBars >= 0.0 ? request.startBars : 0.0)},
+      {"lengthBars", MsgValue(request.lengthBars)},
+    });
+  }
+
+  if (cmd == "clip.delete" || cmd == "clip:delete") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "clip.delete requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(getField(*payload, "track_id"), asInt(getField(*payload, "trackId"), 1)));
+    std::string sourcePath = asString(getField(*payload, "source_path"));
+    if (sourcePath.empty()) {
+      sourcePath = asString(getField(*payload, "sourcePath"));
+    }
+    const double oldStartBars = asDouble(getField(*payload, "old_start"), asDouble(getField(*payload, "oldStartBars"), -1.0));
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::deleteAudioClipBySourceOnMessageThread(trackId, sourcePath, oldStartBars, error)
+      : thestuu::native::deleteAudioClipBySource(trackId, sourcePath, oldStartBars, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"trackId", MsgValue(trackId)}, {"deleted", MsgValue(true)}});
+  }
+
+  if (cmd == "edit.undo" || cmd == "edit:undo") {
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::editUndoOnMessageThread(error)
+      : thestuu::native::editUndo(error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}});
+  }
+
+  if (cmd == "edit.redo" || cmd == "edit:redo") {
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::editRedoOnMessageThread(error)
+      : thestuu::native::editRedo(error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}});
+  }
+
+  if (cmd == "track.list" || cmd == "track:list") {
+    std::vector<thestuu::native::TrackLayoutEntry> tracks;
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::listAudioTracksOnMessageThread(tracks, error)
+      : thestuu::native::listAudioTracks(tracks, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    MsgValue::Array arr;
+    arr.reserve(tracks.size());
+    for (const auto& t : tracks) {
+      arr.push_back(MsgValue(MsgValue::Object{
+        {"track_id", MsgValue(static_cast<int64_t>(t.id))},
+        {"id", MsgValue(static_cast<int64_t>(t.id))},
+        {"name", MsgValue(t.name)},
+        {"index", MsgValue(static_cast<int64_t>(t.index))},
+      }));
+    }
+    return makeResponse(id, MsgValue::Object{{"tracks", MsgValue(std::move(arr))}});
+  }
+
+  if (cmd == "track.create" || cmd == "track:create") {
+    const std::string name = payload ? asString(getField(*payload, "name")) : std::string();
+    int32_t trackId = 0;
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::createAudioTrackOnMessageThread(name, trackId, error)
+      : thestuu::native::createAudioTrack(name, trackId, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"track_id", MsgValue(static_cast<int64_t>(trackId))},
+      {"trackId", MsgValue(static_cast<int64_t>(trackId))},
+    });
+  }
+
+  if (cmd == "track.delete" || cmd == "track:delete") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track.delete requires payload");
+    }
+    const int32_t trackId = static_cast<int32_t>(
+      asInt(getField(*payload, "track_id"), asInt(getField(*payload, "trackId"), 0)));
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::deleteAudioTrackOnMessageThread(trackId, error)
+      : thestuu::native::deleteAudioTrack(trackId, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"track_id", MsgValue(static_cast<int64_t>(trackId))}, {"deleted", MsgValue(true)}});
+  }
+
+  if (cmd == "track.reorder" || cmd == "track:reorder") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track.reorder requires payload");
+    }
+    std::vector<int32_t> orderedIds;
+    const auto* idsField = getField(*payload, "track_ids");
+    if (idsField == nullptr) {
+      idsField = getField(*payload, "trackIds");
+    }
+    const MsgValue::Array* idsArray = asArray(idsField);
+    if (idsArray != nullptr) {
+      for (const auto& item : *idsArray) {
+        orderedIds.push_back(static_cast<int32_t>(asInt(&item, 0)));
+      }
+    }
+    if (orderedIds.empty()) {
+      return makeErrorResponse(id, "track_ids array is required");
+    }
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::reorderAudioTracksOnMessageThread(orderedIds, error)
+      : thestuu::native::reorderAudioTracks(orderedIds, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}});
+  }
+
+  if (cmd == "track.sync-layout" || cmd == "track:sync-layout") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track.sync-layout requires payload");
+    }
+    std::vector<thestuu::native::TrackLayoutEntry> desired;
+    const MsgValue::Array* syncTracks = asArray(getField(*payload, "tracks"));
+    if (syncTracks != nullptr) {
+      int index = 0;
+      for (const auto& item : *syncTracks) {
+        const MsgValue::Object* obj = asObject(&item);
+        if (obj == nullptr) {
+          continue;
+        }
+        thestuu::native::TrackLayoutEntry entry;
+        entry.index = index++;
+        const auto idIt = obj->find("track_id");
+        const auto idIt2 = obj->find("trackId");
+        if (idIt != obj->end()) {
+          entry.id = static_cast<int32_t>(asInt(&idIt->second, entry.index + 1));
+        } else if (idIt2 != obj->end()) {
+          entry.id = static_cast<int32_t>(asInt(&idIt2->second, entry.index + 1));
+        } else {
+          entry.id = entry.index + 1;
+        }
+        const auto nameIt = obj->find("name");
+        if (nameIt != obj->end()) {
+          entry.name = asString(&nameIt->second);
+        }
+        desired.push_back(std::move(entry));
+      }
+    }
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::syncAudioTrackLayoutOnMessageThread(desired, error)
+      : thestuu::native::syncAudioTrackLayout(desired, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}, {"trackCount", MsgValue(static_cast<int64_t>(desired.size()))}});
+  }
+
+  if (cmd == "project.export" || cmd == "project:export") {
+    thestuu::native::ProjectExportSnapshot snapshot;
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::exportProjectSnapshotOnMessageThread(snapshot, error)
+      : thestuu::native::exportProjectSnapshot(snapshot, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    MsgValue::Array trackArr;
+    for (const auto& t : snapshot.tracks) {
+      trackArr.push_back(MsgValue(MsgValue::Object{
+        {"track_id", MsgValue(static_cast<int64_t>(t.id))},
+        {"name", MsgValue(t.name)},
+        {"index", MsgValue(static_cast<int64_t>(t.index))},
+      }));
+    }
+    MsgValue::Array clipArr;
+    for (const auto& c : snapshot.clips) {
+      clipArr.push_back(MsgValue(MsgValue::Object{
+        {"track_id", MsgValue(static_cast<int64_t>(c.trackId))},
+        {"source_path", MsgValue(c.sourcePath)},
+        {"start_seconds", MsgValue(c.startSeconds)},
+        {"length_seconds", MsgValue(c.lengthSeconds)},
+        {"name", MsgValue(c.name)},
+      }));
+    }
+    MsgValue::Array mixerArr;
+    for (const auto& m : snapshot.mixer) {
+      mixerArr.push_back(MsgValue(MsgValue::Object{
+        {"track_id", MsgValue(static_cast<int64_t>(m.trackId))},
+        {"volume", MsgValue(m.volume)},
+        {"pan", MsgValue(m.pan)},
+        {"mute", MsgValue(m.mute)},
+        {"solo", MsgValue(m.solo)},
+        {"record_armed", MsgValue(m.recordArmed)},
+      }));
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"tracks", MsgValue(std::move(trackArr))},
+      {"clips", MsgValue(std::move(clipArr))},
+      {"mixer", MsgValue(std::move(mixerArr))},
+      {"master_volume", MsgValue(snapshot.masterVolume)},
+      {"master_pan", MsgValue(snapshot.masterPan)},
+    });
+  }
+
+  if (cmd == "project.import" || cmd == "project:import") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "project.import requires payload");
+    }
+    thestuu::native::ProjectExportSnapshot snapshot;
+    const MsgValue::Array* importTracks = asArray(getField(*payload, "tracks"));
+    if (importTracks != nullptr) {
+      int index = 0;
+      for (const auto& item : *importTracks) {
+        const MsgValue::Object* obj = asObject(&item);
+        if (obj == nullptr) {
+          continue;
+        }
+        thestuu::native::TrackLayoutEntry entry;
+        entry.index = index++;
+        const auto trackIdIt = obj->find("track_id");
+        const auto trackIdIt2 = obj->find("trackId");
+        if (trackIdIt != obj->end()) {
+          entry.id = static_cast<int32_t>(asInt(&trackIdIt->second, entry.index + 1));
+        } else if (trackIdIt2 != obj->end()) {
+          entry.id = static_cast<int32_t>(asInt(&trackIdIt2->second, entry.index + 1));
+        } else {
+          entry.id = entry.index + 1;
+        }
+        const auto nameIt = obj->find("name");
+        if (nameIt != obj->end()) {
+          entry.name = asString(&nameIt->second);
+        }
+        snapshot.tracks.push_back(std::move(entry));
+      }
+    }
+    const MsgValue::Array* importClips = asArray(getField(*payload, "clips"));
+    if (importClips != nullptr) {
+      for (const auto& item : *importClips) {
+        const MsgValue::Object* obj = asObject(&item);
+        if (obj == nullptr) {
+          continue;
+        }
+        thestuu::native::EditClipInfo clip;
+        const auto trackIdIt = obj->find("track_id");
+        const auto trackIdIt2 = obj->find("trackId");
+        if (trackIdIt != obj->end()) {
+          clip.trackId = static_cast<int32_t>(asInt(&trackIdIt->second, 1));
+        } else if (trackIdIt2 != obj->end()) {
+          clip.trackId = static_cast<int32_t>(asInt(&trackIdIt2->second, 1));
+        }
+        const auto pathIt = obj->find("source_path");
+        const auto pathIt2 = obj->find("sourcePath");
+        if (pathIt != obj->end()) {
+          clip.sourcePath = asString(&pathIt->second);
+        } else if (pathIt2 != obj->end()) {
+          clip.sourcePath = asString(&pathIt2->second);
+        }
+        const auto startIt = obj->find("start_seconds");
+        const auto startIt2 = obj->find("startSeconds");
+        if (startIt != obj->end()) {
+          clip.startSeconds = asDouble(&startIt->second, 0.0);
+        } else if (startIt2 != obj->end()) {
+          clip.startSeconds = asDouble(&startIt2->second, 0.0);
+        }
+        const auto lenIt = obj->find("length_seconds");
+        const auto lenIt2 = obj->find("lengthSeconds");
+        if (lenIt != obj->end()) {
+          clip.lengthSeconds = asDouble(&lenIt->second, 0.0);
+        } else if (lenIt2 != obj->end()) {
+          clip.lengthSeconds = asDouble(&lenIt2->second, 0.0);
+        }
+        const auto nameIt = obj->find("name");
+        if (nameIt != obj->end()) {
+          clip.name = asString(&nameIt->second);
+        }
+        snapshot.clips.push_back(std::move(clip));
+      }
+    }
+    const MsgValue::Array* importMixer = asArray(getField(*payload, "mixer"));
+    if (importMixer != nullptr) {
+      for (const auto& item : *importMixer) {
+        const MsgValue::Object* obj = asObject(&item);
+        if (obj == nullptr) {
+          continue;
+        }
+        thestuu::native::TrackMixerState mixer;
+        const auto trackIdIt = obj->find("track_id");
+        const auto trackIdIt2 = obj->find("trackId");
+        if (trackIdIt != obj->end()) {
+          mixer.trackId = static_cast<int32_t>(asInt(&trackIdIt->second, 0));
+        } else if (trackIdIt2 != obj->end()) {
+          mixer.trackId = static_cast<int32_t>(asInt(&trackIdIt2->second, 0));
+        }
+        const auto volIt = obj->find("volume");
+        mixer.volume = volIt != obj->end() ? asDouble(&volIt->second, 0.85) : 0.85;
+        const auto panIt = obj->find("pan");
+        mixer.pan = panIt != obj->end() ? asDouble(&panIt->second, 0.0) : 0.0;
+        const auto muteIt = obj->find("mute");
+        mixer.mute = muteIt != obj->end() ? asBool(&muteIt->second, false) : false;
+        const auto soloIt = obj->find("solo");
+        mixer.solo = soloIt != obj->end() ? asBool(&soloIt->second, false) : false;
+        const auto armIt = obj->find("record_armed");
+        const auto armIt2 = obj->find("recordArmed");
+        if (armIt != obj->end()) {
+          mixer.recordArmed = asBool(&armIt->second, false);
+        } else if (armIt2 != obj->end()) {
+          mixer.recordArmed = asBool(&armIt2->second, false);
+        }
+        snapshot.mixer.push_back(std::move(mixer));
+      }
+    }
+    snapshot.masterVolume = asDouble(getField(*payload, "master_volume"), asDouble(getField(*payload, "masterVolume"), 1.0));
+    snapshot.masterPan = asDouble(getField(*payload, "master_pan"), asDouble(getField(*payload, "masterPan"), 0.0));
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::importProjectSnapshotOnMessageThread(snapshot, error)
+      : thestuu::native::importProjectSnapshot(snapshot, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{{"ok", MsgValue(true)}});
   }
 
   if (cmd == "clip:import-file") {

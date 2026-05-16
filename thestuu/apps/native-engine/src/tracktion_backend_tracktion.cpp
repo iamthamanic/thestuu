@@ -6504,6 +6504,755 @@ bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::strin
   return ok;
 }
 
+namespace {
+
+std::string normalizeSourcePathKey(const std::string& path) {
+  if (path.empty()) {
+    return {};
+  }
+  return juce::File(path).getFullPathName().toStdString();
+}
+
+double clipStartBarsFromPosition(const tracktion::engine::ClipPosition& pos) {
+  const double beatsPerBar = estimateBeatsPerBar();
+  if (beatsPerBar <= 0.0) {
+    return 0.0;
+  }
+  double bpm = 128.0;
+  if (gState && gState->edit) {
+    bpm = gState->edit->tempoSequence.getBpmAt(tracktion::core::TimePosition::fromSeconds(0.0));
+  }
+  const double startSec = pos.time.getStart().inSeconds();
+  return (startSec * bpm) / (60.0 * beatsPerBar);
+}
+
+tracktion::engine::WaveAudioClip* findWaveClipOnTrack(
+  tracktion::engine::AudioTrack& track,
+  const std::string& sourcePath,
+  double oldStartBars) {
+  const std::string key = normalizeSourcePathKey(sourcePath);
+  if (key.empty()) {
+    return nullptr;
+  }
+  const auto& clips = track.getClips();
+  for (int j = 0; j < clips.size(); ++j) {
+    auto* clip = clips.getUnchecked(j);
+    if (clip == nullptr) {
+      continue;
+    }
+    auto* wave = dynamic_cast<tracktion::engine::WaveAudioClip*>(clip);
+    if (wave == nullptr) {
+      continue;
+    }
+    const std::string clipKey = normalizeSourcePathKey(wave->getOriginalFile().getFullPathName().toStdString());
+    if (clipKey != key) {
+      continue;
+    }
+    if (oldStartBars >= 0.0) {
+      const double sb = clipStartBarsFromPosition(wave->getPosition());
+      if (std::fabs(sb - oldStartBars) > 0.08) {
+        continue;
+      }
+    }
+    return wave;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+bool moveAudioClipBySource(const ClipEditBySourceRequest& request, std::string& error) {
+  error.clear();
+  if (!isInitialised(error) || !requireEdit(error)) {
+    return false;
+  }
+  if (request.sourcePath.empty()) {
+    error = "source_path is required";
+    return false;
+  }
+  try {
+    auto* sourceTrack = getAudioTrackByIndex(request.trackId);
+    if (sourceTrack == nullptr) {
+      error = "track_id out of range";
+      return false;
+    }
+    auto* wave = findWaveClipOnTrack(*sourceTrack, request.sourcePath, request.oldStartBars);
+    if (wave == nullptr) {
+      error = "clip not found on source track";
+      return false;
+    }
+    const int32_t destTrackId = request.toTrackId > 0 ? request.toTrackId : request.trackId;
+    const double beatsPerBar = estimateBeatsPerBar();
+    const double startBeats = std::max(0.0, request.startBars) * beatsPerBar;
+    const auto pos = wave->getPosition();
+    const auto length = pos.time.getLength();
+    const auto offset = pos.offset;
+
+    if (destTrackId == request.trackId) {
+      const auto startTime = convertBeatsToTime(startBeats);
+      const tracktion::engine::ClipPosition newPos{
+        tracktion::core::TimeRange(startTime, startTime + length),
+        offset,
+      };
+      wave->setPosition(newPos);
+      return true;
+    }
+
+    auto* destTrack = getAudioTrackByIndex(destTrackId);
+    if (destTrack == nullptr) {
+      error = "to_track_id out of range";
+      return false;
+    }
+    juce::File file = wave->getOriginalFile();
+    if (!file.existsAsFile()) {
+      error = "clip source file missing";
+      return false;
+    }
+    wave->removeFromParent();
+    const auto startTime = convertBeatsToTime(startBeats);
+    const tracktion::engine::ClipPosition newPos{
+      tracktion::core::TimeRange(startTime, startTime + length),
+      offset,
+    };
+    auto inserted = destTrack->insertWaveClip(file.getFileNameWithoutExtension(), file, newPos, false);
+    if (inserted == nullptr) {
+      error = "failed to insert clip on destination track";
+      return false;
+    }
+    inserted->setUsesProxy(false);
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error during clip.move";
+    return false;
+  }
+}
+
+bool moveAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request, std::string& error) {
+  error.clear();
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return moveAudioClipBySource(request, error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = moveAudioClipBySource(request, error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  return ok;
+}
+
+bool resizeAudioClipBySource(const ClipEditBySourceRequest& request, std::string& error) {
+  error.clear();
+  if (!isInitialised(error) || !requireEdit(error)) {
+    return false;
+  }
+  if (request.sourcePath.empty() || request.lengthBars <= 0.0) {
+    error = "source_path and positive length are required";
+    return false;
+  }
+  try {
+    auto* track = getAudioTrackByIndex(request.trackId);
+    if (track == nullptr) {
+      error = "track_id out of range";
+      return false;
+    }
+    auto* wave = findWaveClipOnTrack(*track, request.sourcePath, request.oldStartBars);
+    if (wave == nullptr) {
+      error = "clip not found";
+      return false;
+    }
+    const double beatsPerBar = estimateBeatsPerBar();
+    double startBeats = clipStartBarsFromPosition(wave->getPosition()) * beatsPerBar;
+    if (request.startBars >= 0.0) {
+      startBeats = std::max(0.0, request.startBars) * beatsPerBar;
+    }
+    const double lengthBeats = request.lengthBars * beatsPerBar;
+    const auto startTime = convertBeatsToTime(startBeats);
+    const auto endTime = convertBeatsToTime(startBeats + lengthBeats);
+    const auto pos = wave->getPosition();
+    const tracktion::engine::ClipPosition newPos{
+      tracktion::core::TimeRange(startTime, endTime),
+      pos.offset,
+    };
+    wave->setPosition(newPos);
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error during clip.resize";
+    return false;
+  }
+}
+
+bool resizeAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request, std::string& error) {
+  error.clear();
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return resizeAudioClipBySource(request, error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = resizeAudioClipBySource(request, error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  return ok;
+}
+
+bool deleteAudioClipBySource(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error) {
+  error.clear();
+  if (!isInitialised(error) || !requireEdit(error)) {
+    return false;
+  }
+  if (sourcePath.empty()) {
+    error = "source_path is required";
+    return false;
+  }
+  try {
+    auto* track = getAudioTrackByIndex(trackId);
+    if (track == nullptr) {
+      error = "track_id out of range";
+      return false;
+    }
+    auto* wave = findWaveClipOnTrack(*track, sourcePath, oldStartBars);
+    if (wave == nullptr) {
+      error = "clip not found";
+      return false;
+    }
+    wave->removeFromParent();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error during clip.delete";
+    return false;
+  }
+}
+
+bool deleteAudioClipBySourceOnMessageThread(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error) {
+  error.clear();
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return deleteAudioClipBySource(trackId, sourcePath, oldStartBars, error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = deleteAudioClipBySource(trackId, sourcePath, oldStartBars, error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  return ok;
+}
+
+bool editUndo(std::string& error) {
+  error.clear();
+  if (!gState || !gState->edit) {
+    error = "backend not initialised";
+    return false;
+  }
+  try {
+    auto& um = gState->edit->getUndoManager();
+    if (!um.canUndo()) {
+      error = "nothing to undo";
+      return false;
+    }
+    um.undo();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error during edit.undo";
+    return false;
+  }
+}
+
+bool editUndoOnMessageThread(std::string& error) {
+  error.clear();
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return editUndo(error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = editUndo(error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  return ok;
+}
+
+bool editRedo(std::string& error) {
+  error.clear();
+  if (!gState || !gState->edit) {
+    error = "backend not initialised";
+    return false;
+  }
+  try {
+    auto& um = gState->edit->getUndoManager();
+    if (!um.canRedo()) {
+      error = "nothing to redo";
+      return false;
+    }
+    um.redo();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error during edit.redo";
+    return false;
+  }
+}
+
+bool editRedoOnMessageThread(std::string& error) {
+  error.clear();
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return editRedo(error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = editRedo(error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  return ok;
+}
+
+namespace {
+
+bool requireEditPtr(std::string& error) {
+  if (!gState || !gState->edit) {
+    error = "backend not initialised";
+    return false;
+  }
+  return true;
+}
+
+template <typename Fn>
+bool runOnMessageThread(Fn&& fn, std::string& error) {
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return fn();
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = fn();
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(30), [&]() { return done.load(); });
+  return ok;
+}
+
+void readTrackMixerState(tracktion::engine::AudioTrack& track, int32_t trackId, TrackMixerState& out) {
+  out.trackId = trackId;
+  out.mute = track.isMuted(false);
+  out.solo = track.isSolo(false);
+  out.recordArmed = false;
+  if (auto* volPan = track.getVolumePlugin()) {
+    out.volume = static_cast<double>(volPan->getSliderPos());
+    out.pan = static_cast<double>(volPan->getPan());
+  }
+}
+
+}  // namespace
+
+bool listAudioTracks(std::vector<TrackLayoutEntry>& out, std::string& error) {
+  out.clear();
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  try {
+    const auto tracks = tracktion::engine::getAudioTracks(*gState->edit);
+    out.reserve(tracks.size());
+    for (int i = 0; i < tracks.size(); ++i) {
+      auto* track = tracks[static_cast<size_t>(i)];
+      if (track == nullptr) {
+        continue;
+      }
+      TrackLayoutEntry entry;
+      entry.id = static_cast<int32_t>(i) + 1;
+      entry.index = i;
+      entry.name = track->getName().toStdString();
+      if (entry.name.empty()) {
+        entry.name = "Track " + std::to_string(entry.id);
+      }
+      out.push_back(std::move(entry));
+    }
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in listAudioTracks";
+    return false;
+  }
+}
+
+bool listAudioTracksOnMessageThread(std::vector<TrackLayoutEntry>& out, std::string& error) {
+  return runOnMessageThread([&]() { return listAudioTracks(out, error); }, error);
+}
+
+bool createAudioTrack(const std::string& name, int32_t& outTrackId, std::string& error) {
+  outTrackId = 0;
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  try {
+    auto& edit = *gState->edit;
+    const int before = tracktion::engine::getAudioTracks(edit).size();
+    edit.ensureNumberOfAudioTracks(before + 1);
+    const auto tracks = tracktion::engine::getAudioTracks(edit);
+    auto* track = tracks.getLast();
+    if (track == nullptr) {
+      error = "failed to create audio track";
+      return false;
+    }
+    const juce::String trackName = name.empty()
+      ? ("Track " + juce::String(before + 1))
+      : juce::String(name);
+    track->setName(trackName);
+    const juce::String defaultOutId = edit.engine.getDeviceManager().getDefaultWaveOutDeviceID();
+    if (defaultOutId.isNotEmpty()) {
+      track->getOutput().setOutputToDeviceID(defaultOutId);
+    } else {
+      track->getOutput().setOutputToDefaultDevice(false);
+    }
+    outTrackId = static_cast<int32_t>(tracks.size());
+    transportRebuildGraphOnly();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in createAudioTrack";
+    return false;
+  }
+}
+
+bool createAudioTrackOnMessageThread(const std::string& name, int32_t& outTrackId, std::string& error) {
+  return runOnMessageThread([&]() { return createAudioTrack(name, outTrackId, error); }, error);
+}
+
+bool deleteAudioTrack(int32_t trackId, std::string& error) {
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  if (trackId < 1) {
+    error = "track_id must be >= 1";
+    return false;
+  }
+  try {
+    auto* track = getAudioTrackByIndex(trackId);
+    if (track == nullptr) {
+      error = "track not found";
+      return false;
+    }
+    auto& clips = track->getClips();
+    for (int j = clips.size(); --j >= 0;) {
+      if (auto* clip = clips.getUnchecked(j)) {
+        clip->removeFromParent();
+      }
+    }
+    if (auto* asTrack = dynamic_cast<tracktion::engine::Track*>(track)) {
+      gState->edit->deleteTrack(asTrack);
+    } else {
+      error = "failed to delete audio track";
+      return false;
+    }
+    clearTrackMeterSlots();
+    transportRebuildGraphOnly();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in deleteAudioTrack";
+    return false;
+  }
+}
+
+bool deleteAudioTrackOnMessageThread(int32_t trackId, std::string& error) {
+  return runOnMessageThread([&]() { return deleteAudioTrack(trackId, error); }, error);
+}
+
+bool reorderAudioTracks(const std::vector<int32_t>& orderedTrackIds, std::string& error) {
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  if (orderedTrackIds.empty()) {
+    return true;
+  }
+  try {
+    const auto audioTracks = tracktion::engine::getAudioTracks(*gState->edit);
+    const int trackCount = static_cast<int>(audioTracks.size());
+    if (static_cast<int>(orderedTrackIds.size()) != trackCount) {
+      error = "track_ids length must match audio track count";
+      return false;
+    }
+    for (size_t destIndex = 0; destIndex < orderedTrackIds.size(); ++destIndex) {
+      const int32_t expectedId = static_cast<int32_t>(destIndex) + 1;
+      if (orderedTrackIds[destIndex] != expectedId) {
+        error = "track.reorder requires contiguous track_ids 1..N matching playlist order (use track.sync-layout)";
+        return false;
+      }
+    }
+    transportRebuildGraphOnly();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in reorderAudioTracks";
+    return false;
+  }
+}
+
+bool reorderAudioTracksOnMessageThread(const std::vector<int32_t>& orderedTrackIds, std::string& error) {
+  return runOnMessageThread([&]() { return reorderAudioTracks(orderedTrackIds, error); }, error);
+}
+
+bool syncAudioTrackLayout(const std::vector<TrackLayoutEntry>& desired, std::string& error) {
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  try {
+    const int targetCount = static_cast<int>(desired.size());
+    if (targetCount <= 0) {
+      return true;
+    }
+
+    while (static_cast<int>(tracktion::engine::getAudioTracks(*gState->edit).size()) > targetCount) {
+      const int lastId = static_cast<int>(tracktion::engine::getAudioTracks(*gState->edit).size());
+      if (!deleteAudioTrack(lastId, error)) {
+        return false;
+      }
+    }
+    while (static_cast<int>(tracktion::engine::getAudioTracks(*gState->edit).size()) < targetCount) {
+      int32_t createdId = 0;
+      if (!createAudioTrack("", createdId, error)) {
+        return false;
+      }
+    }
+
+    std::vector<int32_t> orderedIds;
+    orderedIds.reserve(static_cast<size_t>(targetCount));
+    for (const auto& entry : desired) {
+      orderedIds.push_back(entry.id > 0 ? entry.id : static_cast<int32_t>(orderedIds.size() + 1));
+    }
+    if (!reorderAudioTracks(orderedIds, error)) {
+      return false;
+    }
+
+    const auto tracks = tracktion::engine::getAudioTracks(*gState->edit);
+    const int n = std::min(targetCount, static_cast<int>(tracks.size()));
+    for (int i = 0; i < n; ++i) {
+      auto* track = tracks[static_cast<size_t>(i)];
+      if (track == nullptr) {
+        continue;
+      }
+      const std::string& desiredName = desired[static_cast<size_t>(i)].name;
+      if (!desiredName.empty()) {
+        track->setName(juce::String(desiredName));
+      }
+    }
+    transportRebuildGraphOnly();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in syncAudioTrackLayout";
+    return false;
+  }
+}
+
+bool syncAudioTrackLayoutOnMessageThread(const std::vector<TrackLayoutEntry>& desired, std::string& error) {
+  return runOnMessageThread([&]() { return syncAudioTrackLayout(desired, error); }, error);
+}
+
+bool exportProjectSnapshot(ProjectExportSnapshot& out, std::string& error) {
+  out = {};
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  try {
+    if (!listAudioTracks(out.tracks, error)) {
+      return false;
+    }
+    if (!getEditAudioClips(out.clips, error)) {
+      return false;
+    }
+    const auto tracks = tracktion::engine::getAudioTracks(*gState->edit);
+    out.mixer.reserve(tracks.size());
+    for (int i = 0; i < tracks.size(); ++i) {
+      auto* track = tracks[static_cast<size_t>(i)];
+      if (track == nullptr) {
+        continue;
+      }
+      TrackMixerState mixer;
+      readTrackMixerState(*track, static_cast<int32_t>(i) + 1, mixer);
+      out.mixer.push_back(std::move(mixer));
+    }
+    gState->edit->ensureMasterTrack();
+    if (auto volPan = gState->edit->getMasterVolumePlugin()) {
+      out.masterVolume = static_cast<double>(volPan->getSliderPos());
+      out.masterPan = static_cast<double>(volPan->getPan());
+    }
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in exportProjectSnapshot";
+    return false;
+  }
+}
+
+bool exportProjectSnapshotOnMessageThread(ProjectExportSnapshot& out, std::string& error) {
+  return runOnMessageThread([&]() { return exportProjectSnapshot(out, error); }, error);
+}
+
+bool importProjectSnapshot(const ProjectExportSnapshot& snapshot, std::string& error) {
+  error.clear();
+  if (!requireEditPtr(error)) {
+    return false;
+  }
+  try {
+    if (!syncAudioTrackLayout(snapshot.tracks, error)) {
+      return false;
+    }
+    if (!clearAllAudioClips(error)) {
+      return false;
+    }
+    for (const auto& clip : snapshot.clips) {
+      if (clip.sourcePath.empty() || clip.lengthSeconds <= 0.0) {
+        continue;
+      }
+      ClipImportRequest request;
+      request.trackId = clip.trackId > 0 ? clip.trackId : 1;
+      request.sourcePath = clip.sourcePath;
+      request.startSeconds = clip.startSeconds;
+      request.lengthSeconds = clip.lengthSeconds;
+      request.type = "audio";
+      ClipImportResult ignored;
+      if (!importClipFileOnMessageThread(request, ignored, error)) {
+        return false;
+      }
+    }
+    for (const auto& mixer : snapshot.mixer) {
+      if (mixer.trackId < 1) {
+        continue;
+      }
+      setTrackMute(mixer.trackId, mixer.mute, error);
+      setTrackSolo(mixer.trackId, mixer.solo, error);
+      setTrackVolume(mixer.trackId, mixer.volume, error);
+      setTrackPan(mixer.trackId, mixer.pan, error);
+      setTrackRecordArm(mixer.trackId, mixer.recordArmed, error);
+    }
+    setTrackVolume(0, snapshot.masterVolume, error);
+    setTrackPan(0, snapshot.masterPan, error);
+    transportRebuildGraphOnly();
+    error.clear();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error in importProjectSnapshot";
+    return false;
+  }
+}
+
+bool importProjectSnapshotOnMessageThread(const ProjectExportSnapshot& snapshot, std::string& error) {
+  return runOnMessageThread([&]() { return importProjectSnapshot(snapshot, error); }, error);
+}
+
 bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
   out = {};
   if (!gState) {

@@ -1,0 +1,42 @@
+---
+description: DAW state authority — native-engine (Tracktion) is source of truth; Node forwards only
+alwaysApply: true
+---
+
+# DAW state authority (TheStuu)
+
+**Authoritative:** `thestuu/apps/native-engine` (Tracktion) owns timeline, transport, tracks, clips, mixer, plugins, DAW undo/redo, and DAW project persistence.
+
+**Node (`thestuu/apps/engine`):** Thin API/WebSocket/IPC router + orchestration (AI, cloud, metadata, plugin cache, logs). May hold a **read-only** last native snapshot — not a writable second DAW model.
+
+**Dashboard (`thestuu/apps/dashboard`):** Renders native-confirmed state. Optimistic UI while dragging is OK; **reconcile** after native response/event.
+
+## Required order for DAW changes
+
+1. Define/extend command in `packages/protocol` or `thestuu/docs/native-ipc.md`
+2. Implement in `thestuu/apps/native-engine` + emit snapshot/event (e.g. `edit.snapshot`, `transport.changed`)
+3. Forward only in `thestuu/apps/engine` — do not mutate `state.project` playlist/clips/mixer for DAW logic
+4. Update dashboard to render confirmed state
+
+Migrate incrementally: transport → clips → tracks → mixer → plugins → save/load → undo/redo.
+
+## Forbidden in new code (Node)
+
+- Mutating `state.project.playlist`, clip fields, or mixer for DAW operations
+- Extending `projectHistory` for tracks/clips/mixer/plugins
+- New uses of `syncNativeArrangementFromPlaylist` / `edit:clear-audio-clips` as a sync strategy
+- Fake transport when native is offline (e.g. starting a JS playhead anyway) — show engine offline instead
+
+## Allowed in Node
+
+- HTTP/WebSocket, IPC, process management, AI, cloud/user metadata, import preparation, plugin catalog cache, read-only native snapshot cache, logging
+
+## Legacy (transition)
+
+Touch existing Node-side DAW mutations only when the task is an explicit migration step. Do not add new features on the legacy JSON-first path.
+
+## References
+
+- UI rules: `thestuu/AGENTS.md`, `thestuu/docs/styleguide-ui.md`
+- IPC commands: `thestuu/docs/native-ipc.md`
+- Full architecture: `thestuu/docs/architecture-state-authority.md`

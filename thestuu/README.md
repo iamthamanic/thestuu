@@ -97,6 +97,35 @@ bash scripts/setup-tracktion.sh
 
 Alternative: eigenen Vendor-Pfad ueber `STUU_NATIVE_VENDOR_DIR` setzen.
 
+### DAW authority check (CI / local)
+
+```bash
+npm run check:daw-authority
+```
+
+Fails if new `syncNativeArrangementFromPlaylist` or `projectHistory.*.push` usages appear outside the legacy allowlist in `apps/engine/src/server.js`. See `scripts/check-daw-authority.sh`.
+
+### Native-first DAW flags (engine)
+
+All flags stay **opt-in** until manual QA passes (no default flip).
+
+- `STUU_NATIVE_CLIP_OPS=1` — clip move/resize/delete via Tracktion (`clip.move`, etc.) then playlist cache reconcile
+- `STUU_NATIVE_TRACK_OPS=1` — track create/delete/reorder via `track.create` / `track.delete` / `track.reorder` + layout sync
+- `STUU_NATIVE_EDIT_UNDO=1` — `project:undo` / `project:redo` use Tracktion undo manager
+- `STUU_NATIVE_PROJECT_SIDECAR=1` — save/load merges `project.export` arrangement with JSON sidecar (patterns/view)
+- `STUU_NATIVE_TRANSPORT=0` — JS stub transport only (dev); default requires native for transport
+
+### QA matrix (manual, with native engine running)
+
+| Flags | Verify |
+|-------|--------|
+| Transport (default) | Play/stop/seek offline → transport buttons disabled; no fake playhead when native down |
+| `STUU_NATIVE_CLIP_OPS=1` | Move/resize/delete audio clip; playlist matches native after `engine:state` |
+| `STUU_NATIVE_TRACK_OPS=1` | Create/delete/reorder track; native track count matches UI |
+| `STUU_NATIVE_EDIT_UNDO=1` | Undo/redo clip edit after clip ops |
+| `STUU_NATIVE_PROJECT_SIDECAR=1` | Save `.stu`, reload; audio clips + patterns restored |
+| Combined | Clip ops + track ops + undo + save/load in one session |
+
 ### Starten
 
 ```bash

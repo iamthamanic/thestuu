@@ -3302,6 +3302,17 @@ export default function StuuShell() {
     socket.on('engine:transport', (payload) => {
       applyEngineTransportPayload(payload);
     });
+    socket.on('engine:offline', (payload) => {
+      applyEngineTransportPayload({
+        playing: false,
+        recording: false,
+        timestamp: Date.now(),
+      });
+      const reason = isObject(payload) && typeof payload.message === 'string'
+        ? payload.message
+        : 'Native-Engine offline — Transport und DAW-Bearbeitung sind deaktiviert.';
+      appendConnectionLogEntry({ level: 'warn', message: reason });
+    });
 
     return () => {
       if (pluginScanAckTimeoutRef.current) {
@@ -3319,6 +3330,7 @@ export default function StuuShell() {
       socket.off('engine:meter');
       socket.off('engine:analyzer');
       socket.off('engine:transport');
+      socket.off('engine:offline');
       socket.io.off('reconnect_attempt', handleReconnectAttempt);
       socket.close();
     };
@@ -5340,6 +5352,9 @@ export default function StuuShell() {
       }
       if ((event.key === ' ' || event.code === 'Space') && !shortcutBlockedByTyping) {
         event.preventDefault();
+        if (connection !== 'online' || state?.nativeTransport !== true) {
+          return;
+        }
         if (state?.playing) {
           emitMutation('transport:pause', {});
         } else {
@@ -6333,6 +6348,10 @@ export default function StuuShell() {
   }
 
   function transportPlay() {
+    if (!dawEngineReady) {
+      appendSystemMessage('Play nicht moeglich: Native-Engine ist nicht verbunden. Starte mit npm run start im Projektroot.');
+      return;
+    }
     clearPreviewStopTimer();
     const typedRaw = Number(String(bpmInputValue || '').trim().replace(',', '.'));
     const desiredBpm = Number.isFinite(typedRaw)
@@ -6375,11 +6394,6 @@ export default function StuuShell() {
       if (metronomeEnabled || shouldAutoMetronome) {
         primeMetronomeAudio();
       }
-      applyEngineTransportPayload({
-        playing: true,
-        bpm: desiredBpm,
-        timestamp: Date.now(),
-      });
       emitMutation('transport:play', { bpm: desiredBpm });
     };
 
@@ -6432,6 +6446,10 @@ export default function StuuShell() {
   }
 
   function transportPause() {
+    if (!dawEngineReady) {
+      appendSystemMessage('Pause nicht moeglich: Native-Engine ist nicht verbunden.');
+      return;
+    }
     clearPreviewStopTimer();
     if (countInTimeoutRef.current) { clearTimeout(countInTimeoutRef.current); countInTimeoutRef.current = null; }
     if (countInIntervalRef.current) { clearInterval(countInIntervalRef.current); countInIntervalRef.current = null; }
@@ -6447,6 +6465,10 @@ export default function StuuShell() {
   }
 
   function transportStop() {
+    if (!dawEngineReady) {
+      appendSystemMessage('Stop nicht moeglich: Native-Engine ist nicht verbunden.');
+      return;
+    }
     clearPreviewStopTimer();
     if (countInTimeoutRef.current) { clearTimeout(countInTimeoutRef.current); countInTimeoutRef.current = null; }
     if (countInIntervalRef.current) { clearInterval(countInIntervalRef.current); countInIntervalRef.current = null; }
@@ -6628,6 +6650,9 @@ export default function StuuShell() {
   }
 
   function setMasterVolume(volume) {
+    if (connection !== 'online' || state?.nativeTransport !== true) {
+      return;
+    }
     finalizeMixLevelDragFromSession();
     const resolvedVolume = normalizeVolumeValue(volume);
     applyLocalMasterMix({ volume: resolvedVolume });
@@ -6635,6 +6660,9 @@ export default function StuuShell() {
   }
 
   function setMasterPan(pan) {
+    if (connection !== 'online' || state?.nativeTransport !== true) {
+      return;
+    }
     finalizeMixLevelDragFromSession();
     const resolvedPan = normalizePanValue(pan);
     applyLocalMasterMix({ pan: resolvedPan });
@@ -6672,6 +6700,9 @@ export default function StuuShell() {
   }
 
   function setVolume(trackId, volume) {
+    if (connection !== 'online' || state?.nativeTransport !== true) {
+      return;
+    }
     finalizeMixLevelDragFromSession();
     const resolvedVolume = normalizeVolumeValue(volume);
     applyLocalTrackMix(trackId, { volume: resolvedVolume });
@@ -6681,6 +6712,9 @@ export default function StuuShell() {
   }
 
   function setPan(trackId, pan) {
+    if (connection !== 'online' || state?.nativeTransport !== true) {
+      return;
+    }
     finalizeMixLevelDragFromSession();
     const resolvedPan = normalizePanValue(pan);
     applyLocalTrackMix(trackId, { pan: resolvedPan });
@@ -9000,7 +9034,8 @@ export default function StuuShell() {
   const showDawTopShell = activeTab === 'Edit' || activeTab === 'Mix';
   const canUndoProject = Boolean(state?.history?.canUndo);
   const canRedoProject = Boolean(state?.history?.canRedo);
-  const connectionStatusVariant = connection === 'online' && state?.nativeTransport === true
+  const dawEngineReady = connection === 'online' && state?.nativeTransport === true;
+  const connectionStatusVariant = dawEngineReady
     ? 'online'
     : connection === 'online'
       ? 'no-audio'
@@ -9748,18 +9783,26 @@ export default function StuuShell() {
                 <div className="daw-control-strip">
                   <div className="daw-btn-group">
                     <button
+                      type="button"
                       className={`transport-btn ${state?.playing ? 'is-pause' : 'is-play'}`}
                       onClick={togglePlayPause}
-                      title={state?.playing ? 'Pause (Leertaste)' : 'Play (Leertaste)'}
+                      disabled={!dawEngineReady}
+                      title={dawEngineReady
+                        ? (state?.playing ? 'Pause (Leertaste)' : 'Play (Leertaste)')
+                        : 'Native-Engine nicht verbunden'}
                       aria-label={state?.playing ? 'Pause' : 'Play'}
+                      aria-disabled={!dawEngineReady}
                     >
                       {state?.playing ? <Pause size={14} aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
                     </button>
                     <button
+                      type="button"
                       className="transport-btn is-stop"
                       onClick={transportStop}
-                      title="Stop"
+                      disabled={!dawEngineReady}
+                      title={dawEngineReady ? 'Stop' : 'Native-Engine nicht verbunden'}
                       aria-label="Stop"
+                      aria-disabled={!dawEngineReady}
                     >
                       <Square size={12} aria-hidden="true" />
                     </button>
@@ -9873,18 +9916,26 @@ export default function StuuShell() {
 
               <div className="transport-group">
                 <button
+                  type="button"
                   className={`transport-btn ${state?.playing ? 'is-pause' : 'is-play'}`}
                   onClick={togglePlayPause}
-                  title={state?.playing ? 'Pause (Leertaste)' : 'Play (Leertaste)'}
+                  disabled={!dawEngineReady}
+                  title={dawEngineReady
+                    ? (state?.playing ? 'Pause (Leertaste)' : 'Play (Leertaste)')
+                    : 'Native-Engine nicht verbunden'}
                   aria-label={state?.playing ? 'Pause' : 'Play'}
+                  aria-disabled={!dawEngineReady}
                 >
                   {state?.playing ? <Pause size={14} aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
                 </button>
                 <button
+                  type="button"
                   className="transport-btn is-stop"
                   onClick={transportStop}
-                  title="Stop"
+                  disabled={!dawEngineReady}
+                  title={dawEngineReady ? 'Stop' : 'Native-Engine nicht verbunden'}
                   aria-label="Stop"
+                  aria-disabled={!dawEngineReady}
                 >
                   <Square size={12} aria-hidden="true" />
                 </button>

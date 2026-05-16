@@ -132,6 +132,68 @@ struct EditClipInfo {
 bool getEditAudioClips(std::vector<EditClipInfo>& out, std::string& error);
 bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::string& error);
 
+/** Locate and edit a wave clip by absolute source_path (and optional disambiguating start in bars). */
+struct ClipEditBySourceRequest {
+  int32_t trackId = 0;
+  int32_t toTrackId = 0;
+  std::string sourcePath;
+  double startBars = 0.0;
+  double lengthBars = -1.0;
+  double oldStartBars = -1.0;
+};
+
+bool moveAudioClipBySource(const ClipEditBySourceRequest& request, std::string& error);
+bool moveAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request, std::string& error);
+bool resizeAudioClipBySource(const ClipEditBySourceRequest& request, std::string& error);
+bool resizeAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request, std::string& error);
+bool deleteAudioClipBySource(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error);
+bool deleteAudioClipBySourceOnMessageThread(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error);
+
+bool editUndo(std::string& error);
+bool editUndoOnMessageThread(std::string& error);
+bool editRedo(std::string& error);
+bool editRedoOnMessageThread(std::string& error);
+
+/** One audio track row in the edit (1-based track id matches UI track_id). */
+struct TrackLayoutEntry {
+  int32_t id = 0;
+  std::string name;
+  int32_t index = 0;
+};
+
+struct TrackMixerState {
+  int32_t trackId = 0;
+  double volume = 0.85;
+  double pan = 0.0;
+  bool mute = false;
+  bool solo = false;
+  bool recordArmed = false;
+};
+
+struct ProjectExportSnapshot {
+  std::vector<TrackLayoutEntry> tracks;
+  std::vector<EditClipInfo> clips;
+  std::vector<TrackMixerState> mixer;
+  double masterVolume = 1.0;
+  double masterPan = 0.0;
+};
+
+bool listAudioTracks(std::vector<TrackLayoutEntry>& out, std::string& error);
+bool listAudioTracksOnMessageThread(std::vector<TrackLayoutEntry>& out, std::string& error);
+bool createAudioTrack(const std::string& name, int32_t& outTrackId, std::string& error);
+bool createAudioTrackOnMessageThread(const std::string& name, int32_t& outTrackId, std::string& error);
+bool deleteAudioTrack(int32_t trackId, std::string& error);
+bool deleteAudioTrackOnMessageThread(int32_t trackId, std::string& error);
+bool reorderAudioTracks(const std::vector<int32_t>& orderedTrackIds, std::string& error);
+bool reorderAudioTracksOnMessageThread(const std::vector<int32_t>& orderedTrackIds, std::string& error);
+/** Match native audio track count/order/names to desired layout (clips unchanged). */
+bool syncAudioTrackLayout(const std::vector<TrackLayoutEntry>& desired, std::string& error);
+bool syncAudioTrackLayoutOnMessageThread(const std::vector<TrackLayoutEntry>& desired, std::string& error);
+bool exportProjectSnapshot(ProjectExportSnapshot& out, std::string& error);
+bool exportProjectSnapshotOnMessageThread(ProjectExportSnapshot& out, std::string& error);
+bool importProjectSnapshot(const ProjectExportSnapshot& snapshot, std::string& error);
+bool importProjectSnapshotOnMessageThread(const ProjectExportSnapshot& snapshot, std::string& error);
+
 /**
  * Live spectrum analyzer frame from the native audio path.
  * Source is either the selected track post-FX level meter tap or the global output fallback.
