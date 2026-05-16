@@ -11,9 +11,16 @@ Die App ist als Monorepo aufgebaut und trennt klar zwischen UI, Orchestrierung u
 ## Was ist bereits integriert
 
 ### 1) Produkt- und Laufzeitarchitektur
+
+```
+Dashboard (Next.js)  →  rendert bestätigten State
+Engine (Node.js)     →  WebSocket/IPC-Router, Sidecar-Metadaten (Patterns/View), kein DAW-Owner
+Native (C++/Tracktion) →  Transport, Clips, Tracks, Mixer, Plugins, DAW-Undo, Arrangement
+```
+
 - Dashboard (`Next.js`) als Hauptoberflaeche.
-- Engine (`Node.js`) als zentrale Session- und Mutations-Schicht.
-- Native Engine (`C++`) fuer Transport, Audio-/Plugin-Bruecke und Tracktion-Integration.
+- Engine (`Node.js`) als **Router/Orchestrator** (kein autoritativer DAW-State; JSON-Cache wird aus Native reconciled).
+- Native Engine (`C++`) als **Single Source of Truth** fuer Timeline, Transport, Clips, Tracks, Mixer und DAW-Undo.
 - IPC zwischen Engine und Native ueber Unix Socket + MessagePack.
 - CLI, die den kompletten Stack startet und Prozesse koordiniert.
 
@@ -105,26 +112,27 @@ npm run check:daw-authority
 
 Fails if new `syncNativeArrangementFromPlaylist` or `projectHistory.*.push` usages appear outside the legacy allowlist in `apps/engine/src/server.js`. See `scripts/check-daw-authority.sh`.
 
-### Native-first DAW flags (engine)
+### Native-first DAW (engine, default on)
 
-All flags stay **opt-in** until manual QA passes (no default flip).
+Native-first paths are **on by default**. Opt out per domain with `=0`:
 
-- `STUU_NATIVE_CLIP_OPS=1` — clip move/resize/delete via Tracktion (`clip.move`, etc.) then playlist cache reconcile
-- `STUU_NATIVE_TRACK_OPS=1` — track create/delete/reorder via `track.create` / `track.delete` / `track.reorder` + layout sync
-- `STUU_NATIVE_EDIT_UNDO=1` — `project:undo` / `project:redo` use Tracktion undo manager
-- `STUU_NATIVE_PROJECT_SIDECAR=1` — save/load merges `project.export` arrangement with JSON sidecar (patterns/view)
-- `STUU_NATIVE_TRANSPORT=0` — JS stub transport only (dev); default requires native for transport
+- `STUU_NATIVE_CLIP_OPS=0` — legacy JSON clip mutation + full sync
+- `STUU_NATIVE_TRACK_OPS=0` — JSON-first track layout + `safeRestoreNativeNodes…`
+- `STUU_NATIVE_EDIT_UNDO=0` — JSON `projectHistory` undo/redo
+- `STUU_NATIVE_PROJECT_SIDECAR=0` — save/load without `project.export` merge
+- `STUU_NATIVE_LEGACY_SYNC=1` — restore `edit:clear-audio-clips` + full reimport hot path
+- `STUU_NATIVE_TRANSPORT=0` — JS stub transport only (dev)
 
 ### QA matrix (manual, with native engine running)
 
-| Flags | Verify |
+| Check | Verify |
 |-------|--------|
-| Transport (default) | Play/stop/seek offline → transport buttons disabled; no fake playhead when native down |
-| `STUU_NATIVE_CLIP_OPS=1` | Move/resize/delete audio clip; playlist matches native after `engine:state` |
-| `STUU_NATIVE_TRACK_OPS=1` | Create/delete/reorder track; native track count matches UI |
-| `STUU_NATIVE_EDIT_UNDO=1` | Undo/redo clip edit after clip ops |
-| `STUU_NATIVE_PROJECT_SIDECAR=1` | Save `.stu`, reload; audio clips + patterns restored |
-| Combined | Clip ops + track ops + undo + save/load in one session |
+| Transport | Play/stop/seek offline → transport disabled; no fake playhead |
+| Clips (default) | Move/resize/delete audio; playlist matches native after `engine:state` |
+| Tracks (default) | Create/delete/reorder; native track count matches UI |
+| Undo (default) | `project:undo` / `redo` via Tracktion |
+| Save/load (default) | Save `.stu`, reload; audio + patterns |
+| Legacy | With `STUU_NATIVE_LEGACY_SYNC=1`, import still uses full sync |
 
 ### Starten
 

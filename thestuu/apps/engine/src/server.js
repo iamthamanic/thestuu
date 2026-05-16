@@ -39,14 +39,16 @@ const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
 const structureTemplatesDir = path.join(stuuHome, 'structure-templates');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
 const nativeTransportEnabled = process.env.STUU_NATIVE_TRANSPORT !== '0';
-/** When true, audio clip move/resize/delete use native-engine first, then refresh playlist cache from edit:get-audio-clips. */
-const nativeClipOpsEnabled = process.env.STUU_NATIVE_CLIP_OPS === '1';
-/** When true, project:undo/redo forward to Tracktion undo manager instead of JSON projectHistory. */
-const nativeEditUndoEnabled = process.env.STUU_NATIVE_EDIT_UNDO === '1';
-/** When true, track create/delete/reorder use native-engine first, then reconcile playlist cache. */
-const nativeTrackOpsEnabled = process.env.STUU_NATIVE_TRACK_OPS === '1';
-/** When true, project save/load merges native arrangement export with JSON sidecar (patterns/view). */
-const nativeProjectSidecarEnabled = process.env.STUU_NATIVE_PROJECT_SIDECAR === '1';
+/** Native-first clip ops (default on). Set STUU_NATIVE_CLIP_OPS=0 to force legacy JSON+full-sync path. */
+const nativeClipOpsEnabled = process.env.STUU_NATIVE_CLIP_OPS !== '0';
+/** Native undo/redo for arrangement (default on). Set STUU_NATIVE_EDIT_UNDO=0 for JSON projectHistory. */
+const nativeEditUndoEnabled = process.env.STUU_NATIVE_EDIT_UNDO !== '0';
+/** Native track layout ops (default on). Set STUU_NATIVE_TRACK_OPS=0 for JSON-first tracks. */
+const nativeTrackOpsEnabled = process.env.STUU_NATIVE_TRACK_OPS !== '0';
+/** Save/load: native export + JSON sidecar for patterns/view (default on). */
+const nativeProjectSidecarEnabled = process.env.STUU_NATIVE_PROJECT_SIDECAR !== '0';
+/** Legacy clear+reimport sync (opt-in only). Default: targeted reconcile from native snapshots. */
+const nativeLegacySyncEnabled = process.env.STUU_NATIVE_LEGACY_SYNC === '1';
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
 /** Opt-in only: fake random meter motion when Native has no transport.get_meters. Default off — meters stay at 0 until Native is rebuilt. */
 const meterUiFallbackEnabled = process.env.STUU_METER_UI_FALLBACK === '1';
@@ -1347,6 +1349,9 @@ function trimProjectHistoryStack(stack) {
 }
 
 function syncProjectHistory({ record = true, clearRedo = true, force = false } = {}) {
+  if (nativeEditUndoEnabled) {
+    return;
+  }
   const current = snapshotProjectForHistory();
   if (!current) {
     return;
@@ -1387,10 +1392,19 @@ function resetProjectHistory() {
 }
 
 function getProjectHistoryMeta() {
+  if (nativeEditUndoEnabled && nativeTransportActive) {
+    return { canUndo: true, canRedo: true, nativeUndo: true };
+  }
   return {
     canUndo: projectHistory.undo.length > 0,
     canRedo: projectHistory.redo.length > 0,
   };
+}
+
+function assertNativeEngineForDawMutation() {
+  if (isNativeTransportRequired() && !nativeTransportActive) {
+    throw new Error('Native engine is not connected.');
+  }
 }
 
 function cloneTrackClips(clips) {
@@ -2209,16 +2223,18 @@ async function restoreNativeVstNodes({ resetEdit = false } = {}) {
   }
 
   if (resetEdit) {
-    if (nativeProjectSidecarEnabled && nativeTransportActive) {
+    if (nativeTransportActive && nativeProjectSidecarEnabled) {
       try {
         const importPayload = buildNativeImportFromProject(state.project);
         await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload);
         await reconcileFromNative({ clips: true, tracks: true, mixer: true });
       } catch (importError) {
         errors.push(importError instanceof Error ? importError.message : 'project.import failed');
-        await syncNativeArrangementFromPlaylist();
+        if (nativeLegacySyncEnabled) {
+          await syncNativeArrangementFromPlaylist();
+        }
       }
-    } else {
+    } else if (nativeLegacySyncEnabled) {
       await syncNativeArrangementFromPlaylist();
     }
     const syncErrors = state.nativeClipSyncSummary?.lastErrors ?? [];
@@ -3471,14 +3487,20 @@ async function reconcileFromNative(options = {}) {
   }
 }
 
-/** Clip reconcile: targeted native refresh or legacy full sync. */
+/** Clip reconcile: targeted native refresh or legacy full sync (opt-in). */
 async function reconcileNativeClipState(options = {}) {
   const mergeNativeFirst = options.mergeNativeFirst !== false;
-  if (nativeClipOpsEnabled && nativeTransportActive) {
+  if (nativeTransportActive && (nativeClipOpsEnabled || nativeTrackOpsEnabled)) {
     await reconcilePlaylistAudioClipsFromNative();
     return;
   }
-  await syncNativeArrangementFromPlaylist({ mergeNativeFirst });
+  if (nativeLegacySyncEnabled) {
+    await syncNativeArrangementFromPlaylist({ mergeNativeFirst });
+    return;
+  }
+  if (nativeClipOpsEnabled) {
+    assertNativeEngineForDawMutation();
+  }
 }
 
 async function moveClip(payload = {}) {
@@ -3519,6 +3541,10 @@ async function moveClip(payload = {}) {
       emitState();
       return { clipId, trackId: destinationTrackId };
     }
+    if (normalizeClipType(clip?.type) === 'audio') {
+      assertNativeEngineForDawMutation();
+      throw new Error('Audio clip move requires source_path for native clip.move');
+    }
   }
 
   if (destinationTrackIdRaw !== undefined) {
@@ -3538,6 +3564,11 @@ async function moveClip(payload = {}) {
       await reconcileNativeClipState({ mergeNativeFirst: false });
       return { clipId, trackId: destinationTrackId };
     }
+  }
+
+  if (nativeClipOpsEnabled && normalizeClipType(clip?.type) === 'audio') {
+    assertNativeEngineForDawMutation();
+    throw new Error('Audio clip move requires native clip.move');
   }
 
   clip.start = nextStart;
@@ -3615,6 +3646,15 @@ async function resizeClip(payload = {}) {
       }
       return out;
     }
+    if (normalizeClipType(clip?.type) === 'audio') {
+      assertNativeEngineForDawMutation();
+      throw new Error('Audio clip resize requires source_path for native clip.resize');
+    }
+  }
+
+  if (nativeClipOpsEnabled && normalizeClipType(clip?.type) === 'audio') {
+    assertNativeEngineForDawMutation();
+    throw new Error('Audio clip resize requires native clip.resize');
   }
 
   await reconcileNativeClipState({ mergeNativeFirst: false });
@@ -3793,6 +3833,15 @@ async function deleteClip(payload = {}) {
       emitState();
       return { clipId, trackId };
     }
+    if (normalizeClipType(clip?.type) === 'audio') {
+      assertNativeEngineForDawMutation();
+      throw new Error('Audio clip delete requires source_path for native clip.delete');
+    }
+  }
+
+  if (nativeClipOpsEnabled && normalizeClipType(clip?.type) === 'audio') {
+    assertNativeEngineForDawMutation();
+    throw new Error('Audio clip delete requires native clip.delete');
   }
 
   const currentLength = track.clips.length;
@@ -6142,7 +6191,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('project:undo', async (_payload = {}, callback = () => {}) => {
-    if (nativeEditUndoEnabled && nativeTransportActive) {
+    if (nativeEditUndoEnabled) {
+      if (!nativeTransportActive) {
+        respond(callback, {
+          ok: false,
+          error: 'Native engine is not connected.',
+          history: getProjectHistoryMeta(),
+        });
+        return;
+      }
       try {
         await requestNativeTransport(NATIVE_COMMANDS.EDIT_UNDO);
         await reconcileFromNative({ clips: true, tracks: nativeTrackOpsEnabled, mixer: true });
@@ -6199,7 +6256,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('project:redo', async (_payload = {}, callback = () => {}) => {
-    if (nativeEditUndoEnabled && nativeTransportActive) {
+    if (nativeEditUndoEnabled) {
+      if (!nativeTransportActive) {
+        respond(callback, {
+          ok: false,
+          error: 'Native engine is not connected.',
+          history: getProjectHistoryMeta(),
+        });
+        return;
+      }
       try {
         await requestNativeTransport(NATIVE_COMMANDS.EDIT_REDO);
         await reconcileFromNative({ clips: true, tracks: nativeTrackOpsEnabled, mixer: true });
