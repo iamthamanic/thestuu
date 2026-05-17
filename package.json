@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "description": "TheStuu – start always runs Native-Engine + Engine + Dashboard via CLI",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "node apps/cli/bin/thestuu.js start",
     "start": "node apps/cli/bin/thestuu.js start",
@@ -14,9 +18,5 @@
     "qa:legacy-daw": "node scripts/qa-legacy-daw-smoke.mjs",
     "desktop:dev": "npm run dev --prefix apps/desktop",
     "desktop:build": "npm run build --prefix apps/desktop"
-  },
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ]
+  }
 }

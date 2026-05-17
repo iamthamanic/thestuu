@@ -1,30 +1,37 @@
-node_modules
-.DS_Store
-.next
-dist
-coverage
-.nyc_output
+# --- Node / JavaScript ---
+node_modules/
+.next/
+dist/
+coverage/
+.nyc_output/
 *.log
+
+# --- Environment & secrets ---
 .env*
-/.turbo
-/.cache
-/.codex-home
-/.shim
-/.shimwrapper
-/.semgrep-home
-/.venv-semgrep
 
-# Native engine — local vendor + all CMake build outputs
+# --- Tooling caches (local) ---
+/.turbo/
+/.cache/
+/.codex-home/
+/.shim/
+/.shimwrapper/
+/.semgrep-home/
+/.venv-semgrep/
+
+# --- OS ---
+.DS_Store
+
+# --- Native engine: vendor + CMake build dirs ---
 vendor/
-apps/native-engine/vendor
-apps/native-engine/build
-apps/native-engine/build-tracktion
+apps/native-engine/vendor/
+apps/native-engine/build/
+apps/native-engine/build-tracktion/
 
-# Compiled native binary (any build dir)
+# --- Compiled native binary (any build dir) ---
 **/thestuu-native
 **/thestuu-native.exe
 
-# CMake / compiler artifacts
+# --- CMake / compiler artifacts ---
 **/CMakeCache.txt
 **/CMakeFiles/
 **/*.o
@@ -35,11 +42,9 @@ apps/native-engine/build-tracktion
 **/CompilerIdCXX/a.out
 **/CMakeDetermineCompilerABI_*.bin
 
-# Tauri / Rust
+# --- Tauri / Rust ---
 apps/desktop/src-tauri/target/
 
-# Media / local runtime
+# --- Media / local runtime ---
 *.wav
 *.sock
-
-.DS_Store
