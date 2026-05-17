@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TheStuu — offline</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f1014;
+      color: #e8e8ec;
+      padding: 24px;
+    }
+    .card {
+      max-width: 420px;
+      text-align: center;
+    }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 8px; }
+    p { margin: 0 0 16px; color: #a0a4b0; line-height: 1.5; font-size: 0.9rem; }
+    code { background: #1a1c24; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+    button {
+      background: #3d7cff;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 10px 18px;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    button:hover { background: #2f6ae8; }
+    .hint { margin-top: 20px; font-size: 0.8rem; color: #6b7080; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>TheStuu is not running</h1>
+    <p>
+      The desktop shell could not reach the dashboard at
+      <code id="dashboard-url">http://127.0.0.1:3010</code>.
+    </p>
+    <p>
+      Start the stack from the repo root, then retry:
+    </p>
+    <p><code>npm run start</code></p>
+    <button type="button" id="retry">Retry connection</button>
+    <p class="hint">
+      Phase 1: Tauri does not start native-engine or the Node engine — it only opens a window.
+      DAW state stays in Tracktion + engine; this app is a shell only.
+    </p>
+  </div>
+  <script>
+    const DASHBOARD_URL = 'http://127.0.0.1:3010';
+    document.getElementById('dashboard-url').textContent = DASHBOARD_URL;
+
+    async function tryConnect() {
+      try {
+        await fetch(DASHBOARD_URL, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
+        window.location.replace(DASHBOARD_URL);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    document.getElementById('retry').addEventListener('click', () => {
+      tryConnect();
+    });
+
+    setInterval(tryConnect, 4000);
+  </script>
+</body>
+</html>

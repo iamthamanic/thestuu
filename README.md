@@ -81,6 +81,20 @@ Weitere Leitdokumente:
 - `docs/native-ipc.md`
 - `docs/tracktion-setup.md`
 
+## Desktop shell (Tauri, optional)
+
+TheStuu can open in a native window via **Tauri** (`apps/desktop`). The shell **does not own DAW state** — it only loads the dashboard when `npm run start` is already running.
+
+```bash
+# Terminal 1
+npm run start
+
+# Terminal 2
+npm run desktop:dev
+```
+
+Details: `docs/desktop-tauri.md`.
+
 ## Schnellstart
 
 ### Voraussetzungen
