@@ -2,67 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="refresh" content="0; url=http://127.0.0.1:3010" />
   <title>TheStuu — Diagnostics</title>
-  <link rel="stylesheet" href="diagnostics.css" />
+  <script>
+    const DASHBOARD_URL = 'http://127.0.0.1:3010';
+    window.location.replace(DASHBOARD_URL);
+  </script>
 </head>
 <body>
-  <header>
-    <h1>TheStuu Diagnostics</h1>
-    <div class="header-actions">
-      <button type="button" class="secondary" id="btn-back">Shell home</button>
-      <button type="button" class="secondary" id="btn-copy">Copy diagnostics</button>
-      <button type="button" id="btn-export">Export JSON</button>
-      <button type="button" class="secondary" id="btn-export-txt">Export text</button>
-    </div>
-  </header>
-  <main>
-    <section class="panel">
-      <h2>Engine status</h2>
-      <div class="status-grid">
-        <div class="status-row"><span class="dot" id="dot-dashboard"></span><span>Dashboard</span></div>
-        <div class="status-row"><span class="dot" id="dot-engine"></span><span>Node engine</span></div>
-        <div class="status-row"><span class="dot" id="dot-native"></span><span>native-engine process</span></div>
-        <div class="status-row"><span class="dot" id="dot-ipc"></span><span>IPC connected</span></div>
-        <div class="status-row"><span class="dot" id="dot-tracktion"></span><span>Tracktion backend</span></div>
-        <div class="status-row"><span class="dot" id="dot-audio"></span><span>Audio device</span></div>
-        <div class="status-row"><span class="dot" id="dot-daw"></span><span>DAW ready</span></div>
-      </div>
-      <p class="meta">Socket: <code id="socket-path">—</code></p>
-      <p class="meta">Dashboard: <code id="dashboard-url">—</code></p>
-      <p class="meta">Engine: <code id="engine-url">—</code></p>
-      <p class="meta">Native mode: <strong id="native-mode">—</strong></p>
-      <p class="meta" id="flags-text">—</p>
-      <p class="meta">Error category: <span id="error-category" class="badge">unknown</span></p>
-      <p class="meta" id="last-error" hidden></p>
-      <h2>Actions</h2>
-      <div class="actions">
-        <button type="button" id="btn-retry">Retry native-engine</button>
-        <button type="button" id="btn-restart">Restart native-engine</button>
-        <button type="button" class="danger secondary" id="btn-clear">Clear logs</button>
-      </div>
-    </section>
-    <section class="log-panel">
-      <div class="log-toolbar">
-        <span>Log viewer</span>
-        <div>
-          <label><input type="checkbox" id="auto-scroll" checked /> Auto-scroll</label>
-          <select id="category-filter" aria-label="Filter by category">
-            <option value="all">All categories</option>
-            <option value="startup">startup</option>
-            <option value="ipc">ipc</option>
-            <option value="audio">audio</option>
-            <option value="plugin">plugin</option>
-            <option value="project">project</option>
-            <option value="transport">transport</option>
-            <option value="unknown">unknown</option>
-          </select>
-        </div>
-      </div>
-      <div class="log-view" id="log-view"></div>
-    </section>
-  </main>
-  <p class="hint">⌘⇧D diagnostics · ⌘⇧H shell home · Tauri shell only — no DAW controls</p>
-  <script type="module" src="diagnostics.js"></script>
+  <p>Diagnostics moved to the dashboard <strong>logs</strong> panel (top bar). Redirecting…</p>
+  <p><a href="http://127.0.0.1:3010">Open dashboard</a></p>
 </body>
 </html>

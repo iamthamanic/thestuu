@@ -1,140 +1,109 @@
 # Desktop diagnostics and logging
 
-Integrated diagnostics for the Tauri desktop shell (`apps/desktop`). This layer helps users and developers understand engine state **without relying on terminal output**.
+Native-engine and Tauri shell diagnostics are integrated into the **dashboard LOGS panel** (top bar → **logs**). There is no separate diagnostics window.
 
-Tauri remains a **shell only** — diagnostics probes and logs do not mutate DAW state.
+Tauri remains a **shell only** — probes and logs do not mutate DAW state.
 
 ## Opening diagnostics
 
-| Method | Where it works |
-|--------|----------------|
-| **Diagnostics** button | Shell offline page (`index.html`) |
-| **⌘⇧D** (Ctrl+Shift+D on Windows/Linux) | Shell pages (`index.html`, `diagnostics.html`) |
-| `open_diagnostics` Tauri command | Programmatic |
+| Context | How |
+|---------|-----|
+| **Browser / desktop webview** | Top bar → **logs** (connection status area) |
+| **Shell offline page** | **Open dashboard** — use **logs** in the loaded UI |
+| **Legacy `diagnostics.html`** | Redirects to dashboard (`:3010`) |
 
-When the dashboard URL is loaded in the webview, use shell pages or restart via `index.html` to open diagnostics. Browser devtools on the Next.js app are separate (see below).
+## What the LOGS panel shows
 
-## What the panel shows
+### Health indicators
 
 | Indicator | Meaning |
 |-----------|---------|
-| Dashboard | HTTP reachable at `THESTUU_DASHBOARD_URL` (default `:3010`) |
-| Node engine | `GET /health` on engine port (default `:3990`) |
-| native-engine process | Unix socket accepting connections |
-| IPC connected | `health.ping` over native MessagePack IPC |
-| Tracktion backend | `backend.info` → `tracktion: true` |
+| Dashboard | Node Socket.IO reachable (UI session online) |
+| Node engine | Same as dashboard online in browser; Tauri also probes `GET /health` |
+| native-engine | Managed native process / socket accepting connections |
+| IPC | `health.ping` over native MessagePack IPC |
+| Tracktion | `backend.info` → Tracktion backend ready |
 | Audio device | `audio.get_outputs` returned devices or current id |
-| DAW ready | IPC + Tracktion + audio (native path usable) |
 
-Also shown:
+**UI online does not imply DAW ready.** Transport/play controls stay disabled until `nativeTransport` is true (DAW path usable).
 
-- Active **socket path**
-- **Native mode** and `STUU_NATIVE_*` flags (from shell process environment)
-- **Error category**: `startup` \| `ipc` \| `audio` \| `plugin` \| `project` \| `transport` \| `unknown`
-- **Last native error** (if any)
+In Tauri, health rows also reflect `desktop://status` / `get_desktop_diagnostics`.
 
-## Log viewer
+### Structured log stream
 
-Rolling in-memory log (up to ~2000 entries):
+Normalized entries:
 
 | Field | Description |
 |-------|-------------|
-| timestamp | Local time + ms |
-| level | `info` \| `warn` \| `error` |
-| source | `shell` \| `native-stdout` \| `native-stderr` |
-| category | Auto-classified from message text |
-| message | Raw line |
+| `timestamp` | Local time (ms) |
+| `source` | `engine`, `tauri-shell`, `native-engine`, `ipc`, `audio`, `desktop-lifecycle`, `ui` |
+| `category` | `startup`, `ipc`, `audio`, `plugin`, `project`, `transport`, `unknown` |
+| `level` | `info`, `warn`, `error`, `log` |
+| `event` | Optional event name |
+| `message` / `text` | Log line |
 
-Features:
+Sources:
 
-- Auto-scroll toggle
-- Category filter
-- **Clear logs**
-- **Copy diagnostics** (JSON to clipboard)
-- **Export JSON** / **Export text** (download)
+- **engine** — Node engine via Socket.IO `engine:log` / `engine:logs:init`
+- **tauri-shell**, **native-engine**, **ipc**, **audio**, **desktop-lifecycle** — Tauri sidecar (when running in desktop webview)
 
-### Where logs live
+### Actions (LOGS panel)
 
-| Location | Persisted? |
-|----------|------------|
-| In-memory `DiagnosticsLog` (Rust) | No — cleared when desktop app exits |
-| Export JSON/text download | Yes — user saves file |
-| Terminal (`npm run start`) | Separate — CLI/engine/native still log to terminal |
-
-There is no automatic log file on disk yet.
-
-## Actions (no DAW control)
-
-| Button | Effect |
-|--------|--------|
-| Retry native-engine | Stop managed native (if any) and spawn/reconnect |
-| Restart native-engine | Same as retry (full managed restart) |
-| Clear logs | Clears in-memory diagnostic log buffer |
-| Copy / Export | Diagnostics bundle (see below) |
+| Action | Browser | Tauri desktop |
+|--------|---------|---------------|
+| **restart native** | — | Restarts managed native-engine |
+| **copy** | Clipboard (log lines) | `copy_diagnostics_text` (full bundle) |
+| **export** | JSON (logs + connection snapshot) | `export_diagnostics_bundle` |
+| **clear** | Clears UI log buffer | Also clears Rust diagnostic buffer |
 
 These do **not** start/stop Node, open projects, or change transport/mixer state.
 
-## Export bundle
+## Export bundle (Tauri)
 
-`export_diagnostics_bundle` / Copy / Export produce JSON containing:
+`export_diagnostics_bundle` includes:
 
 - `exportedAtMs`, `appVersion`
 - `platform` (os, arch)
-- Full `status` object (dashboard, engine, native health, flags)
+- Full status (dashboard, engine, native health, enabled flags)
 - All log entries
+- Audio device info when available
 - Default socket path
 
-ZIP packaging and crash upload are **future work**.
-
-## Tauri commands
+## Tauri commands (used by dashboard bridge)
 
 | Command | Purpose |
 |---------|---------|
 | `get_desktop_diagnostics` | Full status struct |
 | `get_diagnostic_logs` | Structured log entries |
-| `get_desktop_status` | Legacy subset for offline page |
-| `get_native_logs` | Plain-text log lines (compat) |
-| `clear_diagnostic_logs` | Clear buffer |
+| `clear_diagnostic_logs` | Clear Rust buffer |
 | `retry_native_startup` | Retry native sidecar |
 | `restart_native_engine` | Restart native sidecar |
 | `export_diagnostics_bundle` | JSON export |
 | `copy_diagnostics_text` | Pretty JSON string |
-| `open_diagnostics` | Navigate to `diagnostics.html` |
-| `open_shell_home` | Navigate to `index.html` |
 
-Events: `desktop://diagnostics`, `desktop://status` (every ~2s).
+Events: `desktop://diagnostics`, `desktop://status`.
 
-## Browser devtools vs integrated diagnostics
+## Browser devtools vs LOGS panel
 
 | Need | Use |
 |------|-----|
-| Native-engine / IPC / audio readiness | **Desktop diagnostics** |
-| Sidecar spawn errors, socket path | **Desktop diagnostics** |
-| Node engine HTTP health | **Desktop diagnostics** |
-| React/UI bugs in dashboard | Browser devtools on `localhost:3010` |
-| WebSocket IPC message traces | Browser devtools + engine logs |
-| CI / scripted QA | `npm run qa:native-daw`, etc. |
+| Native-engine / IPC / audio readiness | **LOGS panel** (Tauri: full health; browser: engine + UI logs) |
+| Sidecar spawn errors, socket path | **LOGS panel** (Tauri) |
+| React/UI bugs, CSS, component state | Browser devtools on `localhost:3010` |
+| CI / scripted QA | `npm run qa:native-daw`, `npm run check:daw-authority` |
 
-## Future: crash reporting
+Browser **console is not required** for normal engine/native diagnostics when using the desktop app or LOGS panel.
 
-Planned (not implemented):
-
-- Optional crash log directory under `~/.thestuu/logs/`
-- User-consented upload bundle
-- Symbolicated native stack traces (platform-specific)
-
-## Files
+## Implementation files
 
 ```
-apps/desktop/offline/
-  index.html           # Shell home + link to diagnostics
-  diagnostics.html     # Diagnostics panel
-  diagnostics.js
-  diagnostics.css
+apps/dashboard/
+  components/connection-status-logs.jsx   # LOGS UI + health grid + actions
+  lib/live-logs.js                        # Structured log normalization
+  lib/desktop-diagnostics-bridge.js       # Tauri invoke + events
 apps/desktop/src-tauri/src/
-  diagnostics.rs       # Log store, engine probe, export
-  native_sidecar.rs    # Forwards native stdout/stderr to log store
-  lib.rs               # Commands + events
+  diagnostics.rs                          # Log store, probes, export
+  native_sidecar.rs                       # Forwards native stdout/stderr
 ```
 
 See also: `docs/desktop-tauri.md`, `docs/daw-authority-guardrails.md`.

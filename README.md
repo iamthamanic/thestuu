@@ -334,4 +334,6 @@ npx thestuu start --native-backend stub
 Wenn Native/Tracktion nicht startet:
 1. Vendor-Pfad pruefen (`STUU_NATIVE_VENDOR_DIR`).
 2. CMake/Compiler-Verfuegbarkeit pruefen.
-3. Native- und Engine-Logs in der CLI-Ausgabe lesen.
+3. **LOGS-Panel** in der Dashboard-Topbar oeffnen (logs) — zentrale Diagnostik fuer Engine, Native und Desktop-Lifecycle; Health-Zeilen zeigen Dashboard/Node/Native/IPC/Tracktion/Audio getrennt (UI online ≠ DAW ready).
+4. Browser-DevTools nur fuer Frontend-Debugging; native Diagnostik laeuft ueber das LOGS-Panel (`docs/desktop-diagnostics.md`).
+5. Zusaetzlich: Native- und Engine-Logs in der CLI-Ausgabe von `npm run start`.

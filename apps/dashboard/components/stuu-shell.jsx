@@ -48,6 +48,8 @@ import MixPlaylistOverview from './MixPlaylistOverview';
 import MixStripChain from './MixStripChain';
 import SongStructureAddMenu from './SongStructureAddMenu';
 import SongStructureLane from './SongStructureLane';
+import ConnectionStatusLogs, { LIVE_LOG_LIMIT as LIVE_ENGINE_LOG_LIMIT } from './connection-status-logs.jsx';
+import { normalizeStructuredLogEntry } from '../lib/live-logs.js';
 import SongStructureNodeModal from './SongStructureNodeModal';
 import SongStructureTemplateManager from './SongStructureTemplateManager';
 import { buildPlaylistOverviewPeaks } from '../lib/playlist-overview-peaks';
@@ -213,7 +215,6 @@ const FADE_CURVE_NODE_MIN_PX = 10;
 const FADE_VISIBLE_MIN_PX = 0.5;
 const DEFAULT_EDIT_TOOL = 'select';
 const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3990';
-const LIVE_ENGINE_LOG_LIMIT = 500;
 
 /** Safe basename for exported project JSON (no path separators or illegal filename chars). */
 function sanitizeProjectJsonBasename(raw) {
@@ -235,47 +236,6 @@ function getProjectJsonDownloadFilename(project) {
   return 'thestuu-project.json';
 }
 const TRACKTION_PLUGIN_PREVIEW_DIMENSIONS = { width: 320, height: 96 };
-
-function normalizeLiveEngineLogLevel(level) {
-  if (level === 'error' || level === 'warn' || level === 'info') {
-    return level;
-  }
-  return 'log';
-}
-
-function normalizeLiveEngineLogEntry(entry) {
-  if (!entry || typeof entry !== 'object') {
-    return null;
-  }
-  const text = typeof entry.text === 'string'
-    ? entry.text
-    : typeof entry.message === 'string'
-      ? entry.message
-      : '';
-  if (!text) {
-    return null;
-  }
-  const tsValue = Number(entry.ts ?? entry.timestamp);
-  const ts = Number.isFinite(tsValue) ? tsValue : Date.now();
-  const id = typeof entry.id === 'string' && entry.id.trim()
-    ? entry.id
-    : `ui_log_${ts}_${Math.random().toString(36).slice(2, 8)}`;
-  return {
-    id,
-    ts,
-    level: normalizeLiveEngineLogLevel(entry.level),
-    text: text.replace(/\r/g, ''),
-  };
-}
-
-function formatLiveEngineLogTime(ts) {
-  const date = new Date(Number.isFinite(Number(ts)) ? Number(ts) : Date.now());
-  const h = String(date.getHours()).padStart(2, '0');
-  const m = String(date.getMinutes()).padStart(2, '0');
-  const s = String(date.getSeconds()).padStart(2, '0');
-  const ms = String(date.getMilliseconds()).padStart(3, '0');
-  return `${h}:${m}:${s}.${ms}`;
-}
 
 const TRACKTION_PLUGIN_UI_META = {
   '4bandeq': {
@@ -2593,10 +2553,6 @@ function resolveNodePluginDisplayName(node, pluginNameByUid) {
 
 export default function StuuShell() {
   const socketRef = useRef(null);
-  const connectionStatusLogsDropdownRef = useRef(null);
-  const connectionStatusLogsTriggerRef = useRef(null);
-  const connectionStatusLogsPanelRef = useRef(null);
-  const connectionStatusLogsViewportRef = useRef(null);
   const clipDraftsRef = useRef({});
   const importFileInputRef = useRef(null);
   const importTargetTrackIdRef = useRef(null);
@@ -2676,9 +2632,7 @@ export default function StuuShell() {
   const mixLevelDragDetachRef = useRef(null);
 
   const [connection, setConnection] = useState('connecting');
-  const [showConnectionLogs, setShowConnectionLogs] = useState(false);
   const [connectionLogs, setConnectionLogs] = useState([]);
-  const [connectionLogsPortalLayout, setConnectionLogsPortalLayout] = useState(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [settingsTab, setSettingsTab] = useState('AUDIO');
   const [settingsVstPluginTab, setSettingsVstPluginTab] = useState('effects');
@@ -2843,63 +2797,16 @@ export default function StuuShell() {
   /** False until first snapshot per session — then intent overrides incoming playlist_link_enabled. Reset on project switch / undo / redo. */
   const playlistLinkIntentReadyRef = useRef(false);
   const appendConnectionLogEntry = useCallback((entry) => {
-    const normalized = normalizeLiveEngineLogEntry(entry);
+    const normalized = normalizeStructuredLogEntry({
+      source: 'engine',
+      ...entry,
+    });
     if (!normalized) {
       return;
     }
     setConnectionLogs((prev) => {
       const next = [...prev, normalized];
       return next.length > LIVE_ENGINE_LOG_LIMIT ? next.slice(-LIVE_ENGINE_LOG_LIMIT) : next;
-    });
-  }, []);
-  const updateConnectionLogsPortalLayout = useCallback(() => {
-    if (typeof window === 'undefined') {
-      return;
-    }
-    const anchorEl = connectionStatusLogsTriggerRef.current || connectionStatusLogsDropdownRef.current;
-    if (!anchorEl) {
-      return;
-    }
-    const rect = anchorEl.getBoundingClientRect();
-    const viewportWidth = Math.max(0, window.innerWidth || 0);
-    const viewportHeight = Math.max(0, window.innerHeight || 0);
-    if (viewportWidth <= 0 || viewportHeight <= 0) {
-      return;
-    }
-    const compact = viewportWidth <= 1080;
-    const gutter = compact ? 12 : 20;
-    const preferredWidth = compact ? 280 : 300;
-    const width = Math.max(260, Math.min(preferredWidth, viewportWidth - gutter * 2));
-    const left = Math.min(
-      Math.max(rect.right - width - 8, gutter),
-      Math.max(gutter, viewportWidth - width - gutter),
-    );
-    const measuredPanelHeight = Number(connectionStatusLogsPanelRef.current?.getBoundingClientRect?.().height);
-    const desiredPanelHeight = Number.isFinite(measuredPanelHeight) && measuredPanelHeight > 0
-      ? measuredPanelHeight
-      : 156;
-    const availableBelow = Math.max(120, viewportHeight - rect.bottom - gutter - 8);
-    const availableAbove = Math.max(120, rect.top - gutter - 8);
-    const canFitBelow = desiredPanelHeight <= availableBelow;
-    const canFitAbove = desiredPanelHeight <= availableAbove;
-    const placeAbove = !canFitBelow && (canFitAbove || availableAbove > availableBelow);
-    const maxHeight = Math.max(120, placeAbove ? availableAbove : availableBelow);
-    let top = placeAbove
-      ? rect.top - Math.min(desiredPanelHeight, maxHeight) - 8
-      : rect.bottom + 8;
-    top = Math.max(gutter, Math.min(top, Math.max(gutter, viewportHeight - maxHeight - gutter)));
-
-    setConnectionLogsPortalLayout((prev) => {
-      if (
-        prev
-        && Math.abs(prev.left - left) < 0.5
-        && Math.abs(prev.top - top) < 0.5
-        && Math.abs(prev.width - width) < 0.5
-        && Math.abs((prev.maxHeight ?? 0) - maxHeight) < 0.5
-      ) {
-        return prev;
-      }
-      return { left, top, width, maxHeight, placement: placeAbove ? 'top' : 'bottom' };
     });
   }, []);
   const pluginNameByUid = useMemo(() => {
@@ -3165,7 +3072,7 @@ export default function StuuShell() {
       }
       setPluginScanPending(false);
       setConnection('offline');
-      appendConnectionLogEntry({ level: 'warn', text: '[thestuu-ui] socket disconnected' });
+      appendConnectionLogEntry({ level: 'warn', source: 'ui', text: '[thestuu-ui] socket disconnected' });
     };
     const handleConnectError = () => {
       if (pluginScanAckTimeoutRef.current) {
@@ -3174,15 +3081,15 @@ export default function StuuShell() {
       }
       setPluginScanPending(false);
       setConnection('offline');
-      appendConnectionLogEntry({ level: 'error', text: '[thestuu-ui] socket connect_error' });
+      appendConnectionLogEntry({ level: 'error', source: 'ui', text: '[thestuu-ui] socket connect_error' });
     };
     const handleReconnectAttempt = () => {
       setConnection('connecting');
-      appendConnectionLogEntry({ level: 'info', text: '[thestuu-ui] socket reconnect_attempt' });
+      appendConnectionLogEntry({ level: 'info', source: 'ui', text: '[thestuu-ui] socket reconnect_attempt' });
     };
     const handleEngineLogsInit = (payload) => {
       const entries = Array.isArray(payload?.entries)
-        ? payload.entries.map(normalizeLiveEngineLogEntry).filter(Boolean)
+        ? payload.entries.map((e) => normalizeStructuredLogEntry({ source: 'engine', ...e })).filter(Boolean)
         : [];
       setConnectionLogs(entries.slice(-LIVE_ENGINE_LOG_LIMIT));
     };
@@ -3335,87 +3242,6 @@ export default function StuuShell() {
       socket.close();
     };
   }, [appendConnectionLogEntry, applyEngineTransportPayload]);
-
-  useEffect(() => {
-    if (!showConnectionLogs) {
-      setConnectionLogsPortalLayout(null);
-      return;
-    }
-    const handlePointerDown = (event) => {
-      const target = event.target;
-      const insideTrigger = connectionStatusLogsDropdownRef.current?.contains(target);
-      const insidePanel = connectionStatusLogsPanelRef.current?.contains(target);
-      if (!insideTrigger && !insidePanel) {
-        setShowConnectionLogs(false);
-      }
-    };
-    const handleKeyDown = (event) => {
-      if (event.key === 'Escape') {
-        setShowConnectionLogs(false);
-      }
-    };
-    document.addEventListener('pointerdown', handlePointerDown);
-    document.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', handlePointerDown);
-      document.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [showConnectionLogs]);
-
-  useEffect(() => {
-    if (!showConnectionLogs) {
-      return;
-    }
-    let rafId = 0;
-    const scheduleUpdate = () => {
-      if (typeof window === 'undefined') {
-        return;
-      }
-      if (rafId) {
-        window.cancelAnimationFrame(rafId);
-      }
-      rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        updateConnectionLogsPortalLayout();
-      });
-    };
-    scheduleUpdate();
-    window.addEventListener('resize', scheduleUpdate);
-    window.addEventListener('scroll', scheduleUpdate, true);
-    return () => {
-      window.removeEventListener('resize', scheduleUpdate);
-      window.removeEventListener('scroll', scheduleUpdate, true);
-      if (rafId && typeof window !== 'undefined') {
-        window.cancelAnimationFrame(rafId);
-      }
-    };
-  }, [showConnectionLogs, updateConnectionLogsPortalLayout]);
-
-  useEffect(() => {
-    if (!showConnectionLogs || typeof window === 'undefined') {
-      return;
-    }
-    let rafId = window.requestAnimationFrame(() => {
-      rafId = 0;
-      updateConnectionLogsPortalLayout();
-    });
-    return () => {
-      if (rafId) {
-        window.cancelAnimationFrame(rafId);
-      }
-    };
-  }, [showConnectionLogs, connectionLogs.length, updateConnectionLogsPortalLayout]);
-
-  useEffect(() => {
-    if (!showConnectionLogs) {
-      return;
-    }
-    const viewport = connectionStatusLogsViewportRef.current;
-    if (!viewport) {
-      return;
-    }
-    viewport.scrollTop = viewport.scrollHeight;
-  }, [connectionLogs, showConnectionLogs]);
 
   useEffect(() => {
     if (connection !== 'online' || !state?.nativeTransport || !socketRef.current) {
@@ -9035,120 +8861,16 @@ export default function StuuShell() {
   const canUndoProject = Boolean(state?.history?.canUndo);
   const canRedoProject = Boolean(state?.history?.canRedo);
   const dawEngineReady = connection === 'online' && state?.nativeTransport === true;
-  const connectionStatusVariant = dawEngineReady
-    ? 'online'
-    : connection === 'online'
-      ? 'no-audio'
-      : connection;
-  const connectionStatusTitle = connection === 'offline' || connection === 'connecting'
-    ? `Engine nicht erreichbar (${enginePort}). Starte alle Dienste mit: npm run start (im Projektroot). Prüfe ob Port ${enginePort} frei ist.`
-    : connection === 'online' && state?.nativeTransport !== true
-      ? 'Native-Engine nicht verbunden – kein Ton. Starte mit: npm run start (Projektroot).'
-      : undefined;
-  const connectionStatusText = connection === 'online' && state?.nativeTransport === true
-    ? 'online'
-    : connection === 'online'
-      ? 'no audio'
-      : connection;
-  const canRenderConnectionLogsPortal = showConnectionLogs
-    && connectionLogsPortalLayout
-    && typeof document !== 'undefined';
-  const connectionLogsTerminalMaxHeight = Math.max(
-    88,
-    Number(connectionLogsPortalLayout?.maxHeight ?? 210) - 48,
-  );
-  const connectionLogsTerminalHeight = Math.max(
-    72,
-    Math.min(96, connectionLogsTerminalMaxHeight),
-  );
   const renderConnectionStatusWithLogs = () => (
-    <span className="status-terminal-wrap" ref={connectionStatusLogsDropdownRef}>
-      <span className={`status status-badge ${connectionStatusVariant}`} title={connectionStatusTitle}>
-        {connectionStatusText}
-        <span className="status-port" title={`Engine: ${enginePort}`}>:{enginePort}</span>
-        <a
-          href={`http://127.0.0.1:${enginePort}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="status-open-icon"
-          title="Engine in neuem Tab öffnen"
-          aria-label="Engine in neuem Tab öffnen"
-        >
-          <ExternalLink size={12} aria-hidden="true" />
-        </a>
-      </span>
-      <div className={`status-log-dropdown ${showConnectionLogs ? 'open' : ''}`}>
-        <button
-          type="button"
-          ref={connectionStatusLogsTriggerRef}
-          className="status-log-trigger"
-          onClick={() => {
-            updateConnectionLogsPortalLayout();
-            setShowConnectionLogs((prev) => !prev);
-          }}
-          aria-expanded={showConnectionLogs}
-          aria-haspopup="dialog"
-          aria-label={showConnectionLogs ? 'Live-Logs schließen' : 'Live-Logs öffnen'}
-          title="Live-Logs"
-        >
-          logs
-          <ChevronRight className="status-log-trigger-icon" size={12} aria-hidden="true" />
-        </button>
-      </div>
-      {canRenderConnectionLogsPortal
-        ? createPortal(
-            <div
-              ref={connectionStatusLogsPanelRef}
-              className="status-log-panel"
-              style={{
-                position: 'fixed',
-                left: connectionLogsPortalLayout.left,
-                top: connectionLogsPortalLayout.top,
-                width: connectionLogsPortalLayout.width,
-                maxHeight: connectionLogsPortalLayout.maxHeight,
-                right: 'auto',
-              }}
-              role="dialog"
-              aria-label="Engine Live-Logs"
-            >
-              <div className="status-log-panel-header">
-                <span className="status-log-panel-title">Live Logs</span>
-                <span className="status-log-panel-meta">{connectionLogs.length} lines</span>
-                <button
-                  type="button"
-                  className="status-log-panel-clear"
-                  onClick={() => setConnectionLogs([])}
-                >
-                  clear
-                </button>
-              </div>
-              <div
-                ref={connectionStatusLogsViewportRef}
-                className="status-log-terminal"
-                style={{
-                  height: connectionLogsTerminalHeight,
-                  maxHeight: connectionLogsTerminalHeight,
-                }}
-                role="log"
-                aria-live="polite"
-                aria-relevant="additions text"
-              >
-                {connectionLogs.length === 0 ? (
-                  <div className="status-log-empty">Noch keine Logs. Warte auf Engine-Events…</div>
-                ) : (
-                  connectionLogs.map((entry) => (
-                    <div key={entry.id} className={`status-log-line level-${entry.level}`}>
-                      <span className="status-log-time">{formatLiveEngineLogTime(entry.ts)}</span>
-                      <span className="status-log-text">{entry.text}</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>,
-            document.body,
-          )
-        : null}
-    </span>
+    <ConnectionStatusLogs
+      connection={connection}
+      enginePort={String(enginePort)}
+      dawEngineReady={dawEngineReady}
+      nativeTransport={state?.nativeTransport === true}
+      connectionLogs={connectionLogs}
+      setConnectionLogs={setConnectionLogs}
+      appendLogEntry={appendConnectionLogEntry}
+    />
   );
 
   const renderInspectorTracktionEqCurvePanel = ({ mode = 'easy', showBandButtons = true } = {}) => {

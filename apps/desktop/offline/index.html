@@ -82,12 +82,11 @@
     <p>Socket: <code id="socket-path">—</code></p>
     <div class="error" id="error-box"></div>
     <div class="actions">
-      <button type="button" id="open-diagnostics">Diagnostics</button>
       <button type="button" id="retry-native">Retry native-engine</button>
       <button type="button" class="secondary" id="open-dashboard">Open dashboard</button>
     </div>
     <p class="hint">
-      <strong>⌘⇧D</strong> opens diagnostics. Shell never fakes DAW state.
+      Logs and desktop diagnostics live in the dashboard <strong>logs</strong> panel (top bar). Shell never fakes DAW state.
     </p>
   </div>
   <script>
@@ -149,10 +148,6 @@
       }
     }
 
-    document.getElementById('open-diagnostics').addEventListener('click', () => {
-      window.location.href = 'diagnostics.html';
-    });
-
     document.getElementById('retry-native').addEventListener('click', async () => {
       if (!window.__TAURI__) return;
       const { invoke } = window.__TAURI__.core;
@@ -167,13 +162,6 @@
 
     document.getElementById('open-dashboard').addEventListener('click', () => {
       window.location.replace(DASHBOARD_URL);
-    });
-
-    document.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'd') {
-        e.preventDefault();
-        window.location.href = 'diagnostics.html';
-      }
     });
 
     if (window.__TAURI__) {
