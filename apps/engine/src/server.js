@@ -1818,6 +1818,8 @@ const LIVE_RECORDING_SOURCE_PATH = '__live_recording__';
  * In-flight `mergeNativeClipsIntoPlaylist` calls must abort if the epoch changed while awaiting
  * `edit:get-audio-clips`, or they can re-append stale native clips after a delete/move. */
 let nativeArrangementEpoch = 0;
+/** Audio clips removed via native delete; used to restore stable clip ids after edit.undo. */
+const pendingNativeClipRestore = new Map();
 let nativeTickEstimator = {
   hasLast: false,
   lastMs: 0,
@@ -2134,7 +2136,7 @@ function normalizePluginParameters(parameters) {
   return normalized;
 }
 
-async function restoreNativeVstNodes({ resetEdit = false } = {}) {
+async function restoreNativeVstNodes({ resetEdit = false, skipNativeProjectReimport = false } = {}) {
   if (!nativeTransportActive) {
     return { restored: 0, failed: 0, errors: [] };
   }
@@ -2265,7 +2267,7 @@ async function restoreNativeVstNodes({ resetEdit = false } = {}) {
     }
   }
 
-  if (resetEdit) {
+  if (resetEdit && !skipNativeProjectReimport) {
     if (nativeTransportActive && nativeProjectSidecarEnabled) {
       try {
         const importPayload = buildNativeImportFromProject(state.project);
@@ -2808,14 +2810,28 @@ async function mergeNativeClipsIntoPlaylist() {
       continue;
     }
     const name = isNonEmptyString(c.name) ? c.name.trim() : path.basename(sourcePath, path.extname(sourcePath)) || path.basename(sourcePath);
-    track.clips.push({
-      id: makeId('clip'),
-      source_path: sourcePath,
-      start: startBars,
-      length: lengthBars,
-      source_name: name,
-      type: 'audio',
-    });
+    const pendingRestore = pendingNativeClipRestore.get(sourcePath);
+    if (pendingRestore && Math.abs(Number(pendingRestore.start) - startBars) < 0.5) {
+      track.clips.push({
+        ...pendingRestore,
+        id: pendingRestore.id,
+        source_path: sourcePath,
+        source_name: pendingRestore.source_name || pendingRestore.sourceName || name,
+        start: startBars,
+        length: lengthBars,
+        type: 'audio',
+      });
+      pendingNativeClipRestore.delete(sourcePath);
+    } else {
+      track.clips.push({
+        id: makeId('clip'),
+        source_path: sourcePath,
+        start: startBars,
+        length: lengthBars,
+        source_name: name,
+        type: 'audio',
+      });
+    }
     sortClips(track);
     merged += 1;
     console.log(`[thestuu-engine] mergeNativeClipsIntoPlaylist: added clip on track ${trackId} "${name}" (${lengthBars.toFixed(2)} bars)`);
@@ -2877,6 +2893,18 @@ function findClip(track, clipId) {
     return { clip: null, index: -1 };
   }
   return { clip: track.clips[index], index };
+}
+
+function findClipInProject(clipId) {
+  ensureProjectArrays();
+  const normalizedId = String(clipId).trim();
+  for (const track of state.project.playlist) {
+    const found = findClip(track, normalizedId);
+    if (found.clip) {
+      return { track, trackId: Number(track.track_id), ...found };
+    }
+  }
+  return { track: null, trackId: null, clip: null, index: -1 };
 }
 
 function sortClips(track) {
@@ -3221,6 +3249,80 @@ async function importClipFile(payload = {}) {
     }
   }
 
+  const sidecarMeta = {
+    clipId,
+    source_name: sourceName,
+    source_format: sourceFormat,
+    ...(sourceMime ? { source_mime: sourceMime } : {}),
+    ...(sourceSizeBytes !== null ? { source_size_bytes: sourceSizeBytes } : {}),
+    ...(clipType === 'audio' && sourceDurationSeconds !== null ? { source_duration_seconds: sourceDurationSeconds } : {}),
+    ...(clipType === 'audio' && waveformPeaks.length > 0 ? { waveform_peaks: waveformPeaks } : {}),
+    ...(clipType === 'audio' ? { fade_in: 0, fade_out: 0, fade_in_curve: 'linear', fade_out_curve: 'linear', gain: 1 } : {}),
+    ...(clipType === 'audio' ? { trim_start_seconds: trimStartSeconds } : {}),
+  };
+
+  if (nativeClipOpsEnabled && clipType === 'audio') {
+    assertNativeEngineForDawMutation();
+    if (!sourcePath) {
+      throw new Error('Audio clip import requires source_path when STUU_NATIVE_CLIP_OPS=1');
+    }
+    const pathToSend = path.isAbsolute(sourcePath)
+      ? await fs.realpath(sourcePath).catch(() => sourcePath)
+      : sourcePath;
+    const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
+    const start_seconds = Number(((Number(start) * BEATS_PER_BAR * 60) / bpm).toFixed(6));
+    const length_seconds = Number(((Number(length) * BEATS_PER_BAR * 60) / bpm).toFixed(6));
+    if (!Number.isFinite(start_seconds) || start_seconds < 0 || !Number.isFinite(length_seconds) || length_seconds <= 0) {
+      throw new Error('invalid clip start/length for native import');
+    }
+    const nativePayload = {
+      track_id: trackId,
+      source_path: pathToSend,
+      start,
+      length,
+      start_seconds,
+      length_seconds,
+      fade_in: 0,
+      fade_out: 0,
+      fade_in_curve: 'linear',
+      fade_out_curve: 'linear',
+      type: clipType,
+    };
+    if (trimStartSeconds > 0) {
+      nativePayload.source_offset_seconds = trimStartSeconds;
+    }
+    await requestNativeTransport('clip:import-file', nativePayload, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
+    await mergeNativeClipsIntoPlaylist();
+    let matched = findAudioClipOnTrackBySource(trackId, pathToSend, start);
+    if (!matched) {
+      await reconcilePlaylistAudioClipsFromNative();
+      matched = findAudioClipOnTrackBySource(trackId, pathToSend, start);
+    }
+    if (!matched) {
+      throw new Error('native clip import succeeded but clip not found in playlist cache after reconcile');
+    }
+    attachAudioClipSidecarMetadata(matched, { ...sidecarMeta, source_path: getPlaylistClipSourcePath(matched) || pathToSend });
+    matched.type = 'audio';
+    if (sourcePath && !getPlaylistClipSourcePath(matched)) {
+      matched.source_path = sourcePath;
+    }
+    sortClips(track);
+    console.log('[SERVER_IMPORT_NATIVE_FIRST]', {
+      trackId,
+      clipId: matched.id,
+      start: matched.start,
+      length: matched.length,
+    });
+    return {
+      clipId: matched.id,
+      trackId,
+      type: clipType,
+      source_name: sourceName,
+      source_format: sourceFormat,
+      source_path: pathToSend,
+    };
+  }
+
   track.clips = Array.isArray(track.clips) ? track.clips : [];
   const newClip = {
     id: clipId,
@@ -3239,30 +3341,17 @@ async function importClipFile(payload = {}) {
   };
   track.clips.push(newClip);
   sortClips(track);
-  console.log('[SERVER_IMPORT_CREATED_CLIP]', {
-    trackId,
-    newClip,
-    allClipsOnTrack: track.clips.map((c) => ({
-      id: c.id,
-      start: c.start,
-      length: c.length,
-      trim_start_seconds: c.trim_start_seconds,
-    })),
-  });
 
   let nativeImportError = null;
-  if (nativeTransportActive && sourcePath) {
+  if (nativeTransportActive && sourcePath && clipType === 'audio') {
     try {
       const pathToSend = path.isAbsolute(sourcePath)
         ? await fs.realpath(sourcePath).catch(() => sourcePath)
         : sourcePath;
       const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
-      // Same conversion as sync: start/length in bars → start_seconds/length_seconds (all formats).
       const start_seconds = Number(((Number(start) * BEATS_PER_BAR * 60) / bpm).toFixed(6));
       const length_seconds = Number(((Number(length) * BEATS_PER_BAR * 60) / bpm).toFixed(6));
-      if (!Number.isFinite(start_seconds) || start_seconds < 0 || !Number.isFinite(length_seconds) || length_seconds <= 0) {
-        console.warn('[thestuu-engine] native clip import skipped: invalid start/length', { start, length, start_seconds, length_seconds });
-      } else {
+      if (Number.isFinite(start_seconds) && start_seconds >= 0 && Number.isFinite(length_seconds) && length_seconds > 0) {
         const nativePayload = {
           track_id: trackId,
           source_path: pathToSend,
@@ -3279,20 +3368,12 @@ async function importClipFile(payload = {}) {
         if (trimStartSeconds > 0) {
           nativePayload.source_offset_seconds = trimStartSeconds;
         }
-        await requestNativeTransport('clip:import-file', nativePayload);
+        await requestNativeTransport('clip:import-file', nativePayload, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
+        await reconcileNativeClipState({ mergeNativeFirst: false });
       }
     } catch (error) {
       nativeImportError = error instanceof Error ? error.message : String(error);
       console.warn('[thestuu-engine] native clip import failed:', nativeImportError);
-    }
-  }
-
-  if (nativeTransportActive && !nativeImportError) {
-    /** Do not mergeNative before clear — stale native clips duplicate playlist rows after split/right-tail import. */
-    await reconcileNativeClipState({ mergeNativeFirst: false });
-    const syncErrors = state.nativeClipSyncSummary?.lastErrors ?? [];
-    if (syncErrors.length > 0) {
-      console.warn('[thestuu-engine] native clip sync after import:', syncErrors.join('; '));
     }
   }
 
@@ -3315,6 +3396,118 @@ function getPlaylistClipSourcePath(clip) {
   return isNonEmptyString(raw) ? raw.trim() : '';
 }
 
+function isNativeFirstAudioClip(clip) {
+  return nativeClipOpsEnabled && normalizeClipType(clip?.type) === 'audio';
+}
+
+/** Compute resize targets without mutating playlist clip (native-first). */
+function computeResizeClipValues(clip, payload) {
+  const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
+  const q = resolveClipQuantizeStep(payload);
+  let nextStart = Number(clip.start) || 0;
+  if (Object.prototype.hasOwnProperty.call(payload, 'start')) {
+    const nextStartRaw = Number(payload.start);
+    if (Number.isFinite(nextStartRaw)) {
+      nextStart = Math.max(0, roundToGrid(nextStartRaw, q));
+    }
+  }
+  let trimStartSeconds = clipHasExplicitTrimStart(clip)
+    ? Math.max(0, Number(clip.trim_start_seconds) || 0)
+    : 0;
+  if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
+    || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
+    const rawTrim = payload.trim_start_seconds ?? payload.trimStartSeconds;
+    const tv = Number(rawTrim);
+    if (Number.isFinite(tv) && tv >= 0) {
+      trimStartSeconds = Number(tv.toFixed(6));
+    }
+  }
+  let nextLength = Math.max(q, roundToGrid(Number(payload.length), q));
+  const sourceDur = Number(clip.source_duration_seconds);
+  if (Number.isFinite(sourceDur) && sourceDur > 0 && (clipHasExplicitTrimStart(clip) || trimStartSeconds > 0)) {
+    const trimS = Math.max(0, trimStartSeconds);
+    const maxLenSec = Math.max((q * BEATS_PER_BAR * 60) / bpm, sourceDur - trimS);
+    const maxLenBars = (maxLenSec * bpm) / (60 * BEATS_PER_BAR);
+    nextLength = Math.min(nextLength, Math.max(q, roundToGrid(maxLenBars, q)));
+  }
+  return { nextStart, nextLength, trimStartSeconds, q, bpm };
+}
+
+function findAudioClipOnTrackBySource(trackId, sourcePath, startBars, toleranceBars = 0.5) {
+  const track = getTrack(trackId);
+  if (!track || !Array.isArray(track.clips)) {
+    return null;
+  }
+  const normalizedPreferred = path.normalize(sourcePath);
+  const preferredBase = path.basename(sourcePath);
+  let best = null;
+  let bestDelta = Infinity;
+  for (const clip of track.clips) {
+    if (normalizeClipType(clip?.type) !== 'audio') {
+      continue;
+    }
+    const clipPath = getPlaylistClipSourcePath(clip);
+    const pathMatches = clipPath === sourcePath
+      || (clipPath && path.normalize(clipPath) === normalizedPreferred)
+      || (clipPath && path.basename(clipPath) === preferredBase);
+    if (!pathMatches) {
+      continue;
+    }
+    const delta = Math.abs(Number(clip.start) - startBars);
+    if (delta < bestDelta && delta < toleranceBars) {
+      best = clip;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
+/** Attach JSON sidecar fields after native confirmed arrangement (import/UI metadata). */
+function attachAudioClipSidecarMetadata(clip, meta) {
+  if (!clip || !meta) {
+    return;
+  }
+  if (isNonEmptyString(meta.clipId)) {
+    clip.id = meta.clipId.trim();
+  }
+  if (meta.source_name) {
+    clip.source_name = meta.source_name;
+  }
+  if (meta.source_format) {
+    clip.source_format = meta.source_format;
+  }
+  if (meta.source_mime) {
+    clip.source_mime = meta.source_mime;
+  }
+  if (meta.source_size_bytes !== null && meta.source_size_bytes !== undefined) {
+    clip.source_size_bytes = meta.source_size_bytes;
+  }
+  if (meta.source_duration_seconds !== null && meta.source_duration_seconds !== undefined) {
+    clip.source_duration_seconds = meta.source_duration_seconds;
+  }
+  if (Array.isArray(meta.waveform_peaks) && meta.waveform_peaks.length > 0) {
+    clip.waveform_peaks = meta.waveform_peaks;
+  }
+  if (meta.trim_start_seconds !== undefined) {
+    clip.trim_start_seconds = meta.trim_start_seconds;
+  }
+  if (meta.fade_in !== undefined) {
+    clip.fade_in = meta.fade_in;
+  }
+  if (meta.fade_out !== undefined) {
+    clip.fade_out = meta.fade_out;
+  }
+  if (meta.fade_in_curve) {
+    clip.fade_in_curve = meta.fade_in_curve;
+  }
+  if (meta.fade_out_curve) {
+    clip.fade_out_curve = meta.fade_out_curve;
+  }
+  if (meta.gain !== undefined) {
+    clip.gain = meta.gain;
+  }
+}
+
 /**
  * Refresh audio clip start/length/track in the playlist cache from native edit:get-audio-clips.
  * Does not clear/reimport the native edit.
@@ -3323,7 +3516,7 @@ async function reconcilePlaylistAudioClipsFromNative() {
   if (!nativeTransportActive) {
     return;
   }
-  const response = await requestNativeTransport(NATIVE_COMMANDS.EDIT_GET_AUDIO_CLIPS);
+  const response = await requestNativeTransport(NATIVE_COMMANDS.EDIT_GET_AUDIO_CLIPS, {}, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
   const nativeClips = Array.isArray(response?.clips) ? response.clips : [];
   const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
   ensureProjectArrays();
@@ -3413,6 +3606,23 @@ function buildPlaylistTrackLayoutPayload() {
     .filter((row) => Number.isInteger(row.track_id) && row.track_id > 0);
 }
 
+/** Desired playlist order for native track.sync-layout (does not reindex track_ids). */
+function buildReorderedTrackLayoutPayload(trackId, toIndex) {
+  ensureProjectArrays();
+  const sorted = [...state.project.playlist].sort((a, b) => Number(a.track_id) - Number(b.track_id));
+  const sourceIndex = sorted.findIndex((track) => Number(track.track_id) === Number(trackId));
+  if (sourceIndex === -1) {
+    throw new Error(`track ${trackId} not found`);
+  }
+  const item = sorted.splice(sourceIndex, 1)[0];
+  const clampedIndex = Math.max(0, Math.min(toIndex, sorted.length));
+  sorted.splice(clampedIndex, 0, item);
+  return sorted.map((track) => ({
+    track_id: Number(track.track_id),
+    name: isNonEmptyString(track.name) ? track.name.trim().slice(0, TRACK_NAME_LIMIT) : `Track ${track.track_id}`,
+  }));
+}
+
 /**
  * Merge native track.list into playlist/mixer (keeps pattern clips + A-metadata per track_id).
  */
@@ -3446,25 +3656,42 @@ async function reconcileTracksFromNative() {
 
   const nextPlaylist = [];
   const nextMixer = [];
+  const usedPlaylistIds = new Set();
   for (const row of nativeTracks) {
     const trackId = Number(row.track_id ?? row.trackId ?? row.id);
     if (!Number.isInteger(trackId) || trackId < 1) {
       continue;
     }
     const name = isNonEmptyString(row.name) ? row.name.trim().slice(0, TRACK_NAME_LIMIT) : `Track ${trackId}`;
-    const previous = byId.get(trackId);
+    let previous = byId.get(trackId);
+    if (nativeTrackOpsEnabled) {
+      const nameMatch = oldPlaylist.find((track) => {
+        const tid = Number(track?.track_id);
+        if (!Number.isInteger(tid) || usedPlaylistIds.has(tid)) {
+          return false;
+        }
+        const trackName = isNonEmptyString(track.name) ? track.name.trim() : '';
+        return trackName.length > 0 && trackName === name;
+      });
+      if (nameMatch) {
+        previous = nameMatch;
+      }
+    }
     if (previous) {
+      usedPlaylistIds.add(Number(previous.track_id));
       nextPlaylist.push({
         ...previous,
         track_id: trackId,
         name,
         clips: Array.isArray(previous.clips) ? previous.clips : [],
       });
+      const previousMixer = mixerById.get(Number(previous.track_id)) || mixerById.get(trackId);
+      nextMixer.push(previousMixer ? { ...previousMixer, track_id: trackId } : createDefaultMixerEntry(trackId));
     } else {
       nextPlaylist.push(createDefaultTrackEntry(trackId, name));
+      const previousMixer = mixerById.get(trackId);
+      nextMixer.push(previousMixer ? { ...previousMixer, track_id: trackId } : createDefaultMixerEntry(trackId));
     }
-    const previousMixer = mixerById.get(trackId);
-    nextMixer.push(previousMixer ? { ...previousMixer, track_id: trackId } : createDefaultMixerEntry(trackId));
   }
 
   state.project.playlist = nextPlaylist;
@@ -3547,16 +3774,23 @@ async function reconcileNativeClipState(options = {}) {
 }
 
 async function moveClip(payload = {}) {
-  const sourceTrackId = assertTrackId(payload);
   const clipId = assertClipId(payload);
-  const sourceTrack = getTrack(sourceTrackId);
+  const payloadTrackId = assertTrackId(payload);
+  let sourceTrackId = payloadTrackId;
+  let sourceTrack = getTrack(sourceTrackId);
+  let { clip, index } = sourceTrack ? findClip(sourceTrack, clipId) : { clip: null, index: -1 };
+  if (!clip) {
+    const located = findClipInProject(clipId);
+    if (!located.clip) {
+      throw new Error(`clip "${clipId}" not found`);
+    }
+    sourceTrack = located.track;
+    sourceTrackId = located.trackId;
+    clip = located.clip;
+    index = located.index;
+  }
   if (!sourceTrack) {
     throw new Error(`track "${sourceTrackId}" not found`);
-  }
-
-  const { clip, index } = findClip(sourceTrack, clipId);
-  if (!clip || index === -1) {
-    throw new Error(`clip "${clipId}" not found on track ${sourceTrackId}`);
   }
 
   const nextStartRaw = Number(payload.start);
@@ -3626,83 +3860,61 @@ async function moveClip(payload = {}) {
 }
 
 async function resizeClip(payload = {}) {
-  const trackId = assertTrackId(payload);
   const clipId = assertClipId(payload);
   const nextLengthRaw = Number(payload.length);
   if (!Number.isFinite(nextLengthRaw)) {
     throw new Error('length must be numeric');
   }
 
-  const track = getTrack(trackId);
-  if (!track) {
-    throw new Error(`track "${trackId}" not found`);
+  const located = findClipInProject(clipId);
+  if (!located.clip) {
+    throw new Error(`clip "${clipId}" not found`);
   }
-  const { clip } = findClip(track, clipId);
-  if (!clip) {
-    throw new Error(`clip "${clipId}" not found on track ${trackId}`);
-  }
+  const trackId = located.trackId;
+  const track = located.track;
+  const { clip } = located;
 
-  const bpm = Math.max(20, Math.min(300, Number(state.project.bpm) || 120));
-  const q = resolveClipQuantizeStep(payload);
+  const computed = computeResizeClipValues(clip, payload);
 
-  if (Object.prototype.hasOwnProperty.call(payload, 'start')) {
-    const nextStartRaw = Number(payload.start);
-    if (Number.isFinite(nextStartRaw)) {
-      clip.start = Math.max(0, roundToGrid(nextStartRaw, q));
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
-    || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
-    const rawTrim = payload.trim_start_seconds ?? payload.trimStartSeconds;
-    const tv = Number(rawTrim);
-    if (Number.isFinite(tv) && tv >= 0) {
-      clip.trim_start_seconds = Number(tv.toFixed(6));
-    }
-  }
-
-  clip.length = Math.max(q, roundToGrid(nextLengthRaw, q));
-
-  const sourceDur = Number(clip.source_duration_seconds);
-  if (clipHasExplicitTrimStart(clip) && Number.isFinite(sourceDur) && sourceDur > 0) {
-    const trimS = Math.max(0, Number(clip.trim_start_seconds) || 0);
-    const maxLenSec = Math.max((q * BEATS_PER_BAR * 60) / bpm, sourceDur - trimS);
-    const maxLenBars = (maxLenSec * bpm) / (60 * BEATS_PER_BAR);
-    clip.length = Math.min(clip.length, Math.max(q, roundToGrid(maxLenBars, q)));
-  }
-
-  if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
+  if (isNativeFirstAudioClip(clip)) {
+    assertNativeEngineForDawMutation();
     const sourcePath = getPlaylistClipSourcePath(clip);
-    if (sourcePath && sourcePath !== LIVE_RECORDING_SOURCE_PATH) {
-      await requestNativeTransport(NATIVE_COMMANDS.CLIP_RESIZE, {
-        track_id: trackId,
-        source_path: sourcePath,
-        start: Number(clip.start) || 0,
-        length: clip.length,
-        old_start: Number(payload.start) !== undefined ? undefined : Number(clip.start) || 0,
-      }, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
-      await reconcilePlaylistAudioClipsFromNative();
-      emitState();
-      const out = {
-        clipId,
-        trackId,
-        start: Number(clip.start) || 0,
-        length: Number(clip.length) || q,
-      };
-      if (clipHasExplicitTrimStart(clip)) {
-        out.trim_start_seconds = Math.max(0, Number(clip.trim_start_seconds) || 0);
-      }
-      return out;
-    }
-    if (normalizeClipType(clip?.type) === 'audio') {
-      assertNativeEngineForDawMutation();
+    if (!sourcePath || sourcePath === LIVE_RECORDING_SOURCE_PATH) {
       throw new Error('Audio clip resize requires source_path for native clip.resize');
     }
+    await requestNativeTransport(NATIVE_COMMANDS.CLIP_RESIZE, {
+      track_id: trackId,
+      source_path: sourcePath,
+      start: computed.nextStart,
+      length: computed.nextLength,
+      old_start: -1,
+    }, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
+    if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
+      || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
+      clip.trim_start_seconds = computed.trimStartSeconds;
+    }
+    await reconcilePlaylistAudioClipsFromNative();
+    emitState();
+    const { clip: refreshed } = findClip(track, clipId);
+    const out = {
+      clipId,
+      trackId,
+      start: Number(refreshed?.start) || computed.nextStart,
+      length: Number(refreshed?.length) || computed.nextLength,
+    };
+    if (clipHasExplicitTrimStart(refreshed) || Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
+      || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
+      out.trim_start_seconds = computed.trimStartSeconds;
+    }
+    return out;
   }
 
-  if (nativeClipOpsEnabled && normalizeClipType(clip?.type) === 'audio') {
-    assertNativeEngineForDawMutation();
-    throw new Error('Audio clip resize requires native clip.resize');
+  const { q } = computed;
+  clip.start = computed.nextStart;
+  clip.length = computed.nextLength;
+  if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
+    || Object.prototype.hasOwnProperty.call(payload, 'trimStartSeconds')) {
+    clip.trim_start_seconds = computed.trimStartSeconds;
   }
 
   assertLegacyJsonArrangementAllowed('clip:resize');
@@ -3761,9 +3973,10 @@ async function setClipGain(payload = {}) {
     throw new Error('gain is required');
   }
   const rawGain = payload.gain ?? payload.clip_gain ?? payload.clipGain;
-  clip.gain = normalizeClipGainValue(rawGain);
-  // Per-clip gain is persisted in project JSON; native Tracktion clip gain is not wired yet.
-  return { clipId, trackId, gain: clip.gain };
+  const gain = normalizeClipGainValue(rawGain);
+  // JSON-only sidecar: native clip gain IPC not implemented yet (see README native-daw fields).
+  clip.gain = gain;
+  return { clipId, trackId, gain };
 }
 
 async function setClipFade(payload = {}) {
@@ -3805,7 +4018,10 @@ async function setClipFade(payload = {}) {
   if (payload.fade_out_curve !== undefined || payload.fadeOutCurve !== undefined) {
     clip.fade_out_curve = normalizeFadeCurve(payload.fade_out_curve ?? payload.fadeOutCurve);
   }
-  await reconcileNativeClipState({ mergeNativeFirst: false });
+  // Fade curves are JSON sidecar until native clip.setFade is wired; do not full-sync arrangement.
+  if (!nativeClipOpsEnabled) {
+    await reconcileNativeClipState({ mergeNativeFirst: false });
+  }
   return { clipId, trackId };
 }
 
@@ -3848,6 +4064,7 @@ function setClipProperties(payload = {}) {
     }
   }
 
+  // name/color are JSON UI metadata only (not in native export yet).
   return {
     clipId,
     trackId,
@@ -3857,17 +4074,14 @@ function setClipProperties(payload = {}) {
 }
 
 async function deleteClip(payload = {}) {
-  const trackId = assertTrackId(payload);
   const clipId = assertClipId(payload);
-  const track = getTrack(trackId);
-  if (!track) {
-    throw new Error(`track "${trackId}" not found`);
+  const located = findClipInProject(clipId);
+  if (!located.clip) {
+    throw new Error(`clip "${clipId}" not found`);
   }
-
-  const { clip } = findClip(track, clipId);
-  if (!clip) {
-    throw new Error(`clip "${clipId}" not found on track ${trackId}`);
-  }
+  const trackId = located.trackId;
+  const track = located.track;
+  const { clip } = located;
 
   if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
     const sourcePath = getPlaylistClipSourcePath(clip);
@@ -3875,9 +4089,14 @@ async function deleteClip(payload = {}) {
       await requestNativeTransport(NATIVE_COMMANDS.CLIP_DELETE, {
         track_id: trackId,
         source_path: sourcePath,
-        old_start: Number(clip.start) || 0,
+        old_start: -1,
       }, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
-      track.clips = track.clips.filter((entry) => String(entry.id).trim() !== clipId);
+      pendingNativeClipRestore.set(sourcePath, {
+        ...clip,
+        id: clipId,
+        source_path: sourcePath,
+        type: 'audio',
+      });
       await reconcilePlaylistAudioClipsFromNative();
       emitState();
       return { clipId, trackId };
@@ -4232,7 +4451,7 @@ async function saveProject(targetPath, projectData) {
   return normalizedProject;
 }
 
-async function applyProjectState(projectData, { resetEdit = true, resetHistory = false } = {}) {
+async function applyProjectState(projectData, { resetEdit = true, resetHistory = false, skipNativeProjectReimport = false } = {}) {
   const previousSnapshot = snapshotProjectForHistory(state.project);
   const normalizedProject = normalizeProject(projectData);
   const validation = validateProject(normalizedProject);
@@ -4248,7 +4467,10 @@ async function applyProjectState(projectData, { resetEdit = true, resetHistory =
     if (nativeTransportActive) {
       await requestNativeTransport('transport.stop');
       await requestNativeTransport('transport.set_bpm', { bpm: state.project.bpm });
-      restoreResult = await restoreNativeVstNodes({ resetEdit: Boolean(resetEdit) });
+      restoreResult = await restoreNativeVstNodes({
+        resetEdit: Boolean(resetEdit),
+        skipNativeProjectReimport: Boolean(skipNativeProjectReimport),
+      });
     } else {
       state.playing = false;
       resetTransportClock();
@@ -4729,6 +4951,14 @@ io.on('connection', (socket) => {
     projectFile: state.selectedProjectFile,
     nativeTransport: nativeTransportActive,
     nativeSocketPath: nativeTransportEnabled ? nativeSocketPath : null,
+    nativeDawFlags: {
+      clipOps: nativeClipOpsEnabled,
+      trackOps: nativeTrackOpsEnabled,
+      editUndo: nativeEditUndoEnabled,
+      projectSidecar: nativeProjectSidecarEnabled,
+      legacySync: nativeLegacySyncEnabled,
+      transport: nativeTransportEnabled,
+    },
   });
   socket.emit('engine:logs:init', {
     entries: engineLogBuffer,
@@ -4984,6 +5214,10 @@ io.on('connection', (socket) => {
 
     const clampedVolume = Math.max(0, Math.min(1.2, volume));
     try {
+      if (isNativeTransportRequired() && !nativeTransportActive) {
+        respond(callback, { ok: false, error: 'Native engine is not connected.' });
+        return;
+      }
       if (trackId === 0) {
         ensureProjectArrays();
         if (nativeTransportActive) {
@@ -5148,15 +5382,11 @@ io.on('connection', (socket) => {
         if (!Number.isInteger(nextId) || nextId < 1) {
           throw new Error('native track.create did not return track_id');
         }
-        const existing = getTrack(nextId);
-        if (!existing) {
-          const nextTrack = createDefaultTrackEntry(nextId, name || `Track ${nextId}`);
-          nextTrack.chain_collapsed = chainCollapsed;
-          state.project.playlist.push(nextTrack);
-          state.project.mixer.push(createDefaultMixerEntry(nextId));
-          sortProjectTrackCollections();
-        }
         await reconcileTracksFromNative();
+        const createdTrack = getTrack(nextId);
+        if (createdTrack) {
+          createdTrack.chain_collapsed = chainCollapsed;
+        }
         emitState();
         respond(callback, { ok: true, trackId: nextId, nativeTrackOps: true });
         return;
@@ -5189,6 +5419,9 @@ io.on('connection', (socket) => {
 
   socket.on('track:insert', async (payload = {}, callback = () => {}) => {
     try {
+      if (nativeTrackOpsEnabled) {
+        assertLegacyJsonArrangementAllowed('track:insert');
+      }
       ensureProjectArrays();
       const highestTrackId = state.project.playlist.reduce((maxId, track) => {
         const trackId = Number(track?.track_id);
@@ -5232,12 +5465,16 @@ io.on('connection', (socket) => {
         respond(callback, { ok: false, error: 'trackId and toIndex (0-based) are required' });
         return;
       }
-      reorderTrackInPlaylist(trackId, toIndex);
       if (nativeTrackOpsEnabled && nativeTransportActive) {
-        const trackIds = buildPlaylistTrackLayoutPayload().map((row) => row.track_id);
+        const tracks = buildReorderedTrackLayoutPayload(trackId, toIndex);
+        const trackIds = tracks.map((row) => row.track_id);
         await requestNativeTransport(NATIVE_COMMANDS.TRACK_REORDER, { track_ids: trackIds });
         await reconcileTracksFromNative();
+        emitState();
+        respond(callback, { ok: true, trackId, toIndex, nativeTrackOps: true });
+        return;
       }
+      reorderTrackInPlaylist(trackId, toIndex);
       emitState();
       respond(callback, { ok: true, trackId, toIndex });
     } catch (error) {
@@ -5262,8 +5499,10 @@ io.on('connection', (socket) => {
 
       if (nativeTrackOpsEnabled && nativeTransportActive) {
         await requestNativeTransport(NATIVE_COMMANDS.TRACK_DELETE, { track_id: trackIdRaw });
-        reindexTracksRemovingIds([trackIdRaw]);
-        await syncNativeTrackLayoutFromPlaylist();
+        await reconcileTracksFromNative();
+        if (nativeClipOpsEnabled) {
+          await reconcilePlaylistAudioClipsFromNative();
+        }
       } else {
         reindexTracksRemovingIds([trackIdRaw]);
         await safeRestoreNativeNodesAfterTrackLayoutChange();
@@ -5304,8 +5543,10 @@ io.on('connection', (socket) => {
         for (const trackId of existingRequestedTrackIds.sort((a, b) => b - a)) {
           await requestNativeTransport(NATIVE_COMMANDS.TRACK_DELETE, { track_id: trackId });
         }
-        reindexTracksRemovingIds(existingRequestedTrackIds);
-        await syncNativeTrackLayoutFromPlaylist();
+        await reconcileTracksFromNative();
+        if (nativeClipOpsEnabled) {
+          await reconcilePlaylistAudioClipsFromNative();
+        }
       } else {
         reindexTracksRemovingIds(existingRequestedTrackIds);
         await safeRestoreNativeNodesAfterTrackLayoutChange();
@@ -5324,6 +5565,9 @@ io.on('connection', (socket) => {
 
   socket.on('track:duplicate', async (payload = {}, callback = () => {}) => {
     try {
+      if (nativeTrackOpsEnabled) {
+        assertLegacyJsonArrangementAllowed('track:duplicate');
+      }
       ensureProjectArrays();
       const sourceTrackId = Number(payload.trackId ?? payload.track_id);
       if (!Number.isInteger(sourceTrackId) || sourceTrackId <= 0) {
@@ -6195,9 +6439,11 @@ io.on('connection', (socket) => {
           console.warn('[thestuu-engine] project:load native sidecar merge failed:', sidecarError instanceof Error ? sidecarError.message : String(sidecarError));
         }
       }
+      const didNativeSidecarImport = nativeProjectSidecarEnabled && nativeTransportActive;
       const restoreResult = await applyProjectState(projectForApply, {
         resetEdit: true,
         resetHistory: true,
+        skipNativeProjectReimport: didNativeSidecarImport,
       });
       if (restoreResult.failed > 0 || restoreResult.errors.length > 0) {
         console.warn('[thestuu-engine] project:load native VST restore issues:', restoreResult.errors.join(' | '));
@@ -6254,6 +6500,7 @@ io.on('connection', (socket) => {
       }
       try {
         await requestNativeTransport(NATIVE_COMMANDS.EDIT_UNDO);
+        await mergeNativeClipsIntoPlaylist();
         await reconcileFromNative({ clips: true, tracks: nativeTrackOpsEnabled, mixer: true });
         emitState();
         respond(callback, { ok: true, history: getProjectHistoryMeta(), nativeUndo: true });
@@ -6319,6 +6566,7 @@ io.on('connection', (socket) => {
       }
       try {
         await requestNativeTransport(NATIVE_COMMANDS.EDIT_REDO);
+        await mergeNativeClipsIntoPlaylist();
         await reconcileFromNative({ clips: true, tracks: nativeTrackOpsEnabled, mixer: true });
         emitState();
         respond(callback, { ok: true, history: getProjectHistoryMeta(), nativeRedo: true });

@@ -3120,7 +3120,7 @@ class DelayFallbackEditor final : public tracktion::engine::Plugin::EditorCompon
     : delay(pluginToControl),
       feedbackParam(delay.feedbackDb),
       mixParam(delay.mixProportion),
-      toneParam(delay.toneAmount) {
+      toneParam(nullptr) {  // toneAmount removed in newer Tracktion DelayPlugin
     setupHeaderLabel(titleLabel, "delayday");
     titleLabel.setFont(juce::Font(juce::FontOptions(24.0F, juce::Font::bold)));
     titleLabel.setJustificationType(juce::Justification::centred);
@@ -6244,6 +6244,12 @@ bool setPluginParameter(
   }
 }
 
+static void beginClipEditTransaction() {
+  if (gState && gState->edit) {
+    gState->edit->getUndoManager().beginNewTransaction();
+  }
+}
+
 bool importClipFile(const ClipImportRequest& request, ClipImportResult& result, std::string& error) {
   result = {};
 
@@ -6304,6 +6310,7 @@ bool importClipFile(const ClipImportRequest& request, ClipImportResult& result, 
 
   const tracktion::engine::ClipPosition position{clipRange, tracktion::core::TimeDuration::fromSeconds(fileOffsetSec)};
 
+  beginClipEditTransaction();
   auto clip = track->insertWaveClip(sourceFile.getFileNameWithoutExtension(), sourceFile, position, false);
   if (clip == nullptr) {
     error = "failed to insert clip";
@@ -6500,7 +6507,10 @@ bool getEditAudioClipsOnMessageThread(std::vector<EditClipInfo>& out, std::strin
     cv.notify_one();
   });
   std::unique_lock<std::mutex> lock(mtx);
-  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!cv.wait_for(lock, std::chrono::seconds(60), [&]() { return done.load(); })) {
+    error = "edit:get-audio-clips timed out waiting for message thread";
+    return false;
+  }
   return ok;
 }
 
@@ -6534,6 +6544,8 @@ tracktion::engine::WaveAudioClip* findWaveClipOnTrack(
   if (key.empty()) {
     return nullptr;
   }
+  tracktion::engine::WaveAudioClip* pathMatch = nullptr;
+  int pathMatchCount = 0;
   const auto& clips = track.getClips();
   for (int j = 0; j < clips.size(); ++j) {
     auto* clip = clips.getUnchecked(j);
@@ -6548,13 +6560,20 @@ tracktion::engine::WaveAudioClip* findWaveClipOnTrack(
     if (clipKey != key) {
       continue;
     }
+    pathMatch = wave;
+    pathMatchCount += 1;
     if (oldStartBars >= 0.0) {
       const double sb = clipStartBarsFromPosition(wave->getPosition());
-      if (std::fabs(sb - oldStartBars) > 0.08) {
-        continue;
+      // BPM/grid rounding between JSON cache and Tracktion edit can exceed 1/16 bar.
+      if (std::fabs(sb - oldStartBars) <= 0.5) {
+        return wave;
       }
+    } else {
+      return wave;
     }
-    return wave;
+  }
+  if (pathMatchCount == 1 && pathMatch != nullptr) {
+    return pathMatch;
   }
   return nullptr;
 }
@@ -6594,6 +6613,7 @@ bool moveAudioClipBySource(const ClipEditBySourceRequest& request, std::string& 
         tracktion::core::TimeRange(startTime, startTime + length),
         offset,
       };
+      beginClipEditTransaction();
       wave->setPosition(newPos);
       return true;
     }
@@ -6608,6 +6628,7 @@ bool moveAudioClipBySource(const ClipEditBySourceRequest& request, std::string& 
       error = "clip source file missing";
       return false;
     }
+    beginClipEditTransaction();
     wave->removeFromParent();
     const auto startTime = convertBeatsToTime(startBeats);
     const tracktion::engine::ClipPosition newPos{
@@ -6693,6 +6714,7 @@ bool resizeAudioClipBySource(const ClipEditBySourceRequest& request, std::string
       tracktion::core::TimeRange(startTime, endTime),
       pos.offset,
     };
+    beginClipEditTransaction();
     wave->setPosition(newPos);
     return true;
   } catch (const std::exception& ex) {
@@ -6754,6 +6776,7 @@ bool deleteAudioClipBySource(int32_t trackId, const std::string& sourcePath, dou
       error = "clip not found";
       return false;
     }
+    beginClipEditTransaction();
     wave->removeFromParent();
     return true;
   } catch (const std::exception& ex) {
@@ -6802,6 +6825,7 @@ bool editUndo(std::string& error) {
     return false;
   }
   try {
+    tracktion::engine::Edit::UndoTransactionInhibitor inhibitor(*gState->edit);
     auto& um = gState->edit->getUndoManager();
     if (!um.canUndo()) {
       error = "nothing to undo";
@@ -6841,7 +6865,10 @@ bool editUndoOnMessageThread(std::string& error) {
     cv.notify_one();
   });
   std::unique_lock<std::mutex> lock(mtx);
-  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!cv.wait_for(lock, std::chrono::seconds(60), [&]() { return done.load(); })) {
+    error = "edit.undo timed out waiting for message thread";
+    return false;
+  }
   return ok;
 }
 
@@ -6852,6 +6879,7 @@ bool editRedo(std::string& error) {
     return false;
   }
   try {
+    tracktion::engine::Edit::UndoTransactionInhibitor inhibitor(*gState->edit);
     auto& um = gState->edit->getUndoManager();
     if (!um.canRedo()) {
       error = "nothing to redo";
@@ -6891,7 +6919,10 @@ bool editRedoOnMessageThread(std::string& error) {
     cv.notify_one();
   });
   std::unique_lock<std::mutex> lock(mtx);
-  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  if (!cv.wait_for(lock, std::chrono::seconds(60), [&]() { return done.load(); })) {
+    error = "edit.redo timed out waiting for message thread";
+    return false;
+  }
   return ok;
 }
 
@@ -7082,11 +7113,26 @@ bool reorderAudioTracks(const std::vector<int32_t>& orderedTrackIds, std::string
       error = "track_ids length must match audio track count";
       return false;
     }
-    for (size_t destIndex = 0; destIndex < orderedTrackIds.size(); ++destIndex) {
-      const int32_t expectedId = static_cast<int32_t>(destIndex) + 1;
-      if (orderedTrackIds[destIndex] != expectedId) {
-        error = "track.reorder requires contiguous track_ids 1..N matching playlist order (use track.sync-layout)";
+    std::vector<tracktion::engine::AudioTrack*> desired;
+    desired.reserve(orderedTrackIds.size());
+    for (int32_t trackId : orderedTrackIds) {
+      if (trackId < 1 || trackId > trackCount) {
+        error = "track_id out of range in track.reorder";
         return false;
+      }
+      auto* track = getAudioTrackByIndex(trackId);
+      if (track == nullptr) {
+        error = "track not found";
+        return false;
+      }
+      desired.push_back(track);
+    }
+    beginClipEditTransaction();
+    tracktion::engine::Edit::UndoTransactionInhibitor inhibitor(*gState->edit);
+    for (auto* track : desired) {
+      if (auto* asTrack = dynamic_cast<tracktion::engine::Track*>(track)) {
+        const auto endPoint = tracktion::engine::TrackInsertPoint::getEndOfTracks(*gState->edit);
+        gState->edit->moveTrack(asTrack, endPoint);
       }
     }
     transportRebuildGraphOnly();
@@ -7272,31 +7318,9 @@ bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
   const int32_t targetPluginIndex = gState->spectrumAnalyzerTargetPluginIndex.load(std::memory_order_relaxed);
   if (targetTrackId > 0) {
     if (auto* track = getAudioTrackByIndex(targetTrackId)) {
-      if (auto* meterPlugin = track->getLevelMeterPlugin()) {
-        double sampleRate = 0.0;
-        int fftSize = 0;
-        int64_t timestamp = 0;
-        std::vector<float> freqsHz;
-        std::vector<float> postDb;
-        if (meterPlugin->getRealtimeSpectrumSnapshot(sampleRate, fftSize, timestamp, freqsHz, postDb)
-            && !freqsHz.empty() && freqsHz.size() == postDb.size()) {
-          out.available = true;
-          out.preMirrorsPost = true;
-          out.scope = targetPluginIndex >= 0
-            ? ("track:" + std::to_string(targetTrackId) + ":plugin:" + std::to_string(targetPluginIndex))
-            : ("track:" + std::to_string(targetTrackId));
-          out.channels = "mono";
-          out.sampleRate = sampleRate;
-          out.fftSize = fftSize;
-          out.minDb = -96.0;
-          out.maxDb = 6.0;
-          out.timestamp = timestamp;
-          out.freqsHz = std::move(freqsHz);
-          out.postDb = std::move(postDb);
-          out.preDb = out.postDb;
-          return true;
-        }
-      }
+      // LevelMeterPlugin no longer exposes getRealtimeSpectrumSnapshot in current Tracktion.
+      (void)track->getLevelMeterPlugin();
+      (void)targetPluginIndex;
     }
   }
 

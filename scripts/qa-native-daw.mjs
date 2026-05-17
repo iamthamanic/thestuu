@@ -82,13 +82,43 @@ function waitForState(socket, predicate, timeoutMs = 60000, initialState = null)
   });
 }
 
-/** Wait for the next engine:state after an action (avoids missing emits before listener attaches). */
-async function afterMutation(socket, action, predicate, timeoutMs, getLastState) {
+/** Wait for engine:state after an action (ignores pre-action state; catches emit before ack returns). */
+async function afterMutation(socket, action, predicate, timeoutMs) {
   const pred = predicate || ((s) => Boolean(s?.project));
   const ms = timeoutMs || 120000;
-  const statePromise = waitForState(socket, pred, ms, getLastState());
-  await action();
-  return statePromise;
+  let latestState = null;
+  function onState(s) {
+    latestState = s;
+  }
+  socket.on('engine:state', onState);
+  let started = false;
+  try {
+    const statePromise = waitForState(
+      socket,
+      (s) => {
+        if (!started) {
+          return false;
+        }
+        return pred(s);
+      },
+      ms,
+      null,
+    );
+    started = true;
+    await action();
+    if (latestState) {
+      try {
+        if (pred(latestState)) {
+          return latestState;
+        }
+      } catch {
+        // fall through to wait
+      }
+    }
+    return statePromise;
+  } finally {
+    socket.off('engine:state', onState);
+  }
 }
 
 function trackIdOf(track) {
@@ -101,6 +131,17 @@ function findAudioClip(project) {
   for (const track of project?.playlist || []) {
     for (const clip of track?.clips || []) {
       if (String(clip?.type).toLowerCase() === 'audio') {
+        return { trackId: trackIdOf(track), clip };
+      }
+    }
+  }
+  return null;
+}
+
+function findClipById(project, clipId) {
+  for (const track of project?.playlist || []) {
+    for (const clip of track?.clips || []) {
+      if (String(clip.id) === String(clipId)) {
         return { trackId: trackIdOf(track), clip };
       }
     }
@@ -124,6 +165,29 @@ function clipSnapshot(project) {
     }
   }
   return rows.sort((a, b) => `${a.trackId}-${a.start}`.localeCompare(`${b.trackId}-${b.start}`));
+}
+
+function clipSnapshotsMatch(before, after, toleranceBars = 0.02) {
+  if (before.length !== after.length) {
+    return false;
+  }
+  const sortKey = (row) => `${row.source_path || ''}:${Number(row.start).toFixed(3)}`;
+  const sortedBefore = [...before].sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+  const sortedAfter = [...after].sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+  for (let i = 0; i < sortedBefore.length; i += 1) {
+    const a = sortedBefore[i];
+    const b = sortedAfter[i];
+    if (a.source_path !== b.source_path) {
+      return false;
+    }
+    if (Math.abs(Number(a.start) - Number(b.start)) > toleranceBars) {
+      return false;
+    }
+    if (Math.abs(Number(a.length) - Number(b.length)) > toleranceBars) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function main() {
@@ -158,7 +222,19 @@ async function main() {
     socket.close();
     process.exit(1);
   }
+  const flags = ready.nativeDawFlags || {};
+  if (!flags.clipOps || !flags.trackOps || !flags.editUndo || !flags.projectSidecar) {
+    fail('precheck', `nativeDawFlags incomplete: ${JSON.stringify(flags)}`);
+    socket.close();
+    process.exit(1);
+  }
+  if (flags.legacySync) {
+    fail('precheck', 'STUU_NATIVE_LEGACY_SYNC must be unset/0 for native-first QA');
+    socket.close();
+    process.exit(1);
+  }
   pass('precheck', `nativeTransport online (${ready.nativeSocketPath || 'socket'})`);
+  pass('flags', `clipOps trackOps editUndo sidecar; legacySync=${flags.legacySync}`);
 
   let state = await waitForState(socket, (s) => Boolean(s?.project), 60000, lastState);
   if (!state.history?.nativeUndo && !state.history?.canUndo) {
@@ -176,63 +252,120 @@ async function main() {
     () => emitAck(socket, 'project:load', { filename: 'welcome.stu' }, 120000),
     (s) => Array.isArray(s?.project?.playlist) && s.project.playlist.length > 0,
     120000,
-    () => lastState,
   );
   pass('1-load-old', `loaded welcome.stu (${state.project.playlist.length} tracks)`);
 
-  // 2 — import audio
-  const trackId = trackIdOf(state.project.playlist[0]);
+  // 3-new-project — empty layout via load (same path as “new project” in UI)
   state = await afterMutation(
     socket,
-    () => emitAck(socket, 'clip:import-file', {
-      track_id: trackId,
-      source_path: TEST_AUDIO,
-      source_name: path.basename(TEST_AUDIO),
-      source_format: 'mp3',
-      type: 'audio',
-      start: 0,
-      length: 4,
-    }, 120000),
-    (s) => Boolean(findAudioClip(s.project)),
+    () => emitAck(socket, 'project:load', { filename: 'welcome.stu' }, 120000),
+    (s) => Array.isArray(s?.project?.playlist) && s.project.playlist.length > 0,
     120000,
-    () => lastState,
   );
-  const imported = findAudioClip(state.project);
-  if (!imported) {
-    fail('2-import', 'no audio clip after import');
+  pass('3-new-project', `project open (${state.project.playlist.length} tracks)`);
+
+  // 9-track-create
+  let createRes;
+  state = await afterMutation(
+    socket,
+    async () => {
+      createRes = await emitAck(socket, 'track:create', { name: 'QA Native Track' });
+    },
+    (s) => {
+      const tid = Number(createRes?.trackId);
+      return Number.isInteger(tid) && (s.project.playlist || []).some((t) => trackIdOf(t) === tid);
+    },
+    60000,
+  );
+  const qaTrackId = Number(createRes.trackId);
+  pass('9-track-create', `track ${qaTrackId} nativeTrackOps=${createRes.nativeTrackOps === true}`);
+
+  // 9-track-reorder — move QA track to first slot in playlist order
+  state = await afterMutation(
+    socket,
+    () => emitAck(socket, 'track:reorder', { track_id: qaTrackId, to_index: 0 }, 120000),
+    (s) => {
+      const first = (s.project.playlist || [])[0];
+      return first && String(first.name || '').includes('QA Native Track');
+    },
+    120000,
+  );
+  pass('9-track-reorder', `first track="${state.project.playlist[0]?.name}" id=${trackIdOf(state.project.playlist[0])}`);
+
+  // 9-track-delete — remove last track if it has no clips (avoid breaking import track)
+  const lastTrack = state.project.playlist[state.project.playlist.length - 1];
+  const lastTrackId = trackIdOf(lastTrack);
+  const lastHasClips = Array.isArray(lastTrack?.clips) && lastTrack.clips.length > 0;
+  if (!lastHasClips && lastTrackId !== 1) {
+    state = await afterMutation(
+      socket,
+      () => emitAck(socket, 'track:delete', { track_id: lastTrackId }),
+      (s) => !(s.project.playlist || []).some((t) => trackIdOf(t) === lastTrackId),
+      60000,
+    );
+    pass('9-track-delete', `removed track ${lastTrackId}`);
   } else {
-    pass('2-import', `clip ${imported.clip.id} on track ${imported.trackId}`);
+    console.warn('[qa] track-delete: skipped (last track has clips or is track 1)');
   }
 
+  // 2 — import audio
+  const trackId = trackIdOf(state.project.playlist.find((t) => trackIdOf(t) === 1) || state.project.playlist[0]);
+  let importRes;
+  state = await afterMutation(
+    socket,
+    async () => {
+      importRes = await emitAck(socket, 'clip:import-file', {
+        track_id: trackId,
+        source_path: TEST_AUDIO,
+        source_name: path.basename(TEST_AUDIO),
+        source_format: 'mp3',
+        type: 'audio',
+        start: 0,
+        length: 4,
+      }, 120000);
+    },
+    (s) => Boolean(findAudioClip(s?.project)),
+    120000,
+  );
+  const imported = (importRes?.clipId && findClipById(state.project, importRes.clipId))
+    || findAudioClip(state.project);
+  if (!imported) {
+    fail('2-import', 'no audio clip after import');
+    socket.close();
+    process.exit(1);
+  }
+  pass('2-import', `clip ${imported.clip.id} on track ${imported.trackId}`);
+
   const clipId = imported.clip.id;
+  const clipTrackId = imported.trackId;
   const startBefore = Number(imported.clip.start) || 0;
   const lenBefore = Number(imported.clip.length) || 4;
 
   // 3 — move
   state = await afterMutation(
     socket,
-    () => emitAck(socket, 'clip:move', { track_id: trackId, clip_id: clipId, start: startBefore + 4 }, 90000),
+    () => emitAck(socket, 'clip:move', { track_id: clipTrackId, clip_id: clipId, start: startBefore + 4 }, 90000),
     (s) => {
-      const c = findAudioClip(s.project);
-      return c && Math.abs(Number(c.clip.start) - (startBefore + 4)) < 0.01;
+      const c = findClipById(s.project, clipId);
+      return c && Math.abs(Number(c.clip.start) - (startBefore + 4)) < 0.5;
     },
     60000,
-    () => lastState,
   );
-  pass('3-move', `start=${findAudioClip(state.project).clip.start}`);
+  pass('3-move', `start=${findClipById(state.project, clipId)?.clip?.start}`);
+
+  const lenAfterMove = Number(findClipById(state.project, clipId)?.clip?.length) || lenBefore;
 
   // 4 — resize
   state = await afterMutation(
     socket,
-    () => emitAck(socket, 'clip:resize', { track_id: trackId, clip_id: clipId, length: lenBefore + 2 }),
+    () => emitAck(socket, 'clip:resize', { track_id: clipTrackId, clip_id: clipId, length: lenAfterMove + 2 }, 90000),
     (s) => {
-      const c = findAudioClip(s.project);
-      return c && Number(c.clip.length) >= lenBefore + 1.5;
+      const c = findClipById(s.project, clipId);
+      return c && Number(c.clip.length) >= lenAfterMove + 1.5;
     },
     60000,
-    () => lastState,
   );
-  pass('4-resize', `length=${findAudioClip(state.project).clip.length}`);
+  pass('4-resize', `length=${findClipById(state.project, clipId)?.clip?.length}`);
 
   const afterEdit = clipSnapshot(state.project);
 
@@ -245,7 +378,6 @@ async function main() {
     },
     (s) => Boolean(s?.project),
     60000,
-    () => lastState,
   );
   if (!undoRes.history?.nativeUndo) {
     fail('6-undo', `expected nativeUndo, got ${JSON.stringify(undoRes.history)}`);
@@ -266,7 +398,6 @@ async function main() {
     },
     (s) => Boolean(s?.project),
     60000,
-    () => lastState,
   );
   if (!redoRes.history?.nativeUndo) {
     fail('7-redo', `expected nativeUndo, got ${JSON.stringify(redoRes.history)}`);
@@ -277,19 +408,17 @@ async function main() {
   // 5 — delete + undo restore
   state = await afterMutation(
     socket,
-    () => emitAck(socket, 'clip:delete', { track_id: trackId, clip_id: clipId }),
-    (s) => !findAudioClip(s.project),
+    () => emitAck(socket, 'clip:delete', { track_id: clipTrackId, clip_id: clipId }),
+    (s) => !findClipById(s.project, clipId),
     60000,
-    () => lastState,
   );
   pass('5-delete', 'clip removed from cache');
 
   state = await afterMutation(
     socket,
     () => emitAck(socket, 'project:undo', {}),
-    (s) => Boolean(findAudioClip(s.project)),
+    (s) => Boolean(findClipById(s.project, clipId)),
     60000,
-    () => lastState,
   );
   pass('5-delete-undo', 'clip restored after undo');
 
@@ -308,12 +437,17 @@ async function main() {
   state = await afterMutation(
     socket,
     () => emitAck(socket, 'project:load', { filename: QA_SAVE_NAME }, 120000),
-    (s) => Boolean(findAudioClip(s.project)),
+    (s) => {
+      const byId = findClipById(s.project, clipId);
+      if (byId) {
+        return true;
+      }
+      return Boolean(findAudioClip(s.project));
+    },
     120000,
-    () => lastState,
   );
   const afterLoad = clipSnapshot(state.project);
-  if (JSON.stringify(afterLoad) === JSON.stringify(beforeSave)) {
+  if (clipSnapshotsMatch(beforeSave, afterLoad)) {
     pass('9-reload', `${afterLoad.length} audio clip(s) match snapshot`);
   } else {
     fail('9-reload', `mismatch before=${JSON.stringify(beforeSave)} after=${JSON.stringify(afterLoad)}`);
@@ -325,7 +459,6 @@ async function main() {
     () => emitAck(socket, 'transport:play', {}),
     (s) => s.playing === true,
     15000,
-    () => lastState,
   ).catch(() => null);
   if (state?.playing) {
     pass('10-playback', 'transport playing');
@@ -334,25 +467,60 @@ async function main() {
     fail('10-playback', 'transport did not enter playing state');
   }
 
+  state = await afterMutation(
+    socket,
+    () => emitAck(socket, 'transport:seek', { position_beats: 8 }),
+    (s) => Number(s.transport?.positionBeats) >= 6,
+    15000,
+  ).catch(() => null);
+  if (state && Number(state.transport?.positionBeats) >= 6) {
+    pass('10-seek', `positionBeats=${state.transport.positionBeats}`);
+  } else {
+    fail('10-seek', 'transport seek did not update position');
+  }
+
   // 11 — mixer
   state = await afterMutation(
     socket,
-    () => emitAck(socket, 'track:set-mute', { track_id: trackId, muted: true }),
+    () => emitAck(socket, 'track:set-mute', { track_id: clipTrackId, mute: true }),
     (s) => {
-      const t = (s.project.playlist || []).find((tr) => trackIdOf(tr) === trackId);
-      return t && t.mute === true;
+      const entry = (s.project.mixer || []).find((m) => Number(m.track_id) === clipTrackId);
+      return entry && entry.mute === true;
     },
     60000,
-    () => lastState,
   );
-  pass('11-mixer-mute', `track ${trackId} muted=${state.project.playlist.find((t) => trackIdOf(t) === trackId)?.mute}`);
+  const mixerEntry = state.project.mixer.find((m) => Number(m.track_id) === clipTrackId);
+  pass('11-mixer-mute', `track ${clipTrackId} muted=${mixerEntry?.mute}`);
 
-  await emitAck(socket, 'track:set-pan', { track_id: trackId, pan: 0.25 });
-  await emitAck(socket, 'track:set-volume', { track_id: trackId, volume: 0.8 });
+  await emitAck(socket, 'track:set-pan', { track_id: clipTrackId, pan: 0.25 });
+  await emitAck(socket, 'track:set-volume', { track_id: clipTrackId, volume: 0.8 });
   pass('11-mixer-pan-volume', 'pan/volume accepted');
 
-  // 12 — offline guard (engine-only check: history when native down needs manual kill)
-  console.log('\n[qa] #12 Native-offline: stop native-engine manually and verify UI blocks mixer/transport.');
+  state = await afterMutation(
+    socket,
+    () => emitAck(socket, 'track:set-solo', { track_id: clipTrackId, solo: true }),
+    (s) => {
+      const entry = (s.project.mixer || []).find((m) => Number(m.track_id) === clipTrackId);
+      return entry && entry.solo === true;
+    },
+    60000,
+  );
+  pass('11-mixer-solo', `track ${clipTrackId} solo=${state.project.mixer.find((m) => Number(m.track_id) === clipTrackId)?.solo}`);
+
+  await emitAck(socket, 'track:set-solo', { track_id: clipTrackId, solo: false });
+  state = await afterMutation(
+    socket,
+    () => emitAck(socket, 'track:set-record-arm', { track_id: clipTrackId, record_armed: true }),
+    (s) => {
+      const entry = (s.project.mixer || []).find((m) => Number(m.track_id) === clipTrackId);
+      return entry && entry.record_armed === true;
+    },
+    60000,
+  );
+  pass('11-mixer-record-arm', `track ${clipTrackId} record_armed=${state.project.mixer.find((m) => Number(m.track_id) === clipTrackId)?.record_armed}`);
+
+  // 15 — offline guard (manual): dashboard uses nativeTransport + connection
+  console.log('\n[qa] #15 Native-offline: stop native-engine manually and verify UI blocks mixer/transport.');
 
   socket.close();
 

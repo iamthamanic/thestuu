@@ -19,7 +19,13 @@ if [ -d "$TRACKTION_DIR/.git" ]; then
   cd "$VENDOR_DIR"
 else
   echo "[thestuu] Cloning Tracktion Engine (with JUCE submodule)..."
-  git clone --recurse-submodules https://github.com/Tracktion/tracktion_engine.git
+  git clone https://github.com/Tracktion/tracktion_engine.git
+  cd "$TRACKTION_DIR"
+  # Use HTTPS for JUCE (SSH submodule URLs fail without GitHub keys).
+  git config -f .gitmodules submodule.modules/juce.url https://github.com/juce-framework/JUCE.git
+  git submodule sync
+  git submodule update --init --recursive
+  cd "$VENDOR_DIR"
 fi
 
 echo ""

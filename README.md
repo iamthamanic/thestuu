@@ -114,44 +114,97 @@ Fails if new `syncNativeArrangementFromPlaylist` or `projectHistory.*.push` usag
 
 ### Native-first DAW flags (engine, **opt-in**)
 
-Enable for QA — default remains legacy JSON + `syncNativeArrangementFromPlaylist` until you pass acceptance below.
+Default remains legacy JSON arrangement until you pass QA below. Tracktion/native is **DAW truth** when these flags are on; Node holds a read-only snapshot plus UI metadata (patterns, view, nodes).
 
 ```bash
 export STUU_NATIVE_CLIP_OPS=1
 export STUU_NATIVE_TRACK_OPS=1
 export STUU_NATIVE_EDIT_UNDO=1
 export STUU_NATIVE_PROJECT_SIDECAR=1
-# Do NOT set unless debugging old sync:
-# export STUU_NATIVE_LEGACY_SYNC=1
+export STUU_NATIVE_LEGACY_SYNC=0   # must stay off for native-first QA
 ```
 
-- `STUU_NATIVE_CLIP_OPS=1` — clip move/resize/delete via Tracktion, then playlist cache reconcile
-- `STUU_NATIVE_TRACK_OPS=1` — track layout via native `track.*`
-- `STUU_NATIVE_EDIT_UNDO=1` — undo/redo via Tracktion (`projectHistory` not used for arrangement)
-- `STUU_NATIVE_PROJECT_SIDECAR=1` — save/load merges `project.export` with JSON sidecar (patterns/view)
-- `STUU_NATIVE_LEGACY_SYNC=1` — legacy clear+reimport (off by default)
-- `STUU_NATIVE_TRANSPORT=0` — JS stub transport only (dev)
+| Flag | Role |
+|------|------|
+| `STUU_NATIVE_CLIP_OPS=1` | `clip.move` / `resize` / `delete` / import → native, then `reconcilePlaylistAudioClipsFromNative` |
+| `STUU_NATIVE_TRACK_OPS=1` | `track.create` / `delete` / `reorder` → native, then `reconcileTracksFromNative` |
+| `STUU_NATIVE_EDIT_UNDO=1` | `project:undo` / `redo` → `edit.undo` / `edit.redo` (no JSON `projectHistory` for arrangement) |
+| `STUU_NATIVE_PROJECT_SIDECAR=1` | `project:save` / `load` merges `project.export` with JSON sidecar |
+| `STUU_NATIVE_LEGACY_SYNC=1` | **Debug only** — full `clear-audio-clips` + reimport; do not set for native-first |
+| `STUU_NATIVE_TRANSPORT=0` | JS stub transport only (dev) |
 
-`state.project` in Node is a **read-only cache / sidecar** (patterns, view, UI metadata) reconciled from native when flags are on — not DAW truth.
+**Separation:** Native = authoritative DAW (tracks, clips, transport, mixer, plugins, undo). Node = cache + patterns/view/VST node metadata. Legacy JSON mutation paths throw when clip/track native flags are on.
 
-### Acceptance checklist (before treating refactor as done)
+**Native-first is still opt-in** (`=== '1'`). Defaults remain legacy until you promote flags after manual QA (#15 offline guard).
 
-Run with all four flags above and **without** `STUU_NATIVE_LEGACY_SYNC`.
+**JSON-only clip fields** (sidecar; native IPC later): `gain`, `fade_in` / `fade_out` / curves, `waveform_peaks`, `source_duration_seconds`, `trim_start_seconds`, `name`, `color`, `source_name`, `source_format`. Arrangement fields (`start`, `length`, `source_path`, track placement) must come from native when `STUU_NATIVE_CLIP_OPS=1`.
 
-1. Altes Projekt öffnen  
-2. Audio importieren  
-3. Clip bewegen  
-4. Clip resizen  
-5. Clip löschen  
-6. Undo  
-7. Redo  
-8. Speichern  
-9. Neu öffnen  
-10. Playback prüfen  
-11. Mixer Mute/Solo/Pan/Volume  
-12. Native Engine stoppen → UI offline, keine Fake-Transport/Mixer-Mutationen  
+| Handler | Native-first order |
+|---------|-------------------|
+| `clip:import-file` (audio) | native import → merge/reconcile → attach sidecar metadata |
+| `clip:move` / `resize` / `delete` | native → `reconcilePlaylistAudioClipsFromNative` (no optimistic `start`/`length`/remove) |
+| `clip:set-gain` / `clip:set-fade` | JSON sidecar only (no arrangement sync) |
+| `clip:set-properties` | JSON UI metadata (`name`, `color`) |
+| `track:*` layout | native → `reconcileTracksFromNative` |
+| Mixer sockets | native command → update mixer cache |
+| `project:undo`/`redo` | native → merge/reconcile |
+| `project:save`/`load` | native export/import + sidecar merge |
 
-**Akzeptanz nur wenn:** Clip-Ops + Undo mit Flags funktionieren, Legacy-Sync aus bleibt stabil, alte `.stu`-Projekte laden, Native-offline sauber.
+### Native-first QA (automated)
+
+Terminal 1 — native engine:
+
+```bash
+export STUU_NATIVE_VENDOR_DIR="$(pwd)/vendor/tracktion_engine"
+./apps/native-engine/build/thestuu-native
+# or: STUU_NATIVE_SOCKET=/tmp/thestuu-native-qa.sock ./apps/native-engine/build/thestuu-native
+```
+
+Terminal 2 — engine with flags:
+
+```bash
+cd apps/engine
+export STUU_NATIVE_CLIP_OPS=1
+export STUU_NATIVE_EDIT_UNDO=1
+export STUU_NATIVE_TRACK_OPS=1
+export STUU_NATIVE_PROJECT_SIDECAR=1
+export STUU_NATIVE_LEGACY_SYNC=0
+export STUU_NATIVE_SOCKET=/tmp/thestuu-native-qa.sock   # if using custom socket
+export ENGINE_PORT=3990
+node src/server.js
+```
+
+Terminal 3 — from repo root:
+
+```bash
+npm run check:daw-authority
+npm run qa:native-daw
+```
+
+**Status (2026-05-16):** `qa:native-daw` passes with the flags above (clip/track/undo/save-reload/transport/mixer). Item **#15** (native offline → UI blocks DAW) is manual: stop `thestuu-native` and confirm dashboard disables transport/mixer (see `dawEngineReady` in `stuu-shell.jsx`).
+
+Legacy smoke (engine **without** `STUU_NATIVE_*=1`):
+
+```bash
+npm run qa:legacy-daw
+```
+
+### Acceptance checklist (17 items)
+
+| # | Check | Automated |
+|---|--------|-----------|
+| 1 | App starts | manual (`npm run start`) |
+| 2 | Native online | `qa:native-daw` precheck |
+| 3 | Project open | `qa:native-daw` |
+| 4–8 | Clip import/move/resize/delete | `qa:native-daw` |
+| 9 | Track create/delete/reorder | `qa:native-daw` |
+| 10 | Transport play/stop/seek | `qa:native-daw` |
+| 11 | Mixer vol/pan/mute/solo/arm | `qa:native-daw` |
+| 12 | Native undo/redo | `qa:native-daw` |
+| 13–14 | Save/reload sidecar | `qa:native-daw` |
+| 15 | Native offline guards UI | **manual** |
+| 16 | `STUU_NATIVE_LEGACY_SYNC=0` | `qa:native-daw` flags check |
+| 17 | Legacy without flags | `qa:legacy-daw` |
 
 ### Starten
 

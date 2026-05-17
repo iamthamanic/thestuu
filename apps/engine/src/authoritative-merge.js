@@ -58,6 +58,7 @@ export function mergeAuthoritativeProjectState(jsonProject, nativeExport) {
   const BEATS_PER_BAR = 4;
   const nativeClips = Array.isArray(native.clips) ? native.clips : [];
   const clipsByTrack = new Map();
+  const usedJsonAudioClipIds = new Set();
   for (const clip of nativeClips) {
     const trackId = Number(clip.track_id ?? clip.trackId);
     const sourcePath = typeof clip.source_path === 'string'
@@ -70,14 +71,36 @@ export function mergeAuthoritativeProjectState(jsonProject, nativeExport) {
     }
     const startBars = Number(((startSeconds * bpm) / (60 * BEATS_PER_BAR)).toFixed(6));
     const lengthBars = Number(((lengthSeconds * bpm) / (60 * BEATS_PER_BAR)).toFixed(6));
-    const audioClip = {
-      id: `clip-${trackId}-${startBars}-${sourcePath.split('/').pop()}`,
-      type: 'audio',
-      start: startBars,
-      length: lengthBars,
-      source_path: sourcePath,
-      source_name: clip.name || sourcePath.split('/').pop(),
-    };
+    const previousTrack = jsonById.get(trackId);
+    const jsonAudioClips = (Array.isArray(previousTrack?.clips) ? previousTrack.clips : [])
+      .filter((entry) => String(entry?.type || '').toLowerCase() === 'audio');
+    const jsonWithSamePath = jsonAudioClips.filter((entry) => {
+      const jsonPath = entry.source_path || entry.sourcePath || '';
+      return jsonPath && jsonPath === sourcePath && !usedJsonAudioClipIds.has(entry.id);
+    });
+    const matchedJsonClip = jsonWithSamePath.length === 1
+      ? jsonWithSamePath[0]
+      : jsonWithSamePath.find((entry) => Math.abs(Number(entry.start) - startBars) < 0.5);
+    if (matchedJsonClip?.id) {
+      usedJsonAudioClipIds.add(matchedJsonClip.id);
+    }
+    const audioClip = matchedJsonClip
+      ? {
+        ...matchedJsonClip,
+        type: 'audio',
+        start: Number.isFinite(Number(matchedJsonClip.start)) ? Number(matchedJsonClip.start) : startBars,
+        length: Number.isFinite(Number(matchedJsonClip.length)) ? Number(matchedJsonClip.length) : lengthBars,
+        source_path: sourcePath,
+        source_name: clip.name || matchedJsonClip.source_name || sourcePath.split('/').pop(),
+      }
+      : {
+        id: `clip-${trackId}-${startBars}-${sourcePath.split('/').pop()}`,
+        type: 'audio',
+        start: startBars,
+        length: lengthBars,
+        source_path: sourcePath,
+        source_name: clip.name || sourcePath.split('/').pop(),
+      };
     if (!clipsByTrack.has(trackId)) {
       clipsByTrack.set(trackId, []);
     }

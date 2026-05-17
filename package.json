@@ -9,7 +9,8 @@
     "dev:engine": "npm run start --prefix apps/engine",
     "dev:dashboard": "npm run dev --prefix apps/dashboard",
     "check:daw-authority": "bash scripts/check-daw-authority.sh",
-    "qa:native-daw": "node scripts/qa-native-daw.mjs"
+    "qa:native-daw": "node scripts/qa-native-daw.mjs",
+    "qa:legacy-daw": "node scripts/qa-legacy-daw-smoke.mjs"
   },
   "workspaces": [
     "apps/*",
