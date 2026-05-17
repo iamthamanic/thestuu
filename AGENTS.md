@@ -53,6 +53,8 @@ Native-first flags are **opt-in** (`STUU_NATIVE_*=1`). Without flags, legacy JSO
 
 `state.project` = reconciled **cache/sidecar** (patterns, view, UI). `projectHistory` = JSON undo for legacy/pattern only — disabled for arrangement when any native DAW flag is on.
 
-Do not mutate tracks/clips/mixer/timeline in JSON when native flags are enabled; `assertLegacyJsonArrangementAllowed` guards the legacy clip path.
+Do not mutate tracks/clips/mixer/timeline in JSON when native flags are enabled; use `apps/engine/src/daw-authority.js` assertions and `runDuringNativeReconcile` for cache updates.
 
-**Details:** `docs/architecture-state-authority.md` · **Refactor-Plan:** `docs/refactor-plan-daw-authority.md` · **IPC:** `docs/native-ipc.md` · **Cursor-Regel:** `.cursor/rules/daw-state-authority.mdc`
+Before DAW engine changes: `npm run check:daw-authority` and `npm run test:daw-authority`.
+
+**Guardrails:** `docs/daw-authority-guardrails.md` · **Architecture:** `docs/architecture-state-authority.md` · **Refactor-Plan:** `docs/refactor-plan-daw-authority.md` · **IPC:** `docs/native-ipc.md` · **Cursor:** `.cursor/rules/daw-state-authority.mdc`

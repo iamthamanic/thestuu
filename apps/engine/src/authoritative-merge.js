@@ -1,6 +1,7 @@
 /**
  * Merge JSON sidecar project (patterns/view/UI) with native export (arrangement/mixer).
- * Location: apps/engine/src (used by project:load/save).
+ * DAW-authoritative: native export wins arrangement; JSON sidecar preserves ids + UI-only fields.
+ * Location: apps/engine/src (used by project:load/save). See docs/daw-authority-guardrails.md.
  */
 
 function isObject(value) {

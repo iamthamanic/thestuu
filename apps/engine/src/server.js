@@ -25,6 +25,14 @@ import {
   mergeAuthoritativeProjectState,
 } from './authoritative-merge.js';
 import {
+  assertDirectArrangementMutationAllowed,
+  assertJsonProjectHistoryAllowed,
+  assertLegacyJsonArrangementAllowed,
+  logDawAuthorityBoot,
+  runDuringNativeReconcile,
+  shouldUseJsonProjectHistory,
+} from './daw-authority.js';
+import {
   maxPeakFromMeterRows,
   mergeNativeMetersPayload,
   placeholderMetersForPlaylist,
@@ -1032,27 +1040,6 @@ function emitState(options = {}) {
   io.emit('engine:state', getStatePayload());
 }
 
-/** Any native-first DAW domain flag enabled (all opt-in). */
-function isNativeDawModeEnabled() {
-  return nativeClipOpsEnabled || nativeEditUndoEnabled || nativeTrackOpsEnabled;
-}
-
-/** JSON projectHistory is only for legacy / pattern-view when native DAW mode is off. */
-function shouldUseJsonProjectHistory() {
-  return !nativeEditUndoEnabled && !nativeClipOpsEnabled && !nativeTrackOpsEnabled;
-}
-
-/** Forbid legacy JSON-first arrangement mutations when native clip/track ops are enabled. */
-function assertLegacyJsonArrangementAllowed(operation) {
-  if (nativeClipOpsEnabled || nativeTrackOpsEnabled) {
-    throw new Error(
-      `${operation}: legacy JSON arrangement path is disabled. `
-      + 'Set STUU_NATIVE_CLIP_OPS=1 and STUU_NATIVE_TRACK_OPS=1 (native required), '
-      + 'or unset those flags to use legacy sync.',
-    );
-  }
-}
-
 /** True when DAW transport must go through native-engine (default). Set STUU_NATIVE_TRANSPORT=0 for JS stub clock only. */
 function isNativeTransportRequired() {
   return nativeTransportEnabled;
@@ -1408,6 +1395,7 @@ function syncProjectHistory({ record = true, clearRedo = true, force = false } =
   if (record && lastProjectSnapshot && lastProjectSnapshotKey) {
     const latestUndo = projectHistory.undo[projectHistory.undo.length - 1];
     if (!latestUndo || latestUndo.key !== lastProjectSnapshotKey) {
+      assertJsonProjectHistoryAllowed('syncProjectHistory.undo.push');
       projectHistory.undo.push({
         project: deepCloneJson(lastProjectSnapshot, lastProjectSnapshot),
         key: lastProjectSnapshotKey,
@@ -3510,9 +3498,10 @@ function attachAudioClipSidecarMetadata(clip, meta) {
 
 /**
  * Refresh audio clip start/length/track in the playlist cache from native edit:get-audio-clips.
- * Does not clear/reimport the native edit.
+ * DAW-authoritative: native snapshot → Node cache (see docs/daw-authority-guardrails.md).
  */
 async function reconcilePlaylistAudioClipsFromNative() {
+  return runDuringNativeReconcile(async () => {
   if (!nativeTransportActive) {
     return;
   }
@@ -3593,6 +3582,7 @@ async function reconcilePlaylistAudioClipsFromNative() {
     sortClips(track);
   }
   sortProjectTrackCollections();
+  });
 }
 
 function buildPlaylistTrackLayoutPayload() {
@@ -3624,9 +3614,11 @@ function buildReorderedTrackLayoutPayload(trackId, toIndex) {
 }
 
 /**
- * Merge native track.list into playlist/mixer (keeps pattern clips + A-metadata per track_id).
+ * Merge native track.list into playlist/mixer (keeps pattern clips + track UI metadata).
+ * DAW-authoritative: native track.list → Node cache.
  */
 async function reconcileTracksFromNative() {
+  return runDuringNativeReconcile(async () => {
   if (!nativeTransportActive) {
     return;
   }
@@ -3697,6 +3689,7 @@ async function reconcileTracksFromNative() {
   state.project.playlist = nextPlaylist;
   state.project.mixer = nextMixer;
   sortProjectTrackCollections();
+  });
 }
 
 async function syncNativeTrackLayoutFromPlaylist() {
@@ -3853,6 +3846,7 @@ async function moveClip(payload = {}) {
   }
 
   assertLegacyJsonArrangementAllowed('clip:move');
+  assertDirectArrangementMutationAllowed('clip:move (legacy clip.start)');
   clip.start = nextStart;
   sortClips(sourceTrack);
   await reconcileNativeClipState({ mergeNativeFirst: false });
@@ -3910,6 +3904,7 @@ async function resizeClip(payload = {}) {
   }
 
   const { q } = computed;
+  assertDirectArrangementMutationAllowed('clip:resize (legacy clip.start/length)');
   clip.start = computed.nextStart;
   clip.length = computed.nextLength;
   if (Object.prototype.hasOwnProperty.call(payload, 'trim_start_seconds')
@@ -6527,6 +6522,7 @@ io.on('connection', (socket) => {
     }
 
     projectHistory.undo.pop();
+    assertJsonProjectHistoryAllowed('project:undo.redo.push');
     projectHistory.redo.push(currentEntry);
     trimProjectHistoryStack(projectHistory.redo);
 
@@ -6593,6 +6589,7 @@ io.on('connection', (socket) => {
     }
 
     projectHistory.redo.pop();
+    assertJsonProjectHistoryAllowed('project:redo.undo.push');
     projectHistory.undo.push(currentEntry);
     trimProjectHistoryStack(projectHistory.undo);
 
@@ -6784,6 +6781,7 @@ async function boot() {
 
   httpServer.listen(enginePort, engineHost, () => {
     console.log(`[thestuu-engine] listening on ${engineHost}:${enginePort}`);
+    logDawAuthorityBoot();
     console.log(`[thestuu-engine] home: ${stuuHome}`);
     if (nativeTransportEnabled) {
       if (nativeTransportActive) {

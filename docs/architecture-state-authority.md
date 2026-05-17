@@ -2,7 +2,7 @@
 
 This document is the canonical reference for how TheStuu splits responsibility between the dashboard, Node orchestrator, and native Tracktion engine. Coding agents and contributors must follow it for any DAW-related change.
 
-Related: `AGENTS.md` (short rules), `.cursor/rules/daw-state-authority.mdc` (always-on in Cursor), `docs/native-ipc.md` (IPC command list), **`docs/refactor-plan-daw-authority.md`** (sprint plan and tasks).
+Related: `AGENTS.md` (short rules), `.cursor/rules/daw-state-authority.mdc` (always-on in Cursor), **`docs/daw-authority-guardrails.md`** (enforcement + allowed fields), `docs/native-ipc.md` (IPC command list), **`docs/refactor-plan-daw-authority.md`** (sprint plan and tasks).
 
 ## Goal
 
@@ -195,9 +195,22 @@ Classify each hit:
 | B — Read-only native cache | Keep; only update from native |
 | C — Illegal DAW mutation | Migrate behind native command |
 
+## Enforcement (guardrails)
+
+| Mechanism | Location |
+|-----------|----------|
+| Canonical field lists + dev assertions | `apps/engine/src/daw-authority.js` |
+| CI pattern guard | `scripts/check-daw-authority.sh` → `npm run check:daw-authority` |
+| Unit tests (merge / assertions) | `apps/engine/test/daw-authority.test.js` → `npm run test:daw-authority` |
+| Native-first QA | `scripts/qa-native-daw.mjs` → `npm run qa:native-daw` |
+
+See **`docs/daw-authority-guardrails.md`** for the architecture diagram, JSON-only fields, and contributor checklist.
+
 ## References
 
 - `packages/shared-json` — project JSON schema / normalization (not command transport)
+- `docs/daw-authority-guardrails.md` — enforcement rules and allowed JSON-only fields
 - `docs/native-ipc.md` — IPC framing and command list (keep in sync with native)
 - `apps/engine/src/server.js` — current orchestrator (legacy mutations here)
+- `apps/engine/src/daw-authority.js` — runtime + exported constants
 - `apps/native-engine/src/main.cpp` — command dispatch

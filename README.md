@@ -104,13 +104,26 @@ bash scripts/setup-tracktion.sh
 
 Alternative: eigenen Vendor-Pfad ueber `STUU_NATIVE_VENDOR_DIR` setzen.
 
-### DAW authority check (CI / local)
+### DAW authority (guardrails)
 
-```bash
-npm run check:daw-authority
+Tracktion owns arrangement when native flags are on; Node holds a reconciled cache plus JSON sidecar metadata only. Full rules: **`docs/daw-authority-guardrails.md`**.
+
+```mermaid
+flowchart LR
+  UI[Dashboard] -->|commands| ENG[Engine]
+  ENG -->|IPC| NAT[Native-engine]
+  NAT -->|export / snapshots| ENG
+  ENG -->|engine:state| UI
+  SIDE[JSON sidecar<br/>patterns, gain, fades, view] -.->|save/load merge| ENG
 ```
 
-Fails if new `syncNativeArrangementFromPlaylist` or `projectHistory.*.push` usages appear outside the legacy allowlist in `apps/engine/src/server.js`. See `scripts/check-daw-authority.sh`.
+| Check | Command |
+|-------|---------|
+| Static pattern guard | `npm run check:daw-authority` |
+| Unit tests (merge + assertions) | `npm run test:daw-authority` |
+| End-to-end native-first | `npm run qa:native-daw` |
+
+Runtime dev assertions (`assertDirectArrangementMutationAllowed`) block direct `clip.start` / `length` writes when `STUU_NATIVE_CLIP_OPS` or `STUU_NATIVE_TRACK_OPS` is on, except inside `runDuringNativeReconcile`.
 
 ### Native-first DAW flags (engine, **opt-in**)
 

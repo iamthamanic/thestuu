@@ -35,8 +35,15 @@ Migrate incrementally: transport → clips → tracks → mixer → plugins → 
 
 Touch existing Node-side DAW mutations only when the task is an explicit migration step. Do not add new features on the legacy JSON-first path.
 
+## Enforcement before merging DAW changes
+
+- Run `npm run check:daw-authority` and `npm run test:daw-authority`
+- Read `docs/daw-authority-guardrails.md` for JSON-only vs native-authoritative fields
+- Use `runDuringNativeReconcile` for cache updates from native snapshots only
+
 ## References
 
 - UI rules: `thestuu/AGENTS.md`, `thestuu/docs/styleguide-ui.md`
+- Guardrails: `thestuu/docs/daw-authority-guardrails.md`
 - IPC commands: `thestuu/docs/native-ipc.md`
 - Full architecture: `thestuu/docs/architecture-state-authority.md`
