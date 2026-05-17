@@ -2,6 +2,7 @@
 // Window + process lifecycle only — never owns DAW state.
 // See docs/desktop-tauri.md and docs/daw-authority-guardrails.md.
 
+mod diagnostics;
 mod native_health;
 mod native_sidecar;
 
@@ -9,13 +10,20 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use diagnostics::{
+    build_diagnostics, export_bundle, DiagnosticsLog, DesktopDiagnostics, LogEntry,
+};
 use native_sidecar::NativeSidecarManager;
 use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 const DEFAULT_DASHBOARD_URL: &str = "http://127.0.0.1:3010";
 const STATUS_EVENT: &str = "desktop://status";
+const DIAGNOSTICS_EVENT: &str = "desktop://diagnostics";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Legacy status payload for offline shell (subset of diagnostics).
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopStatus {
@@ -52,48 +60,52 @@ fn is_dashboard_reachable() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
 }
 
-fn build_status(manager: &NativeSidecarManager) -> DesktopStatus {
-    let sidecar = manager.snapshot();
-    let ui_online = is_dashboard_reachable();
-    let ipc_connected = sidecar.health.ipc_connected;
-    let tracktion_ready = sidecar.health.tracktion_ready;
-    let audio_device_ready = sidecar.health.audio_device_ready;
-    let daw_ready = ipc_connected && tracktion_ready && audio_device_ready;
+fn diagnostics_from(d: &DesktopDiagnostics) -> DesktopDiagnostics {
+    d.clone()
+}
 
-    let startup_error = sidecar
-        .startup_error
-        .clone()
-        .or_else(|| sidecar.health.last_error.clone());
-
+fn status_from_diag(d: &DesktopDiagnostics) -> DesktopStatus {
     DesktopStatus {
-        ui_online,
-        native_process_running: sidecar.process_running,
-        native_managed_by_desktop: sidecar.managed_by_desktop,
-        ipc_connected,
-        tracktion_ready,
-        audio_device_ready,
-        daw_ready,
-        startup_error,
-        socket_path: sidecar.socket_path,
-        dashboard_url: dashboard_url(),
+        ui_online: d.dashboard_online,
+        native_process_running: d.native_process_running,
+        native_managed_by_desktop: d.native_managed_by_desktop,
+        ipc_connected: d.ipc_connected,
+        tracktion_ready: d.tracktion_ready,
+        audio_device_ready: d.audio_device_ready,
+        daw_ready: d.daw_ready,
+        startup_error: d.last_native_error.clone(),
+        socket_path: d.socket_path.clone(),
+        dashboard_url: d.dashboard_url.clone(),
     }
 }
 
-fn emit_status(app: &AppHandle, manager: &NativeSidecarManager) {
-    let status = build_status(manager);
-    let _ = app.emit(STATUS_EVENT, status);
+fn build_full_diagnostics(manager: &NativeSidecarManager) -> DesktopDiagnostics {
+    build_diagnostics(manager, is_dashboard_reachable(), &dashboard_url())
+}
+
+fn emit_diagnostics(app: &AppHandle, manager: &NativeSidecarManager) {
+    let diag = build_full_diagnostics(manager);
+    let _ = app.emit(DIAGNOSTICS_EVENT, diagnostics_from(&diag));
+    let _ = app.emit(STATUS_EVENT, status_from_diag(&diag));
+}
+
+fn is_diagnostics_page(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|w| w.url().ok())
+        .map(|u| u.as_str().contains("diagnostics.html"))
+        .unwrap_or(false)
 }
 
 fn start_status_poller(app: AppHandle, manager: Arc<NativeSidecarManager>) {
     std::thread::spawn(move || {
         loop {
             manager.refresh_health();
-            emit_status(&app, &manager);
+            emit_diagnostics(&app, &manager);
 
-            let status = build_status(&manager);
-            if status.ui_online && status.daw_ready {
+            let diag = build_full_diagnostics(&manager);
+            if diag.dashboard_online && diag.daw_ready && !is_diagnostics_page(&app) {
                 if let Some(window) = app.get_webview_window("main") {
-                    if let Ok(url) = status.dashboard_url.parse() {
+                    if let Ok(url) = diag.dashboard_url.parse() {
                         let _ = window.navigate(url);
                     }
                 }
@@ -104,46 +116,135 @@ fn start_status_poller(app: AppHandle, manager: Arc<NativeSidecarManager>) {
     });
 }
 
+fn navigate_main_window(app: &AppHandle, path: &str) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    let safe_path = path.replace('\\', "\\\\").replace('\'', "\\'");
+    let script = format!("window.location.replace('{safe_path}');");
+    window.eval(&script).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_desktop_status(manager: State<'_, Arc<NativeSidecarManager>>) -> DesktopStatus {
-    manager.refresh_health();
-    build_status(&manager)
+    status_from_diag(&build_full_diagnostics(&manager))
+}
+
+#[tauri::command]
+fn get_desktop_diagnostics(manager: State<'_, Arc<NativeSidecarManager>>) -> DesktopDiagnostics {
+    build_full_diagnostics(&manager)
+}
+
+#[tauri::command]
+fn get_diagnostic_logs(manager: State<'_, Arc<NativeSidecarManager>>) -> Vec<LogEntry> {
+    manager.diagnostics_log().entries()
 }
 
 #[tauri::command]
 fn get_native_logs(manager: State<'_, Arc<NativeSidecarManager>>) -> Vec<String> {
-    manager.logs()
+    manager
+        .diagnostics_log()
+        .entries()
+        .into_iter()
+        .map(|e| format!(
+            "[{}] {} {} [{}] {}",
+            e.timestamp_ms, e.level, e.source, e.category, e.message
+        ))
+        .collect()
+}
+
+#[tauri::command]
+fn clear_diagnostic_logs(manager: State<'_, Arc<NativeSidecarManager>>) {
+    manager.diagnostics_log().clear();
+    manager
+        .diagnostics_log()
+        .push_shell_info("diagnostic logs cleared");
 }
 
 #[tauri::command]
 fn retry_native_startup(
     app: AppHandle,
     manager: State<'_, Arc<NativeSidecarManager>>,
-) -> DesktopStatus {
+) -> DesktopDiagnostics {
     manager.retry_startup(&app);
-    manager.refresh_health();
-    let status = build_status(&manager);
-    let _ = app.emit(STATUS_EVENT, &status);
-    status
+    let diag = build_full_diagnostics(&manager);
+    emit_diagnostics(&app, &manager);
+    diag
+}
+
+#[tauri::command]
+fn restart_native_engine(
+    app: AppHandle,
+    manager: State<'_, Arc<NativeSidecarManager>>,
+) -> DesktopDiagnostics {
+    manager.restart_startup(&app);
+    let diag = build_full_diagnostics(&manager);
+    emit_diagnostics(&app, &manager);
+    diag
+}
+
+#[tauri::command]
+fn export_diagnostics_bundle(
+    manager: State<'_, Arc<NativeSidecarManager>>,
+) -> Value {
+    let diag = build_full_diagnostics(&manager);
+    let logs = manager.diagnostics_log().entries();
+    export_bundle(&diag, &logs, APP_VERSION)
+}
+
+#[tauri::command]
+fn copy_diagnostics_text(manager: State<'_, Arc<NativeSidecarManager>>) -> String {
+    let diag = build_full_diagnostics(&manager);
+    let logs = manager.diagnostics_log().entries();
+    let bundle = export_bundle(&diag, &logs, APP_VERSION);
+    serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[tauri::command]
+fn open_diagnostics(app: AppHandle) -> Result<(), String> {
+    manager_log_open(&app);
+    navigate_main_window(&app, "diagnostics.html")
+}
+
+#[tauri::command]
+fn open_shell_home(app: AppHandle) -> Result<(), String> {
+    navigate_main_window(&app, "index.html")
+}
+
+fn manager_log_open(app: &AppHandle) {
+    if let Some(manager) = app.try_state::<Arc<NativeSidecarManager>>() {
+        manager.diagnostics_log().push_shell_info("diagnostics panel opened");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let native_manager = Arc::new(NativeSidecarManager::new());
+    let diag_log = DiagnosticsLog::new();
+    diag_log.push_shell_info(format!("TheStuu desktop shell v{APP_VERSION} starting"));
+    let native_manager = Arc::new(NativeSidecarManager::new(diag_log.clone()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(native_manager.clone())
+        .manage(diag_log)
         .invoke_handler(tauri::generate_handler![
             get_desktop_status,
+            get_desktop_diagnostics,
+            get_diagnostic_logs,
             get_native_logs,
+            clear_diagnostic_logs,
             retry_native_startup,
+            restart_native_engine,
+            export_diagnostics_bundle,
+            copy_diagnostics_text,
+            open_diagnostics,
+            open_shell_home,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
             native_manager.startup(&handle);
             native_manager.refresh_health();
-            emit_status(&handle, &native_manager);
+            emit_diagnostics(&handle, &native_manager);
             start_status_poller(handle, native_manager);
             Ok(())
         })
@@ -152,6 +253,7 @@ pub fn run() {
         .run(move |app_handle, event| {
             if let RunEvent::Exit = event {
                 if let Some(manager) = app_handle.try_state::<Arc<NativeSidecarManager>>() {
+                    manager.diagnostics_log().push_shell_info("desktop shell exiting");
                     manager.shutdown_managed();
                 }
             }

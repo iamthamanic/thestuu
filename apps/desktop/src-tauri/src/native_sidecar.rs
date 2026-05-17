@@ -1,7 +1,6 @@
 // Native-engine process lifecycle for the Tauri desktop shell.
 // Spawns/stops thestuu-native only — no DAW logic.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,15 +9,16 @@ use tauri::AppHandle;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
+use crate::diagnostics::DiagnosticsLog;
 use crate::native_health::{probe_native_health, resolve_socket_path, socket_reachable, NativeHealthSnapshot};
 
-const LOG_CAP: usize = 400;
 const SOCKET_WAIT_MS: u64 = 25_000;
 const SOCKET_POLL_MS: u64 = 120;
 
 #[derive(Clone)]
 pub struct NativeSidecarManager {
     inner: Arc<Mutex<NativeSidecarState>>,
+    diag_log: DiagnosticsLog,
 }
 
 struct NativeSidecarState {
@@ -27,7 +27,6 @@ struct NativeSidecarState {
     process_running: bool,
     startup_error: Option<String>,
     health: NativeHealthSnapshot,
-    logs: VecDeque<String>,
     child: Option<ManagedChild>,
 }
 
@@ -36,7 +35,7 @@ enum ManagedChild {
 }
 
 impl NativeSidecarManager {
-    pub fn new() -> Self {
+    pub fn new(diag_log: DiagnosticsLog) -> Self {
         Self {
             inner: Arc::new(Mutex::new(NativeSidecarState {
                 socket_path: resolve_socket_path(),
@@ -44,30 +43,18 @@ impl NativeSidecarManager {
                 process_running: false,
                 startup_error: None,
                 health: NativeHealthSnapshot::default(),
-                logs: VecDeque::new(),
                 child: None,
             })),
+            diag_log,
         }
+    }
+
+    pub fn diagnostics_log(&self) -> &DiagnosticsLog {
+        &self.diag_log
     }
 
     pub fn socket_path(&self) -> String {
         self.inner.lock().map(|s| s.socket_path.clone()).unwrap_or_default()
-    }
-
-    pub fn push_log(&self, line: impl Into<String>) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.logs.push_back(line.into());
-            while state.logs.len() > LOG_CAP {
-                state.logs.pop_front();
-            }
-        }
-    }
-
-    pub fn logs(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .map(|s| s.logs.iter().cloned().collect())
-            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> SidecarSnapshot {
@@ -102,10 +89,12 @@ impl NativeSidecarManager {
             state.socket_path = socket_path.clone();
         }
 
-        self.push_log(format!("[desktop] native socket: {socket_path}"));
+        self.diag_log
+            .push_shell_info(format!("native socket: {socket_path}"));
 
         if socket_reachable(&socket_path, Duration::from_millis(500)) {
-            self.push_log("[desktop] existing native-engine socket detected — reusing process");
+            self.diag_log
+                .push_shell_info("existing native-engine socket detected — reusing process");
             if let Ok(mut state) = self.inner.lock() {
                 state.managed_by_desktop = false;
                 state.process_running = true;
@@ -123,14 +112,14 @@ impl NativeSidecarManager {
                     state.startup_error = None;
                 }
                 attach_log_receiver(self.clone(), log_rx);
-                self.push_log("[desktop] spawned native-engine sidecar");
+                self.diag_log.push_shell_info("spawned native-engine sidecar");
 
                 if !wait_for_socket(&socket_path, SOCKET_WAIT_MS) {
                     let msg = format!(
                         "native-engine did not open socket within {}s: {socket_path}",
                         SOCKET_WAIT_MS / 1000
                     );
-                    self.push_log(format!("[desktop] error: {msg}"));
+                    self.diag_log.push_shell_error(&msg);
                     if let Ok(mut state) = self.inner.lock() {
                         state.startup_error = Some(msg);
                         state.process_running = false;
@@ -145,7 +134,7 @@ impl NativeSidecarManager {
             }
             Err(err) => {
                 let msg = format!("failed to spawn native-engine: {err}");
-                self.push_log(format!("[desktop] error: {msg}"));
+                self.diag_log.push_shell_error(&msg);
                 if let Ok(mut state) = self.inner.lock() {
                     state.startup_error = Some(msg);
                     state.process_running = false;
@@ -155,6 +144,17 @@ impl NativeSidecarManager {
     }
 
     pub fn retry_startup(&self, app: &AppHandle) {
+        self.diag_log.push_shell_info("retry native-engine startup");
+        self.shutdown_managed();
+        if let Ok(mut state) = self.inner.lock() {
+            state.startup_error = None;
+            state.health = NativeHealthSnapshot::default();
+        }
+        self.startup(app);
+    }
+
+    pub fn restart_startup(&self, app: &AppHandle) {
+        self.diag_log.push_shell_info("restart native-engine");
         self.shutdown_managed();
         if let Ok(mut state) = self.inner.lock() {
             state.startup_error = None;
@@ -179,11 +179,12 @@ impl NativeSidecarManager {
             child.map(|c| (c, socket))
         };
 
-        let Some((ManagedChild::Sidecar(mut command_child), socket_path)) = taken else {
+        let Some((ManagedChild::Sidecar(command_child), socket_path)) = taken else {
             return;
         };
 
-        self.push_log("[desktop] stopping managed native-engine sidecar");
+        self.diag_log
+            .push_shell_info("stopping managed native-engine sidecar");
         let _ = command_child.kill();
 
         #[cfg(unix)]
@@ -207,14 +208,18 @@ fn attach_log_receiver(manager: NativeSidecarManager, mut rx: tauri::async_runti
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    manager.push_log(format!("[native stdout] {}", String::from_utf8_lossy(&line)));
+                    manager
+                        .diag_log
+                        .push_native_stdout(String::from_utf8_lossy(&line));
                 }
                 CommandEvent::Stderr(line) => {
-                    manager.push_log(format!("[native stderr] {}", String::from_utf8_lossy(&line)));
+                    manager
+                        .diag_log
+                        .push_native_stderr(String::from_utf8_lossy(&line));
                 }
                 CommandEvent::Terminated(payload) => {
-                    manager.push_log(format!(
-                        "[native] exited code={:?} signal={:?}",
+                    manager.diag_log.push_shell_warn(format!(
+                        "native-engine exited code={:?} signal={:?}",
                         payload.code, payload.signal
                     ));
                     if let Ok(mut state) = manager.inner.lock() {
@@ -229,7 +234,9 @@ fn attach_log_receiver(manager: NativeSidecarManager, mut rx: tauri::async_runti
                     break;
                 }
                 CommandEvent::Error(err) => {
-                    manager.push_log(format!("[native] command error: {err}"));
+                    manager
+                        .diag_log
+                        .push_shell_error(format!("native command error: {err}"));
                 }
                 _ => {}
             }
@@ -246,7 +253,7 @@ fn spawn_native_sidecar(
 
     let sidecar_result = app.shell().sidecar("thestuu-native");
 
-    let mut command = match sidecar_result {
+    let command = match sidecar_result {
         Ok(cmd) => cmd,
         Err(sidecar_err) => {
             if !binary_path.is_file() {
@@ -270,7 +277,6 @@ fn spawn_native_sidecar(
     Ok((rx, child))
 }
 
-/// Dev reuse: honour env socket, then probe CLI-style sockets in the temp dir.
 fn discover_existing_socket() -> Option<String> {
     let preferred = resolve_socket_path();
     if socket_reachable(&preferred, Duration::from_millis(400)) {
@@ -333,7 +339,10 @@ pub fn resolve_native_binary_path(repo_root: &Path) -> Result<PathBuf, String> {
         if candidate.is_file() {
             return Ok(candidate);
         }
-        return Err(format!("STUU_NATIVE_BIN points to missing file: {}", candidate.display()));
+        return Err(format!(
+            "STUU_NATIVE_BIN points to missing file: {}",
+            candidate.display()
+        ));
     }
 
     let build_dir = repo_root.join("apps/native-engine/build");

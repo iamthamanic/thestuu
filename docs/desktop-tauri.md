@@ -153,15 +153,25 @@ Target order when complete: native → engine → dashboard → Tauri window.
 - Rust + `webkit2gtk` (Tauri prerequisites).
 - Sidecar: `thestuu-native-x86_64-unknown-linux-gnu` (or arm64 triple).
 
+## Diagnostics UI
+
+Integrated diagnostics panel: **`docs/desktop-diagnostics.md`**
+
+- Open via **Diagnostics** button on shell home or **⌘⇧D**
+- Log viewer, status grid, export/copy bundle
+- No DAW control actions
+
 ## Tauri commands (shell ↔ UI)
 
 | Command | Purpose |
 |---------|---------|
-| `get_desktop_status` | UI / native / IPC / Tracktion / audio / DAW ready flags |
-| `get_native_logs` | Captured stdout/stderr from managed native process |
-| `retry_native_startup` | Stop managed native (if any) and spawn again |
+| `get_desktop_diagnostics` | Full diagnostics (dashboard, engine, native, flags) |
+| `get_diagnostic_logs` | Structured log entries |
+| `get_desktop_status` | Legacy status subset |
+| `export_diagnostics_bundle` | JSON export for support |
+| `retry_native_startup` / `restart_native_engine` | Native sidecar lifecycle |
 
-Event: `desktop://status` (polled every 2s from Rust).
+Events: `desktop://status`, `desktop://diagnostics` (polled every ~2s).
 
 ## QA
 
