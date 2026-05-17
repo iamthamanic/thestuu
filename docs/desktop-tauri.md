@@ -8,127 +8,173 @@ Tauri is a **desktop window and OS integration layer only**. It does not own, mu
 | `apps/engine` | Node router + JSON sidecar (patterns, view, metadata) |
 | `apps/dashboard` | Next.js UI |
 | `apps/cli` | Dev/start workflow (`npm run start`) |
-| `apps/desktop` | **Tauri shell** — native window, future process manager |
+| `apps/desktop` | **Tauri shell** — window, native-engine lifecycle, future OS integration |
 
 See also: `docs/daw-authority-guardrails.md`, `docs/architecture-state-authority.md`.
 
-## Architecture (phase 1)
+## Architecture (phase 2 — native sidecar)
 
 ```mermaid
 flowchart LR
   subgraph dev["Developer machine"]
     CLI["apps/cli\nnpm run start"]
-    NAT["native-engine"]
+    NAT["native-engine\nUnix IPC"]
     ENG["apps/engine"]
     DASH["apps/dashboard\n:3010"]
-    TAU["apps/desktop\nTauri window"]
+    TAU["apps/desktop\nTauri"]
   end
   CLI --> NAT
-  CLI --> ENG
-  CLI --> DASH
-  TAU -->|"HTTP if up"| DASH
-  DASH --> ENG
-  ENG --> NAT
+    CLI --> ENG
+    CLI --> DASH
+    TAU -->|"spawn or reuse"| NAT
+    TAU -->|"HTTP if up"| DASH
+    DASH --> ENG
+    ENG --> NAT
 ```
 
-**Tauri never sits in the DAW data path.** It only loads the dashboard URL when the stack is already running.
+**Tauri never sits in the DAW data path.** It may spawn `thestuu-native` and probe IPC health; it does not implement clip/track/project logic.
 
-## Current dev flow (phase 1)
+## Status model (shell UI)
 
-1. Terminal A — start TheStuu as today:
+The bundled shell page (`apps/desktop/offline/index.html`) distinguishes:
 
-   ```bash
-   npm run start
-   ```
+| Indicator | Meaning |
+|-----------|---------|
+| **UI online** | Dashboard HTTP reachable (`127.0.0.1:3010` or `THESTUU_DASHBOARD_URL`) |
+| **native-engine process** | Unix socket accepting connections (spawned by Tauri or reused from `npm run start`) |
+| **IPC connected** | `health.ping` → `{ pong: true }` over native MessagePack IPC |
+| **Tracktion backend ready** | `backend.info` → `{ tracktion: true }` |
+| **Audio device ready** | `audio.get_outputs` returns devices or a current output id |
+| **DAW ready** | IPC + Tracktion + audio (native truth path usable) |
 
-   This uses `apps/cli` and starts native-engine, engine, and dashboard (port **3010**).
+If native-engine fails to start, the shell shows an error and **Retry native-engine** — it does not fake DAW state.
 
-2. Terminal B — open the desktop shell:
+## Current dev flow
 
-   ```bash
-   npm run desktop:dev
-   ```
+### Full stack (unchanged)
 
-3. Behaviour:
-   - Rust probes `127.0.0.1:3010` (or `THESTUU_DASHBOARD_URL`).
-   - If reachable → webview navigates to `http://127.0.0.1:3010`.
-   - If not → bundled `apps/desktop/offline/index.html` with retry UI.
+```bash
+npm run start
+```
 
-`npm run start` is unchanged. `apps/cli` is not removed.
+Starts native-engine, Node engine, and dashboard via `apps/cli`.
 
-## Scripts
+### Desktop shell
+
+**Option A — desktop manages native-engine only** (Node/dashboard still manual):
+
+```bash
+# Build native binary once (CMake)
+# apps/native-engine/build/thestuu-native
+
+npm run desktop:dev
+```
+
+Tauri spawns `thestuu-native` on startup and stops it on exit **when it launched the process**.
+
+**Option B — stack already running** (`npm run start` in another terminal):
+
+```bash
+npm run desktop:dev
+```
+
+Tauri **reuses** an existing native socket (env `STUU_NATIVE_SOCKET`, `/tmp/thestuu-native.sock`, or `thestuu-native-*.sock` in the temp dir). It does **not** kill a reused process on exit.
+
+### Scripts
 
 | Command | Description |
 |---------|-------------|
-| `npm run desktop:dev` | `tauri dev` in `apps/desktop` |
-| `npm run desktop:build` | `tauri build` (release bundle; phase 1 still expects external stack or future sidecars) |
+| `npm run start` | CLI: native + engine + dashboard (unchanged) |
+| `npm run desktop:dev` | Tauri dev window + native sidecar lifecycle |
+| `npm run desktop:build` | Tauri release bundle (native binary must exist for sidecar) |
 
-Optional env:
+### Environment
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `THESTUU_DASHBOARD_URL` | `http://127.0.0.1:3010` | Dashboard URL for shell navigation |
+| `THESTUU_DASHBOARD_URL` | `http://127.0.0.1:3010` | Dashboard URL for webview navigation |
+| `STUU_NATIVE_SOCKET` | `/tmp/thestuu-native.sock` | Unix socket for native IPC (match CLI when reusing) |
+| `STUU_NATIVE_BIN` / `THESTUU_NATIVE_BIN` | *(auto)* | Override path to `thestuu-native` |
+| `THESTUU_REPO_ROOT` | *(auto from crate path)* | Repo root for spawn `cwd` |
+
+## Native-engine sidecar (Tauri `externalBin`)
+
+Configured in `apps/desktop/src-tauri/tauri.conf.json`:
+
+```json
+"externalBin": ["../../native-engine/build/thestuu-native"]
+```
+
+Tauri expects a target-triplet suffix at build time, e.g.:
+
+| Platform | Sidecar filename (examples) |
+|----------|-------------------------------|
+| macOS Apple Silicon | `thestuu-native-aarch64-apple-darwin` |
+| macOS Intel | `thestuu-native-x86_64-apple-darwin` |
+| Linux x86_64 | `thestuu-native-x86_64-unknown-linux-gnu` |
+| Windows | `thestuu-native-x86_64-pc-windows-msvc.exe` |
+
+`apps/desktop/src-tauri/build.rs` copies `apps/native-engine/build/thestuu-native` (or `Release/`) to the suffixed name when present.
+
+**Dev binary paths (CMake, not committed):**
+
+- `apps/native-engine/build/thestuu-native`
+- `apps/native-engine/build/Release/thestuu-native` (MSVC / multi-config)
+
+Rust spawn API: `app.shell().sidecar("thestuu-native")` with args `--socket <path>`.
 
 ## Future packaged desktop flow (not implemented)
 
-Planned sidecars (Tauri **spawns and supervises**, does not implement DAW logic):
+| Sidecar | Status | Notes |
+|---------|--------|-------|
+| Native | **Phase 2** — spawn/stop in dev | Production bundling + signing not done |
+| Engine (Node) | Planned | `node apps/engine/src/server.js` |
+| Dashboard | Planned | static export or embedded server |
 
-| Sidecar | Binary / process | Responsibility |
-|---------|------------------|----------------|
-| Native | `thestuu-native` | Tracktion DAW — arrangement, transport, mixer, plugins |
-| Engine | `node apps/engine/src/server.js` | WebSocket API, sidecar merge, IPC to native |
-| Dashboard | static server or embedded Next export | UI assets served to the webview |
+Target order when complete: native → engine → dashboard → Tauri window.
 
-Target startup order: native → engine → dashboard → Tauri window.
-
-Tauri responsibilities later:
-
-- Spawn/kill/restart sidecars
-- Health checks and crash recovery
-- OS menus, file associations, auto-update (platform-specific)
-- Single `.app` / `.exe` installer
-
-**Out of scope for the shell:** clip move, undo stacks, mixer state, project JSON as source of truth.
+**Out of scope:** auto-update, code signing, shipping Tracktion/JUCE in git, Node sidecar in this task.
 
 ## Per-platform build notes
 
 ### macOS
 
-- Install [Rust](https://rustup.rs/) and Xcode command line tools.
-- `npm run desktop:build` → `.app` under `apps/desktop/src-tauri/target/release/bundle/`.
-- Code signing / notarization: not configured in this scaffold.
+- Build native: CMake target `thestuu-native` under `apps/native-engine/build/`.
+- `npm run desktop:build` → `.app` under `src-tauri/target/release/bundle/`.
+- Notarization / signing: not configured.
 
 ### Windows
 
-- Rust + Visual Studio Build Tools (MSVC).
-- WebView2 runtime (usually present on Windows 10+).
+- Binary: `thestuu-native.exe` in `build/` or `build/Release/`.
+- Native IPC uses Unix domain sockets in current code — validate Windows support before shipping.
 
 ### Linux
 
-- Rust + system deps (`webkit2gtk`, etc. — see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)).
-- `.deb` / `.AppImage` from `tauri build` when bundle targets are enabled.
+- Rust + `webkit2gtk` (Tauri prerequisites).
+- Sidecar: `thestuu-native-x86_64-unknown-linux-gnu` (or arm64 triple).
 
-## What this task did **not** do
+## Tauri commands (shell ↔ UI)
 
-- Bundle native-engine, engine, or dashboard into the Tauri app
-- Change DAW authority rules or native-first flags
-- Replace `npm run start` or remove `apps/cli`
-- Add product features (menus, project open dialogs, auto-update)
-- Ship production installers with signed sidecars
+| Command | Purpose |
+|---------|---------|
+| `get_desktop_status` | UI / native / IPC / Tracktion / audio / DAW ready flags |
+| `get_native_logs` | Captured stdout/stderr from managed native process |
+| `retry_native_startup` | Stop managed native (if any) and spawn again |
+
+Event: `desktop://status` (polled every 2s from Rust).
 
 ## QA
-
-After desktop changes, run:
 
 ```bash
 npm run check:daw-authority
 npm run test:daw-authority
 ```
 
-With engine + native running and native flags set:
+Native QA (engine on `:3990` with native flags):
 
 ```bash
-npm run qa:native-daw
+STUU_NATIVE_CLIP_OPS=1 STUU_NATIVE_EDIT_UNDO=1 STUU_NATIVE_TRACK_OPS=1 \
+STUU_NATIVE_PROJECT_SIDECAR=1 STUU_NATIVE_LEGACY_SYNC=0 npm run qa:native-daw
 ```
 
 Legacy smoke requires engine **without** `STUU_NATIVE_*=1`:
@@ -137,14 +183,20 @@ Legacy smoke requires engine **without** `STUU_NATIVE_*=1`:
 npm run qa:legacy-daw
 ```
 
-Desktop scaffold does not affect these checks unless engine/native code was modified.
+If legacy fails with *"engine has native-first flags enabled"*, restart the engine without native env vars — not a desktop regression.
+
+Desktop changes do not modify `apps/engine` DAW authority paths.
 
 ## Repository layout
 
 ```
 apps/desktop/
-  offline/index.html      # offline / retry UI (not DAW UI)
-  src-tauri/              # Rust + Tauri config
+  offline/index.html       # shell status + retry (not DAW UI)
+  src-tauri/
+    src/lib.rs             # Tauri app + status poller
+    src/native_sidecar.rs  # spawn / reuse / stop native-engine
+    src/native_health.rs   # IPC health probes (read-only)
+    build.rs               # copy native bin for externalBin triple
   package.json
 ```
 

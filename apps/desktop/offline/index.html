@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>TheStuu — offline</title>
+  <title>TheStuu — starting</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -17,13 +17,30 @@
       color: #e8e8ec;
       padding: 24px;
     }
-    .card {
-      max-width: 420px;
-      text-align: center;
-    }
-    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 8px; }
-    p { margin: 0 0 16px; color: #a0a4b0; line-height: 1.5; font-size: 0.9rem; }
+    .card { max-width: 520px; width: 100%; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 12px; }
+    p { margin: 0 0 12px; color: #a0a4b0; line-height: 1.5; font-size: 0.9rem; }
     code { background: #1a1c24; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+    ul { list-style: none; padding: 0; margin: 0 0 16px; }
+    li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid #1e212b;
+      font-size: 0.9rem;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: #4a4f5c;
+    }
+    .dot.ok { background: #3ecf6e; }
+    .dot.warn { background: #e8b339; }
+    .dot.err { background: #e85d5d; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     button {
       background: #3d7cff;
       color: #fff;
@@ -33,46 +50,143 @@
       font-size: 0.9rem;
       cursor: pointer;
     }
-    button:hover { background: #2f6ae8; }
-    .hint { margin-top: 20px; font-size: 0.8rem; color: #6b7080; }
+    button.secondary { background: #2a2d38; color: #c8cad4; }
+    button:hover { filter: brightness(1.08); }
+    .error {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: #2a1518;
+      border: 1px solid #5c2a30;
+      border-radius: 6px;
+      color: #f0a8a8;
+      font-size: 0.85rem;
+      display: none;
+    }
+    .error.visible { display: block; }
+    .hint { margin-top: 16px; font-size: 0.8rem; color: #6b7080; }
+    pre.logs {
+      margin-top: 12px;
+      max-height: 140px;
+      overflow: auto;
+      background: #12141a;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      color: #8b90a0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>TheStuu is not running</h1>
-    <p>
-      The desktop shell could not reach the dashboard at
-      <code id="dashboard-url">http://127.0.0.1:3010</code>.
-    </p>
-    <p>
-      Start the stack from the repo root, then retry:
-    </p>
-    <p><code>npm run start</code></p>
-    <button type="button" id="retry">Retry connection</button>
+    <h1>TheStuu desktop shell</h1>
+    <p>Status (Tauri manages native-engine only; Node engine is not started by the shell yet):</p>
+    <ul id="status-list">
+      <li><span class="dot" id="dot-ui"></span><span>UI online (dashboard)</span></li>
+      <li><span class="dot" id="dot-native"></span><span>native-engine process</span></li>
+      <li><span class="dot" id="dot-ipc"></span><span>IPC connected</span></li>
+      <li><span class="dot" id="dot-tracktion"></span><span>Tracktion backend ready</span></li>
+      <li><span class="dot" id="dot-audio"></span><span>Audio device ready</span></li>
+      <li><span class="dot" id="dot-daw"></span><span>DAW ready</span></li>
+    </ul>
+    <p>Socket: <code id="socket-path">—</code></p>
+    <div class="error" id="error-box"></div>
+    <div class="actions">
+      <button type="button" id="retry-native">Retry native-engine</button>
+      <button type="button" class="secondary" id="open-dashboard">Open dashboard</button>
+    </div>
+    <pre class="logs" id="logs" hidden></pre>
     <p class="hint">
-      Phase 1: Tauri does not start native-engine or the Node engine — it only opens a window.
-      DAW state stays in Tracktion + engine; this app is a shell only.
+      Phase 2: Tauri spawns <code>thestuu-native</code> on startup and stops it on exit when it launched the process.
+      Run <code>npm run start</code> for the full stack (Node + dashboard). This page never fakes DAW state.
     </p>
   </div>
   <script>
     const DASHBOARD_URL = 'http://127.0.0.1:3010';
-    document.getElementById('dashboard-url').textContent = DASHBOARD_URL;
 
-    async function tryConnect() {
-      try {
-        await fetch(DASHBOARD_URL, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
-        window.location.replace(DASHBOARD_URL);
-        return true;
-      } catch {
-        return false;
+    function setDot(id, state) {
+      const el = document.getElementById(id);
+      el.className = 'dot ' + (state || '');
+    }
+
+    function renderStatus(s) {
+      setDot('dot-ui', s.uiOnline ? 'ok' : '');
+      setDot('dot-native', s.nativeProcessRunning ? 'ok' : (s.startupError ? 'err' : 'warn'));
+      setDot('dot-ipc', s.ipcConnected ? 'ok' : '');
+      setDot('dot-tracktion', s.tracktionReady ? 'ok' : '');
+      setDot('dot-audio', s.audioDeviceReady ? 'ok' : '');
+      setDot('dot-daw', s.dawReady ? 'ok' : (s.nativeProcessRunning ? 'warn' : ''));
+
+      document.getElementById('socket-path').textContent = s.socketPath || '—';
+
+      const err = document.getElementById('error-box');
+      if (s.startupError) {
+        err.textContent = s.startupError;
+        err.classList.add('visible');
+      } else {
+        err.textContent = '';
+        err.classList.remove('visible');
+      }
+
+      if (s.uiOnline && s.dawReady) {
+        window.location.replace(s.dashboardUrl || DASHBOARD_URL);
       }
     }
 
-    document.getElementById('retry').addEventListener('click', () => {
-      tryConnect();
+    async function refresh() {
+      if (!window.__TAURI__) return;
+      const { invoke } = window.__TAURI__.core;
+      try {
+        const status = await invoke('get_desktop_status');
+        renderStatus(status);
+      } catch (e) {
+        console.warn('get_desktop_status failed', e);
+      }
+    }
+
+    async function loadLogs() {
+      if (!window.__TAURI__) return;
+      const { invoke } = window.__TAURI__.core;
+      try {
+        const lines = await invoke('get_native_logs');
+        const pre = document.getElementById('logs');
+        if (lines && lines.length) {
+          pre.hidden = false;
+          pre.textContent = lines.slice(-40).join('\n');
+        }
+      } catch (_) {}
+    }
+
+    document.getElementById('retry-native').addEventListener('click', async () => {
+      if (!window.__TAURI__) return;
+      const { invoke } = window.__TAURI__.core;
+      try {
+        const status = await invoke('retry_native_startup');
+        renderStatus(status);
+        await loadLogs();
+      } catch (e) {
+        document.getElementById('error-box').textContent = String(e);
+        document.getElementById('error-box').classList.add('visible');
+      }
     });
 
-    setInterval(tryConnect, 4000);
+    document.getElementById('open-dashboard').addEventListener('click', () => {
+      window.location.replace(DASHBOARD_URL);
+    });
+
+    if (window.__TAURI__) {
+      const { listen } = window.__TAURI__.event;
+      listen('desktop://status', (event) => renderStatus(event.payload));
+      refresh();
+      loadLogs();
+      setInterval(refresh, 3000);
+      setInterval(loadLogs, 5000);
+    } else {
+      document.getElementById('error-box').textContent =
+        'Tauri API unavailable — open via npm run desktop:dev';
+      document.getElementById('error-box').classList.add('visible');
+    }
   </script>
 </body>
 </html>

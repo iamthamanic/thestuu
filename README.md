@@ -83,7 +83,7 @@ Weitere Leitdokumente:
 
 ## Desktop shell (Tauri, optional)
 
-TheStuu can open in a native window via **Tauri** (`apps/desktop`). The shell **does not own DAW state** — it only loads the dashboard when `npm run start` is already running.
+TheStuu can open in a native window via **Tauri** (`apps/desktop`). The shell **does not own DAW state** — it manages **native-engine** lifecycle (spawn/reuse/stop) and loads the dashboard when reachable. Node engine and dashboard still start via `npm run start` unless you run them separately.
 
 ```bash
 # Terminal 1

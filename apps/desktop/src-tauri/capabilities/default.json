@@ -1,9 +1,30 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "TheStuu desktop shell — core webview only (no DAW IPC)",
+  "description": "TheStuu desktop shell — webview, native sidecar lifecycle (no DAW IPC mutation)",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "shell:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "thestuu-native",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "thestuu-native",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
   ]
 }
