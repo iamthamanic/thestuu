@@ -20,10 +20,8 @@ import {
 import {
   formatLiveLogTime,
   formatLogLineLabel,
-  normalizeStructuredLogEntry,
 } from '../lib/live-logs.js';
-
-const LIVE_LOG_LIMIT = 500;
+import { mergeLogsPanelHealth } from '../lib/engine-diagnostics.js';
 
 /**
  * @param {object} props
@@ -31,6 +29,7 @@ const LIVE_LOG_LIMIT = 500;
  * @param {string} props.enginePort
  * @param {boolean} props.dawEngineReady
  * @param {boolean} props.nativeTransport
+ * @param {object | null} props.engineDiagnostics
  * @param {import('react').Dispatch<import('react').SetStateAction<Array>>} props.setConnectionLogs
  * @param {Array} props.connectionLogs
  * @param {(entry: object) => void} props.appendLogEntry
@@ -40,6 +39,7 @@ export default function ConnectionStatusLogs({
   enginePort,
   dawEngineReady,
   nativeTransport,
+  engineDiagnostics,
   connectionLogs,
   setConnectionLogs,
   appendLogEntry,
@@ -56,6 +56,8 @@ export default function ConnectionStatusLogs({
   const viewportRef = useRef(null);
   const desktopLogIdsRef = useRef(new Set());
   const autoScrollRef = useRef(true);
+  const appendLogEntryRef = useRef(appendLogEntry);
+  appendLogEntryRef.current = appendLogEntry;
 
   const connectionStatusVariant = dawEngineReady
     ? 'online'
@@ -75,15 +77,10 @@ export default function ConnectionStatusLogs({
       ? 'no audio'
       : connection;
 
-  const health = desktopHealth || {
-    dashboardOnline: connection === 'online',
-    engineOnline: connection === 'online',
-    nativeProcessRunning: nativeTransport,
-    ipcConnected: nativeTransport,
-    tracktionReady: false,
-    audioDeviceReady: false,
-    dawReady: dawEngineReady,
-  };
+  const health = mergeLogsPanelHealth(connection, dawEngineReady, engineDiagnostics, desktopHealth);
+  const legacyClipOpsOff =
+    engineDiagnostics?.nativeDawFlags?.clipOps === false
+    || health.dawAuthority === 'legacy-json';
 
   const updatePortalLayout = useCallback(() => {
     if (typeof window === 'undefined') return;
@@ -108,7 +105,7 @@ export default function ConnectionStatusLogs({
     const unsub = subscribeDesktopDiagnostics(
       (h) => setDesktopHealth(h),
       (entry) => {
-        if (entry) appendLogEntry(entry);
+        if (entry) appendLogEntryRef.current(entry);
       },
     );
 
@@ -118,7 +115,7 @@ export default function ConnectionStatusLogs({
         setIsTauri(inTauri);
         setDesktopHealth(h);
         for (const entry of newLogs) {
-          appendLogEntry(entry);
+          appendLogEntryRef.current(entry);
         }
       } catch (err) {
         console.warn('[desktop-diagnostics]', err);
@@ -131,7 +128,7 @@ export default function ConnectionStatusLogs({
       clearInterval(id);
       unsub();
     };
-  }, [appendLogEntry]);
+  }, []);
 
   useEffect(() => {
     if (!showLogs) {
@@ -157,7 +154,7 @@ export default function ConnectionStatusLogs({
       document.removeEventListener('pointerdown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [showLogs, connectionLogs.length, updatePortalLayout]);
+  }, [showLogs, updatePortalLayout]);
 
   useEffect(() => {
     if (!autoScrollRef.current || !viewportRef.current) return;
@@ -297,6 +294,11 @@ export default function ConnectionStatusLogs({
                 {healthRow('track', 'Tracktion', health.tracktionReady)}
                 {healthRow('audio', 'Audio device', health.audioDeviceReady)}
               </div>
+              {legacyClipOpsOff ? (
+                <div className="status-log-native-error" role="status">
+                  Legacy JSON mode (clipOps=false): not optimized for smooth playback. Start with npm run start (native-first). Use --legacy-daw only for QA.
+                </div>
+              ) : null}
               {health.lastNativeError ? (
                 <div className="status-log-native-error" role="alert">
                   {health.lastNativeError}
@@ -373,5 +375,3 @@ export default function ConnectionStatusLogs({
     </span>
   );
 }
-
-export { normalizeStructuredLogEntry, LIVE_LOG_LIMIT };

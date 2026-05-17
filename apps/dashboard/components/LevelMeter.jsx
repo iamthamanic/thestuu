@@ -1,11 +1,12 @@
 /**
  * Vertical peak meter (0–1): Mix strip (tall) or Arrangement row (compact).
- * FL-style ballistics: instant attack, exponential release toward the engine sample;
- * optional short peak-hold segment. Optional graded gradient via CSS modifiers.
+ * FL-style ballistics via shared MeterAnimator (single rAF for all meters).
  * Location: apps/dashboard/components — consumed by stuu-shell Mix + Arrangement meters.
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { registerMeterAnimator } from '../lib/meter-animator.js';
+import { levelMeterLightMode, getPerformanceProfile } from '../lib/performance-prefs.js';
 
 function clamp01(n) {
   const v = Number(n);
@@ -25,91 +26,38 @@ export default function LevelMeter({
   ballistics = true,
   peakHoldEnabled = true,
   peakHoldMs = 750,
+  light = undefined,
 }) {
   const targetRef = useRef(0);
-  const envelopeRef = useRef(0);
-  const heldPeakRef = useRef(0);
-  const holdUntilRef = useRef(0);
-  const lastFrameTsRef = useRef(null);
-  const lastEmitRef = useRef({ env: -1, held: -1 });
-
+  const registrationIdRef = useRef({});
   const [paint, setPaint] = useState({ env: 0, held: 0 });
+
+  const perfLight = light ?? levelMeterLightMode(getPerformanceProfile());
+  const useBallistics = ballistics && !perfLight;
+  const usePeakHold = peakHoldEnabled && !perfLight;
 
   targetRef.current = clamp01(value);
 
   useEffect(() => {
-    if (!ballistics) {
+    if (!useBallistics) {
       const v = targetRef.current;
-      envelopeRef.current = v;
-      heldPeakRef.current = v;
       setPaint({ env: v, held: v });
       return undefined;
     }
 
-    const releaseTauSec = variant === 'arrangement' ? 0.11 : 0.18;
-    let cancelled = false;
-    let rafId = 0;
+    return registerMeterAnimator(registrationIdRef.current, {
+      getTarget: () => targetRef.current,
+      setPaint: (env, held) => setPaint({ env, held }),
+      variant,
+      peakHoldEnabled: usePeakHold,
+      peakHoldMs,
+    });
+  }, [useBallistics, usePeakHold, peakHoldMs, variant]);
 
-    const tick = (ts) => {
-      if (cancelled) {
-        return;
-      }
-      const now = ts ?? performance.now();
-      const last = lastFrameTsRef.current;
-      lastFrameTsRef.current = now;
-      const dt = last == null ? 0 : Math.min(0.08, Math.max(0, (now - last) / 1000));
-
-      const t = targetRef.current;
-      let env = envelopeRef.current;
-      if (t >= env) {
-        env = t;
-      } else if (dt > 0) {
-        const k = 1 - Math.exp(-dt / releaseTauSec);
-        env += (t - env) * k;
-      }
-      envelopeRef.current = env;
-
-      let held = heldPeakRef.current;
-      let holdUntil = holdUntilRef.current;
-      if (peakHoldEnabled) {
-        if (env >= held - 1e-5) {
-          held = env;
-          holdUntil = now + peakHoldMs;
-        } else if (now >= holdUntil) {
-          held = env;
-        }
-        heldPeakRef.current = held;
-        holdUntilRef.current = holdUntil;
-      } else {
-        held = env;
-        heldPeakRef.current = held;
-      }
-
-      const prev = lastEmitRef.current;
-      if (
-        Math.abs(env - prev.env) > 0.0015
-        || Math.abs(held - prev.held) > 0.0015
-        || (env < 0.025 && t < 0.025 && Math.abs(env - prev.env) > 1e-6)
-      ) {
-        lastEmitRef.current = { env, held };
-        setPaint({ env, held });
-      }
-
-      rafId = requestAnimationFrame(tick);
-    };
-
-    rafId = requestAnimationFrame(tick);
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(rafId);
-      lastFrameTsRef.current = null;
-    };
-  }, [ballistics, peakHoldEnabled, peakHoldMs, variant]);
-
-  const v = ballistics ? paint.env : clamp01(value);
-  const held = ballistics ? paint.held : v;
+  const v = useBallistics ? paint.env : clamp01(value);
+  const held = useBallistics ? paint.held : v;
   const pct = toPct(v);
-  const showPeakHold = peakHoldEnabled && ballistics && held > v + 0.004;
+  const showPeakHold = usePeakHold && useBallistics && held > v + 0.004;
 
   const wrapClass = variant === 'arrangement' ? 'arrangement-track-meter' : 'mix-strip-meter';
   const fillClass =
@@ -128,7 +76,7 @@ export default function LevelMeter({
       {showPeakHold ? (
         <div
           className="level-meter-peak-hold"
-          style={{ bottom: `${Math.min(100, Math.max(0, held * 100)).toFixed(2)}%` }}
+          style={{ bottom: `${toPct(held)}%` }}
           aria-hidden="true"
         />
       ) : null}

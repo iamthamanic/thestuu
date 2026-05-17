@@ -15,6 +15,7 @@ Options:
   --native-vendor-dir <path> Path containing JUCE + tracktion_engine sources
   --native-socket <path>  Unix socket path for native transport bridge
   --no-native             Disable native transport process and use JS transport clock
+  --legacy-daw            Legacy JSON DAW mode (disables STUU_NATIVE_* clip/track flags)
   --no-browser            Do not open browser automatically
   -h, --help              Show help
 `);
@@ -30,6 +31,7 @@ function parseArgs(argv) {
     nativeBackend: 'tracktion',
     nativeVendorDir: null,
     nativeSocket: null,
+    legacyDaw: false,
   };
 
   const args = [...argv];
@@ -85,6 +87,11 @@ function parseArgs(argv) {
 
     if (arg === '--no-native') {
       options.native = false;
+      continue;
+    }
+
+    if (arg === '--legacy-daw') {
+      options.legacyDaw = true;
       continue;
     }
 

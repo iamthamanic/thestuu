@@ -1,5 +1,5 @@
-import StuuShell from '../components/stuu-shell';
+import DawShell from '../components/daw/daw-shell';
 
 export default function Page() {
-  return <StuuShell />;
+  return <DawShell />;
 }

@@ -3,6 +3,8 @@
  * Used by engine Socket.IO events and Tauri desktop diagnostics.
  */
 
+export const LIVE_LOG_LIMIT = 500;
+
 export const LIVE_LOG_SOURCES = Object.freeze({
   ENGINE: 'engine',
   TAURI_SHELL: 'tauri-shell',

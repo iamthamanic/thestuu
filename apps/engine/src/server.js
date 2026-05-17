@@ -63,12 +63,18 @@ const NATIVE_PROJECT_IO_TIMEOUT_MS = 120000;
 const stuuDebugMeters = process.env.STUU_DEBUG_METERS === '1';
 /** Opt-in only: fake random meter motion when Native has no transport.get_meters. Default off — meters stay at 0 until Native is rebuilt. */
 const meterUiFallbackEnabled = process.env.STUU_METER_UI_FALLBACK === '1';
-/** Socket `engine:meter` poll interval (native `transport.get_meters`). Default 50 (~20 Hz); lowers JUCE/message-thread load vs 30 Hz (reduces crackle under load). Override: STUU_METER_INTERVAL_MS. */
+/** Socket `engine:meter` poll interval (native `transport.get_meters`). Default 50 (~20 Hz); lowers JUCE/message-thread load vs 30 Hz (reduces crackle under load). Override: STUU_METER_INTERVAL_MS. STUU_PERF=low → 140ms. */
 const meterIntervalMsRaw = Number(process.env.STUU_METER_INTERVAL_MS);
-const engineMeterIntervalMs =
-  Number.isFinite(meterIntervalMsRaw) && meterIntervalMsRaw >= 16
-    ? Math.min(500, Math.round(meterIntervalMsRaw))
-    : 50;
+const stuuPerfProfile = String(process.env.STUU_PERF || '').toLowerCase();
+const engineMeterIntervalMs = (() => {
+  if (Number.isFinite(meterIntervalMsRaw) && meterIntervalMsRaw >= 16) {
+    return Math.min(500, Math.round(meterIntervalMsRaw));
+  }
+  if (stuuPerfProfile === 'low') {
+    return 140;
+  }
+  return 50;
+})();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const engineDir = path.resolve(__dirname, '..');
@@ -307,6 +313,8 @@ let nativeTransportClient = null;
 let nativeTransportActive = false;
 /** True only when native is connected and reports Tracktion backend (not stub). UI "online" = this. */
 let nativeTracktionActive = false;
+/** Set after audio.get_outputs probe when native IPC is up. */
+let nativeAudioDeviceReady = false;
 let cachedNativePluginsByUid = new Map();
 let latestEqAnalyzerFrame = null;
 let desiredEqAnalyzerTarget = { mode: 'master', trackId: 0, pluginIndex: -1 };
@@ -1034,6 +1042,63 @@ function getStatePayload() {
   };
 }
 
+function isNativeFirstDawAuthority() {
+  return nativeClipOpsEnabled
+    && nativeTrackOpsEnabled
+    && nativeEditUndoEnabled
+    && nativeProjectSidecarEnabled
+    && !nativeLegacySyncEnabled;
+}
+
+function getEngineDiagnosticsPayload() {
+  const ipcConnected = Boolean(
+    nativeTransportActive
+    && nativeTransportClient
+    && (typeof nativeTransportClient.connected === 'boolean'
+      ? nativeTransportClient.connected
+      : true),
+  );
+  return {
+    nativeProcessRunning: Boolean(nativeTransportActive),
+    ipcConnected,
+    tracktionReady: Boolean(nativeTracktionActive),
+    audioDeviceReady: Boolean(nativeAudioDeviceReady),
+    dawReady: Boolean(nativeTracktionActive && nativeAudioDeviceReady),
+    dawAuthority: isNativeFirstDawAuthority() ? 'native-first' : 'legacy-json',
+    nativeSocketPath: nativeTransportEnabled ? nativeSocketPath : null,
+    nativeDawFlags: {
+      clipOps: nativeClipOpsEnabled,
+      trackOps: nativeTrackOpsEnabled,
+      editUndo: nativeEditUndoEnabled,
+      projectSidecar: nativeProjectSidecarEnabled,
+      legacySync: nativeLegacySyncEnabled,
+      transport: nativeTransportEnabled,
+    },
+  };
+}
+
+function emitEngineDiagnostics() {
+  if (!engineLogIo) {
+    return;
+  }
+  engineLogIo.emit(ENGINE_EVENTS.DIAGNOSTICS, getEngineDiagnosticsPayload());
+}
+
+async function refreshNativeAudioDeviceReady() {
+  if (!nativeTransportActive) {
+    nativeAudioDeviceReady = false;
+    return false;
+  }
+  try {
+    const response = await requestNativeTransport('audio.get_outputs');
+    const devices = Array.isArray(response?.devices) ? response.devices : [];
+    nativeAudioDeviceReady = devices.length > 0 || Boolean(response?.currentId);
+  } catch {
+    nativeAudioDeviceReady = false;
+  }
+  return nativeAudioDeviceReady;
+}
+
 function emitState(options = {}) {
   const wantsHistory = options.recordHistory !== false;
   syncProjectHistory({ record: wantsHistory && shouldUseJsonProjectHistory() });
@@ -1064,6 +1129,8 @@ function emitNativeEngineOffline(reason = 'native-disconnected') {
   }
   nativeTransportActive = false;
   nativeTracktionActive = false;
+  nativeAudioDeviceReady = false;
+  emitEngineDiagnostics();
   io.emit(ENGINE_EVENTS.OFFLINE, {
     reason,
     nativeTransport: false,
@@ -1077,7 +1144,9 @@ function emitNativeEngineReady() {
   io.emit(ENGINE_EVENTS.READY, {
     nativeTransport: Boolean(nativeTracktionActive),
     nativeSocket: nativeSocketPath,
+    diagnostics: getEngineDiagnosticsPayload(),
   });
+  emitEngineDiagnostics();
 }
 
 function ensureProjectArrays() {
@@ -4540,12 +4609,16 @@ async function startNativeTransportBridge() {
     emitState();
     emitTransport(Date.now());
     requestNativeTransport('backend.info')
-      .then((r) => {
+      .then(async (r) => {
         nativeTracktionActive = Boolean(r && r.tracktion);
+        await refreshNativeAudioDeviceReady();
         emitState();
         emitTransport(Date.now());
+        emitEngineDiagnostics();
       })
-      .catch(() => {});
+      .catch(() => {
+        emitEngineDiagnostics();
+      });
     setTimeout(async () => {
       if (!nativeTransportActive) return;
       try {
@@ -4558,10 +4631,13 @@ async function startNativeTransportBridge() {
         await applyNativeAnalyzerTarget().catch((error) => {
           console.warn('[thestuu-engine] analyzer target sync failed:', error instanceof Error ? error.message : String(error));
         });
+        await refreshNativeAudioDeviceReady();
         emitState();
         emitTransport(Date.now());
+        emitEngineDiagnostics();
       } catch (error) {
-        console.warn('[thestuu-engine] native transport sync failed:', error instanceof Error ? error.message : error);
+        console.warn('[thestuu-engine] native transport sync failed:', error instanceof Error ? error.message : String(error));
+        emitEngineDiagnostics();
       }
     }, 500);
   });
@@ -4884,9 +4960,10 @@ const httpServer = createServer(async (request, response) => {
         pid: process.pid,
         host: engineHost,
         port: enginePort,
-        nativeTransport: Boolean(nativeTransportActive),
+        nativeTransport: Boolean(nativeTracktionActive),
         projectFile: state?.selectedProjectFile ?? null,
         timestamp: Date.now(),
+        diagnostics: getEngineDiagnosticsPayload(),
       });
       return;
     }
@@ -4938,13 +5015,24 @@ function bindMutation(socket, eventName, handler) {
 }
 
 io.on('connection', (socket) => {
+  socket.data.meterPaused = false;
+  socket.on('client:meter_pause', (payload = {}) => {
+    socket.data.meterPaused = Boolean(payload.paused);
+  });
+  socket.on('client:performance_profile', (payload = {}) => {
+    const profile = String(payload.profile || '').toLowerCase();
+    if (profile === 'low' || profile === 'balanced' || profile === 'high') {
+      socket.data.performanceProfile = profile;
+    }
+  });
+
   if (!nativeTransportActive) {
     updateTransportSnapshot(Date.now());
   }
   socket.emit('engine:ready', {
     enginePort,
     projectFile: state.selectedProjectFile,
-    nativeTransport: nativeTransportActive,
+    nativeTransport: nativeTracktionActive,
     nativeSocketPath: nativeTransportEnabled ? nativeSocketPath : null,
     nativeDawFlags: {
       clipOps: nativeClipOpsEnabled,
@@ -4954,7 +5042,9 @@ io.on('connection', (socket) => {
       legacySync: nativeLegacySyncEnabled,
       transport: nativeTransportEnabled,
     },
+    diagnostics: getEngineDiagnosticsPayload(),
   });
+  emitEngineDiagnostics();
   socket.emit('engine:logs:init', {
     entries: engineLogBuffer,
   });
@@ -6686,9 +6776,30 @@ let lastMetersRequestErrorLogMs = 0;
 let lastStuuDebugMetersLogMs = 0;
 let loggedMeterPlaceholderNotice = false;
 
+function engineHasMeterSubscribers() {
+  if (!io || !io.sockets) {
+    return false;
+  }
+  for (const socket of io.sockets.sockets.values()) {
+    if (!socket.data?.meterPaused) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function emitEngineMeterTick() {
   const now = Date.now();
-  emitTransport(now);
+  if (!io.sockets?.sockets?.size) {
+    return;
+  }
+  if (!engineHasMeterSubscribers()) {
+    return;
+  }
+  // Native path: transport.tick already emits engine:transport — avoid duplicate emit on meter poll.
+  if (!nativeTransportActive) {
+    emitTransport(now);
+  }
 
   const playlist = state.project.playlist || [];
   let meters;

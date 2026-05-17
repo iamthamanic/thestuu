@@ -1,7 +1,15 @@
 'use client';
 
 import Image from 'next/image';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  startTransition,
+} from 'react';
 import { createPortal } from 'react-dom';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import {
@@ -42,14 +50,27 @@ import {
 } from 'lucide-react';
 import 'reactflow/dist/style.css';
 import { createEngineSocket } from '../lib/socket';
-import { getMeterMap } from '../lib/meter-map';
-import LevelMeter from './LevelMeter';
+import { clipIntersectsViewport, getVisibleBarRange, trackRowIntersectsViewport } from '../lib/clip-visibility.js';
+import {
+  getPerformanceProfile,
+  meterIntervalMsForProfile,
+  setPerformanceProfile,
+} from '../lib/performance-prefs.js';
+import { useBindMeterSocket } from '../context/meters-context.jsx';
+import MeterSubscription from './daw/meter-subscription.jsx';
+import { MixMeterFlatHint } from '../context/meters-context.jsx';
+import {
+  ArrangementTrackLevelMeter,
+  MixMasterLevelMeter,
+  MixStripLevelMeter,
+} from './daw/meter-ui.jsx';
 import MixPlaylistOverview from './MixPlaylistOverview';
 import MixStripChain from './MixStripChain';
 import SongStructureAddMenu from './SongStructureAddMenu';
 import SongStructureLane from './SongStructureLane';
-import ConnectionStatusLogs, { LIVE_LOG_LIMIT as LIVE_ENGINE_LOG_LIMIT } from './connection-status-logs.jsx';
-import { normalizeStructuredLogEntry } from '../lib/live-logs.js';
+import ConnectionStatusLogs from './connection-status-logs.jsx';
+import { LIVE_LOG_LIMIT as LIVE_ENGINE_LOG_LIMIT, normalizeStructuredLogEntry } from '../lib/live-logs.js';
+import { mapEngineDiagnostics } from '../lib/engine-diagnostics.js';
 import SongStructureNodeModal from './SongStructureNodeModal';
 import SongStructureTemplateManager from './SongStructureTemplateManager';
 import { buildPlaylistOverviewPeaks } from '../lib/playlist-overview-peaks';
@@ -2632,6 +2653,7 @@ export default function StuuShell() {
   const mixLevelDragDetachRef = useRef(null);
 
   const [connection, setConnection] = useState('connecting');
+  const [engineDiagnostics, setEngineDiagnostics] = useState(null);
   const [connectionLogs, setConnectionLogs] = useState([]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [settingsTab, setSettingsTab] = useState('AUDIO');
@@ -2672,9 +2694,15 @@ export default function StuuShell() {
     ? state.appPreferences.record_use_standard_mic
     : FALLBACK_STATE.appPreferences.record_use_standard_mic;
   const [transport, setTransport] = useState(FALLBACK_STATE.transport);
-  const [meters, setMeters] = useState({});
-  const [meterFlatWarning, setMeterFlatWarning] = useState(false);
-  const meterFlatSinceRef = useRef(null);
+  const transportUiMetaRef = useRef({
+    bpm: FALLBACK_STATE.transport.bpm,
+    playing: false,
+    recording: false,
+    beatsPerBar: 4,
+  });
+  const [arrangementVisibleBars, setArrangementVisibleBars] = useState({ start: 0, end: 128 });
+  const [performanceProfile, setPerformanceProfileState] = useState('balanced');
+  const bindMeterSocket = useBindMeterSocket();
   const [chatInput, setChatInput] = useState('');
   const [speechListening, setSpeechListening] = useState(false);
   const [chatMessages, setChatMessages] = useState(DEFAULT_CHAT_MESSAGES);
@@ -2796,6 +2824,9 @@ export default function StuuShell() {
   const playlistLinkIntentRef = useRef(false);
   /** False until first snapshot per session — then intent overrides incoming playlist_link_enabled. Reset on project switch / undo / redo. */
   const playlistLinkIntentReadyRef = useRef(false);
+  /** Latest link flag for synchronous toggles (avoids stale closures during rapid engine:state). */
+  const playlistLinkEnabledRef = useRef(false);
+  const playlistLinkTogglePendingRef = useRef(false);
   const appendConnectionLogEntry = useCallback((entry) => {
     const normalized = normalizeStructuredLogEntry({
       source: 'engine',
@@ -2907,10 +2938,26 @@ export default function StuuShell() {
       || nowMs - lastUiCommit.lastMs >= commitIntervalMs;
     if (shouldCommit) {
       transportUiCommitRef.current = { lastMs: nowMs, playing };
-      setTransport((current) => ({
-        ...current,
-        ...merged,
-      }));
+      const meta = transportUiMetaRef.current;
+      const recording = Boolean(merged.recording ?? snapshot?.recording);
+      const metaChanged =
+        !playing
+        || safeBpm !== meta.bpm
+        || playing !== meta.playing
+        || recording !== meta.recording
+        || safeBeatsPerBar !== meta.beatsPerBar;
+      if (metaChanged) {
+        transportUiMetaRef.current = {
+          bpm: safeBpm,
+          playing,
+          recording,
+          beatsPerBar: safeBeatsPerBar,
+        };
+        setTransport((current) => ({
+          ...current,
+          ...merged,
+        }));
+      }
     }
   }, []);
 
@@ -3101,9 +3148,14 @@ export default function StuuShell() {
     socket.on('disconnect', handleDisconnect);
     socket.on('connect_error', handleConnectError);
     socket.io.on('reconnect_attempt', handleReconnectAttempt);
+    const handleEngineDiagnostics = (payload) => {
+      setEngineDiagnostics(mapEngineDiagnostics(payload?.diagnostics ?? payload));
+    };
     socket.on('engine:ready', (payload) => {
       if (Number.isFinite(payload?.enginePort)) setEnginePort(payload.enginePort);
+      handleEngineDiagnostics(payload);
     });
+    socket.on('engine:diagnostics', handleEngineDiagnostics);
     socket.on('engine:logs:init', handleEngineLogsInit);
     socket.on('engine:log', handleEngineLog);
     socket.on('engine:state', (payload) => {
@@ -3199,7 +3251,7 @@ export default function StuuShell() {
       });
       setTrackChainEnabledOverrides({});
     });
-    socket.on('engine:meter', (payload) => setMeters(getMeterMap(payload)));
+    const unbindMeters = bindMeterSocket ? bindMeterSocket(socket) : () => {};
     socket.on('engine:analyzer', (payload) => {
       if (inspectorEqAnalyzerFrozenRef.current) {
         return;
@@ -3215,6 +3267,13 @@ export default function StuuShell() {
         recording: false,
         timestamp: Date.now(),
       });
+      setEngineDiagnostics(mapEngineDiagnostics({
+        nativeProcessRunning: false,
+        ipcConnected: false,
+        tracktionReady: false,
+        audioDeviceReady: false,
+        dawReady: false,
+      }));
       const reason = isObject(payload) && typeof payload.message === 'string'
         ? payload.message
         : 'Native-Engine offline — Transport und DAW-Bearbeitung sind deaktiviert.';
@@ -3233,15 +3292,20 @@ export default function StuuShell() {
       socket.off('engine:logs:init', handleEngineLogsInit);
       socket.off('engine:log', handleEngineLog);
       socket.off('engine:ready');
+      socket.off('engine:diagnostics');
+      unbindMeters();
       socket.off('engine:state');
-      socket.off('engine:meter');
       socket.off('engine:analyzer');
       socket.off('engine:transport');
       socket.off('engine:offline');
       socket.io.off('reconnect_attempt', handleReconnectAttempt);
       socket.close();
     };
-  }, [appendConnectionLogEntry, applyEngineTransportPayload]);
+  }, [appendConnectionLogEntry, applyEngineTransportPayload, bindMeterSocket]);
+
+  useEffect(() => {
+    setPerformanceProfileState(getPerformanceProfile());
+  }, []);
 
   useEffect(() => {
     if (connection !== 'online' || !state?.nativeTransport || !socketRef.current) {
@@ -4463,59 +4527,75 @@ export default function StuuShell() {
     };
   }, [state?.project?.song_structure]);
 
+  useEffect(() => {
+    playlistLinkEnabledRef.current = songStructure.playlist_link_enabled;
+  }, [songStructure.playlist_link_enabled]);
+
   const handleStructurePlaylistLinkToggle = useCallback(() => {
-    if (!socketRef.current) {
-      appendSystemMessage('Socket nicht bereit — Structure-Link kann nicht umgeschaltet werden.');
+    if (playlistLinkTogglePendingRef.current) {
       return;
     }
-    let prevEnabled = false;
-    setState((statePrev) => {
-      const ss = statePrev.project?.song_structure;
-      prevEnabled = Boolean(ss?.playlist_link_enabled);
-      const nextEnabled = !prevEnabled;
-      const base = isObject(ss) ? ss : {};
-      return {
-        ...statePrev,
-        project: {
-          ...statePrev.project,
-          song_structure: {
-            ...base,
-            playlist_link_enabled: nextEnabled,
-          },
-        },
-      };
-    });
+    const socket = socketRef.current;
+    if (!socket || connection !== 'online') {
+      appendSystemMessage('Engine nicht verbunden — Structure-Link kann nicht umgeschaltet werden.');
+      return;
+    }
+    const prevEnabled = playlistLinkEnabledRef.current;
     const nextEnabled = !prevEnabled;
+    playlistLinkTogglePendingRef.current = true;
     playlistLinkIntentRef.current = nextEnabled;
     playlistLinkIntentReadyRef.current = true;
-    socketRef.current.emit(
+    playlistLinkEnabledRef.current = nextEnabled;
+
+    startTransition(() => {
+      setState((statePrev) => {
+        const ss = statePrev.project?.song_structure;
+        const base = isObject(ss) ? ss : {};
+        return {
+          ...statePrev,
+          project: {
+            ...statePrev.project,
+            song_structure: {
+              ...base,
+              playlist_link_enabled: nextEnabled,
+            },
+          },
+        };
+      });
+    });
+
+    socket.emit(
       'song-structure:set-playlist-link',
       { playlist_link_enabled: nextEnabled },
       (result) => {
+        playlistLinkTogglePendingRef.current = false;
         if (result?.ok) {
           return;
         }
-        setState((statePrev) => {
-          const ss = statePrev.project?.song_structure;
-          const base = isObject(ss) ? ss : {};
-          return {
-            ...statePrev,
-            project: {
-              ...statePrev.project,
-              song_structure: {
-                ...base,
-                playlist_link_enabled: prevEnabled,
-              },
-            },
-          };
-        });
         playlistLinkIntentRef.current = prevEnabled;
+        playlistLinkEnabledRef.current = prevEnabled;
+        startTransition(() => {
+          setState((statePrev) => {
+            const ss = statePrev.project?.song_structure;
+            const base = isObject(ss) ? ss : {};
+            return {
+              ...statePrev,
+              project: {
+                ...statePrev.project,
+                song_structure: {
+                  ...base,
+                  playlist_link_enabled: prevEnabled,
+                },
+              },
+            };
+          });
+        });
         appendSystemMessage(
           `Fehler (song-structure:set-playlist-link): ${result?.error || 'Unbekannter Fehler'}`,
         );
       },
     );
-  }, [appendSystemMessage]);
+  }, [appendSystemMessage, connection]);
 
   const structurePlaylistTintSegments = useMemo(() => {
     if (!songStructure.playlist_link_enabled || !songStructure.nodes.length) {
@@ -4973,6 +5053,7 @@ export default function StuuShell() {
         !target.closest('.structure-node')
         && !target.closest('.structure-node-modal-overlay')
         && !target.closest('[data-structure-add-menu="true"]')
+        && !target.closest('[data-structure-link-toggle="true"]')
       ) {
         setSelectedStructureNodeId(null);
       }
@@ -5376,6 +5457,13 @@ export default function StuuShell() {
     }
 
     function handleScroll() {
+      const range = getVisibleBarRange(
+        scrollElement.scrollLeft,
+        scrollElement.clientWidth,
+        barWidthRef.current,
+      );
+      setArrangementVisibleBars(range);
+
       const viewportEnd = scrollElement.scrollLeft + scrollElement.clientWidth;
       const totalWidth = scrollElement.scrollWidth;
       if (totalWidth <= 0) {
@@ -5401,7 +5489,7 @@ export default function StuuShell() {
       return;
     }
 
-    const positionBars = Number(transport?.positionBars);
+    const positionBars = Number(transportSnapshotRef.current?.positionBars);
     if (!Number.isFinite(positionBars)) {
       return;
     }
@@ -8824,38 +8912,12 @@ export default function StuuShell() {
     }
     return [];
   }, [arrangementTracks]);
-  /* Master peak: max over mix tracks from engine rows — not gated on clips (FL-style: live bus / FX / ext input). */
-  const mixMasterPeak = useMemo(() => {
-    return mixTracks.reduce((maxPeak, track) => {
-      const trackPeak = clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1);
-      return Math.max(maxPeak, trackPeak);
-    }, 0);
-  }, [mixTracks, meters]);
   const mixSelectedTrackId = useMemo(() => {
     if (Number.isInteger(selectedTrackId) && mixTracks.some((track) => track.track_id === selectedTrackId)) {
       return selectedTrackId;
     }
     return mixTracks[0]?.track_id ?? null;
   }, [selectedTrackId, mixTracks]);
-
-  useEffect(() => {
-    const playing = Boolean(transport.playing);
-    const nativeOn = Boolean(state?.nativeTransport);
-    const flat =
-      playing && nativeOn && mixTracks.length > 0 && Number(mixMasterPeak) < 0.001;
-    if (!flat) {
-      meterFlatSinceRef.current = null;
-      setMeterFlatWarning(false);
-      return;
-    }
-    const now = Date.now();
-    if (meterFlatSinceRef.current == null) {
-      meterFlatSinceRef.current = now;
-    }
-    if (now - meterFlatSinceRef.current > 2000) {
-      setMeterFlatWarning(true);
-    }
-  }, [transport.playing, state?.nativeTransport, mixTracks.length, mixMasterPeak]);
 
   const showDawTopShell = activeTab === 'Edit' || activeTab === 'Mix';
   const canUndoProject = Boolean(state?.history?.canUndo);
@@ -8867,6 +8929,7 @@ export default function StuuShell() {
       enginePort={String(enginePort)}
       dawEngineReady={dawEngineReady}
       nativeTransport={state?.nativeTransport === true}
+      engineDiagnostics={engineDiagnostics}
       connectionLogs={connectionLogs}
       setConnectionLogs={setConnectionLogs}
       appendLogEntry={appendConnectionLogEntry}
@@ -9390,6 +9453,7 @@ export default function StuuShell() {
 
   return (
     <>
+    <MeterSubscription socketRef={socketRef} connection={connection} activeTab={activeTab} />
     <div className={`stuu-root ${activeTab === 'Edit' ? 'edit-focus' : ''}`}>
       <input
         ref={importFileInputRef}
@@ -9786,6 +9850,7 @@ export default function StuuShell() {
                         <button
                           type="button"
                           className={`arrangement-structure-link-toggle${songStructure.playlist_link_enabled ? ' is-active' : ''}`}
+                          data-structure-link-toggle="true"
                           aria-label={
                             songStructure.playlist_link_enabled
                               ? 'Structure mit Playlist verknüpft (klicken zum Trennen)'
@@ -9797,7 +9862,13 @@ export default function StuuShell() {
                               ? 'Verbunden: Sections verschieben mitzieht Clips. Klick zum Trennen.'
                               : 'Getrennt: Klicken, um Sections mit der Playlist zu verknüpfen.'
                           }
-                          onClick={handleStructurePlaylistLinkToggle}
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                          }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleStructurePlaylistLinkToggle();
+                          }}
                         >
                           <span className="arrangement-structure-link-toggle-glyph" aria-hidden="true">
                             <span className="arrangement-structure-link-toggle-mask" />
@@ -9892,8 +9963,27 @@ export default function StuuShell() {
                         }}
                       >
                         {arrangementTracks.map((track, trackIndex) => {
-                          const meter = meters[track.track_id];
-                          const isHot = track.exists && (meter?.peak || 0) > 0.12;
+                          const scrollEl = arrangementScrollRef.current;
+                          const rowHeightPx = showTrackNodes ? 150 : 104;
+                          if (
+                            scrollEl
+                            && arrangementTracks.length > 24
+                            && !trackRowIntersectsViewport(
+                              trackIndex,
+                              rowHeightPx,
+                              scrollEl.scrollTop,
+                              scrollEl.clientHeight,
+                            )
+                          ) {
+                            return (
+                              <div
+                                key={`track_spacer_${track.track_id}`}
+                                className="arrangement-track-row arrangement-track-row-spacer"
+                                style={{ height: rowHeightPx, minHeight: rowHeightPx }}
+                                aria-hidden="true"
+                              />
+                            );
+                          }
                           const isChainEnabled = track.chain_enabled !== false;
                           const isSelected = multiSelectMode
                             ? selectedTrackIdSet.has(track.track_id)
@@ -9983,10 +10073,9 @@ export default function StuuShell() {
                                   >
                                     <MultiSelectIcon active={selectedTrackIdSet.has(track.track_id)} />
                                   </button>
-                                  <LevelMeter
-                                    variant="arrangement"
+                                  <ArrangementTrackLevelMeter
+                                    trackId={track.track_id}
                                     ariaLabel={`Track ${track.track_id} Pegel`}
-                                    value={clamp(Number(meter?.peak) || 0, 0, 1)}
                                   />
                                   <span className="arrangement-track-index">{track.track_id}</span>
                                   {editingTrackId === track.track_id ? (
@@ -10036,7 +10125,7 @@ export default function StuuShell() {
                                 <div className="arrangement-track-actions" data-track-add-menu-root="true">
                                   <button
                                     type="button"
-                                    className={`arrangement-track-add ${track.track_id === 1 ? 'primary' : ''} ${isHot ? 'hot' : ''}`}
+                                    className={`arrangement-track-add ${track.track_id === 1 ? 'primary' : ''}`}
                                     title={track.track_id === 1 ? 'Track 1: Record, Import oder neues Pattern + Clip' : `Track ${track.track_id}: Record, Import oder Pattern`}
                                     aria-label={`Track ${track.track_id} Aktionen`}
                                     aria-haspopup="menu"
@@ -10856,7 +10945,18 @@ export default function StuuShell() {
                                 <div className="timeline-row-playhead" />
                                 {(() => {
                                   const arrangementClipBpm = Number(state?.project?.bpm) || 128;
-                                  return clips.map((clip) => {
+                                  const clipsInView = clips.filter((clip) => {
+                                    const rendered = getRenderedClip(track.track_id, clip);
+                                    return clipIntersectsViewport(
+                                      {
+                                        start: Number(rendered?.start) || 0,
+                                        length: Number(rendered?.length) || 1,
+                                      },
+                                      arrangementVisibleBars.start,
+                                      arrangementVisibleBars.end,
+                                    );
+                                  });
+                                  return clipsInView.map((clip) => {
                                   const renderedClip = getRenderedClip(track.track_id, clip);
                                   const patternId = getPatternId(renderedClip);
                                   const clipLabel = getClipDisplayLabel(renderedClip);
@@ -11615,7 +11715,7 @@ export default function StuuShell() {
                           </div>
                         </div>
                         <div className="settings-modal-tabs">
-                          {['AUDIO', 'VST PLUGINS', 'RECORD', 'GENERAL'].map((tab) => (
+                          {['AUDIO', 'VST PLUGINS', 'RECORD', 'GENERAL', 'PERFORMANCE'].map((tab) => (
                             <button
                               key={tab}
                               type="button"
@@ -11954,6 +12054,28 @@ export default function StuuShell() {
                                 </div>
                               )}
                             </div>
+                          ) : settingsTab === 'PERFORMANCE' ? (
+                            <div className="settings-performance-panel">
+                              <p className="settings-audio-hint">Steuert Meter-Rate und UI-Last auf schwacher Hardware.</p>
+                              <div className="settings-performance-options" role="radiogroup" aria-label="Performance Profil">
+                                {['low', 'balanced', 'high'].map((profile) => (
+                                  <label key={profile} className={`settings-performance-option ${performanceProfile === profile ? 'active' : ''}`}>
+                                    <input
+                                      type="radio"
+                                      name="performanceProfile"
+                                      value={profile}
+                                      checked={performanceProfile === profile}
+                                      onChange={() => {
+                                        setPerformanceProfile(profile);
+                                        setPerformanceProfileState(profile);
+                                        socketRef.current?.emit('client:performance_profile', { profile });
+                                      }}
+                                    />
+                                    <span>{profile === 'low' ? 'Low (Kartoffel)' : profile === 'high' ? 'High' : 'Balanced'}</span>
+                                  </label>
+                                ))}
+                              </div>
+                            </div>
                           ) : (
                             <div className="settings-placeholder-panel">
                               <p>Allgemeine Einstellungen — in Arbeit.</p>
@@ -12117,14 +12239,12 @@ export default function StuuShell() {
 
               {activeTab === 'Mix' ? (
                 <div className="mix-layout">
-                  {meterFlatWarning ? (
-                    <div className="alert alert-warning mix-meter-flat-hint" role="status">
-                      Pegelanzeige bleibt bei 0 während der Wiedergabe: die Native-Bridge liefert keine Pegel. Im
-                      Engine-Terminal nach <code className="mix-meter-flat-hint-code">transport.get_meters</code> schauen
-                      oder <code className="mix-meter-flat-hint-code">thestuu-native</code> neu bauen. Mit{' '}
-                      <code className="mix-meter-flat-hint-code">STUU_DEBUG_METERS=1</code> erscheinen Rohdaten im Log.
-                    </div>
-                  ) : null}
+                  <MixMeterFlatHint
+                    playing={Boolean(transport.playing)}
+                    nativeOn={Boolean(state?.nativeTransport)}
+                    trackCount={mixTracks.length}
+                    tracks={mixTracks}
+                  />
                   <div className="mix-structure-strip">
                     <div className="mix-structure-strip-label">Structure</div>
                     <SongStructureLane
@@ -12172,7 +12292,7 @@ export default function StuuShell() {
                           <span className="mix-strip-index">M</span>
                           <strong>Master</strong>
                         </div>
-                        <LevelMeter variant="mix" value={mixMasterPeak} />
+                        <MixMasterLevelMeter tracks={mixTracks} />
                         <div className="mix-strip-toggle-row">
                           <button
                             type="button"
@@ -12289,7 +12409,6 @@ export default function StuuShell() {
                       {mixTracks.map((track) => {
                         const trackMix = track.mix || createDefaultTrackMix(track.track_id);
                         const trackNodes = vstNodesByTrack.get(track.track_id) || [];
-                        const meterPeak = clamp(Number(meters[track.track_id]?.peak) || 0, 0, 1);
                         const isSelected = track.track_id === mixSelectedTrackId;
 
                         return (
@@ -12322,7 +12441,7 @@ export default function StuuShell() {
                               <strong>{track.name || `Track ${track.track_id}`}</strong>
                             </div>
 
-                            <LevelMeter variant="mix" value={meterPeak} />
+                            <MixStripLevelMeter trackId={track.track_id} />
 
                             <div className="mix-strip-toggle-row">
                               <button

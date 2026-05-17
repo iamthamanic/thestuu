@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev --port 3010 --hostname 0.0.0.0",
+    "dev": "next dev --port 3010 --hostname 0.0.0.0 --webpack",
     "build": "next build",
     "start": "next start --port 3010 --hostname 0.0.0.0",
     "lint": "eslint .",

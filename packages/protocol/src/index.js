@@ -104,6 +104,7 @@ export const NATIVE_COMMANDS_TARGET = Object.freeze({
 /** @type {Readonly<Record<string, string>>} */
 export const ENGINE_EVENTS = Object.freeze({
   READY: 'engine:ready',
+  DIAGNOSTICS: 'engine:diagnostics',
   OFFLINE: 'engine:offline',
   ERROR: 'engine:error',
   STATE: 'engine:state',
@@ -112,6 +113,12 @@ export const ENGINE_EVENTS = Object.freeze({
   ANALYZER: 'engine:analyzer',
   LOG: 'engine:log',
   LOGS_INIT: 'engine:logs:init',
+});
+
+/** Dashboard → engine client events (not colon commands). */
+export const CLIENT_EVENTS = Object.freeze({
+  METER_PAUSE: 'client:meter_pause',
+  PERFORMANCE_PROFILE: 'client:performance_profile',
 });
 
 /**

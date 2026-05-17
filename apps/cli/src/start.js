@@ -460,6 +460,49 @@ function attachShutdown(children) {
 
 const DEFAULT_VENDOR_SUBPATH = path.join('vendor', 'tracktion_engine');
 
+/**
+ * Engine env for `npm run start`: native-first DAW by default; `--legacy-daw` for JSON-only QA.
+ * @param {Record<string, string | undefined>} baseEnv
+ * @param {{ native?: boolean, legacyDaw?: boolean, enginePort: number, host: string, nativeSocket: string }} opts
+ */
+function buildEngineSpawnEnv(baseEnv, opts) {
+  const env = {
+    ...baseEnv,
+    ENGINE_PORT: String(opts.enginePort),
+    ENGINE_HOST: opts.host,
+    STUU_NATIVE_SOCKET: opts.nativeSocket,
+  };
+  if (opts.native === false) {
+    env.STUU_NATIVE_TRANSPORT = '0';
+    return env;
+  }
+  env.STUU_NATIVE_TRANSPORT = '1';
+  if (opts.legacyDaw) {
+    env.STUU_NATIVE_CLIP_OPS = '0';
+    env.STUU_NATIVE_EDIT_UNDO = '0';
+    env.STUU_NATIVE_TRACK_OPS = '0';
+    env.STUU_NATIVE_PROJECT_SIDECAR = '0';
+    env.STUU_NATIVE_LEGACY_SYNC = '0';
+    return env;
+  }
+  const nativeDefaults = {
+    STUU_NATIVE_CLIP_OPS: '1',
+    STUU_NATIVE_EDIT_UNDO: '1',
+    STUU_NATIVE_TRACK_OPS: '1',
+    STUU_NATIVE_PROJECT_SIDECAR: '1',
+    STUU_NATIVE_LEGACY_SYNC: '0',
+  };
+  for (const [key, value] of Object.entries(nativeDefaults)) {
+    if (env[key] === undefined || env[key] === '') {
+      env[key] = value;
+    }
+  }
+  if (env.STUU_METER_INTERVAL_MS === undefined || env.STUU_METER_INTERVAL_MS === '') {
+    env.STUU_METER_INTERVAL_MS = '80';
+  }
+  return env;
+}
+
 export async function runStartCommand(options) {
   const commandFile = fileURLToPath(import.meta.url);
   const cliDir = path.resolve(path.dirname(commandFile), '..');
@@ -548,13 +591,13 @@ export async function runStartCommand(options) {
       workspace: '@thestuu/engine',
       script: 'start',
       cwd: repoRoot,
-      env: {
-        ...commonEnv,
-        ENGINE_PORT: String(options.enginePort),
-        ENGINE_HOST: host,
-        STUU_NATIVE_TRANSPORT: options.native === false ? '0' : '1',
-        STUU_NATIVE_SOCKET: nativeSocketPath,
-      },
+      env: buildEngineSpawnEnv(commonEnv, {
+        native: options.native,
+        legacyDaw: options.legacyDaw,
+        enginePort: options.enginePort,
+        host,
+        nativeSocket: nativeSocketPath,
+      }),
       name: 'engine',
     });
 
