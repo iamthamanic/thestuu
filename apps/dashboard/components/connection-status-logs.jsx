@@ -15,6 +15,7 @@ import {
   fetchDesktopDiagnostics,
   isTauriDesktopShell,
   restartNativeEngine,
+  restartNodeEngine,
   subscribeDesktopDiagnostics,
 } from '../lib/desktop-diagnostics-bridge.js';
 import {
@@ -224,6 +225,18 @@ export default function ConnectionStatusLogs({
     await restartNativeEngine();
   };
 
+  const handleRestartNode = async () => {
+    if (!isTauri) return;
+    appendLogEntry({
+      level: 'info',
+      source: 'desktop-lifecycle',
+      category: 'startup',
+      event: 'restart',
+      message: '[desktop] restart Node engine requested',
+    });
+    await restartNodeEngine();
+  };
+
   const terminalHeight = Math.min(220, Math.max(120, (portalLayout?.maxHeight ?? 280) - 140));
 
   const healthRow = (id, label, on) => (
@@ -299,16 +312,26 @@ export default function ConnectionStatusLogs({
                   Legacy JSON mode (clipOps=false): not optimized for smooth playback. Start with npm run start (native-first). Use --legacy-daw only for QA.
                 </div>
               ) : null}
+              {health.lastEngineError ? (
+                <div className="status-log-native-error" role="alert">
+                  Node: {health.lastEngineError}
+                </div>
+              ) : null}
               {health.lastNativeError ? (
                 <div className="status-log-native-error" role="alert">
-                  {health.lastNativeError}
+                  Native: {health.lastNativeError}
                 </div>
               ) : null}
               <div className="status-log-panel-actions">
                 {isTauri ? (
-                  <button type="button" className="status-log-panel-clear" onClick={handleRestartNative}>
-                    restart native
-                  </button>
+                  <>
+                    <button type="button" className="status-log-panel-clear" onClick={handleRestartNode}>
+                      restart node
+                    </button>
+                    <button type="button" className="status-log-panel-clear" onClick={handleRestartNative}>
+                      restart native
+                    </button>
+                  </>
                 ) : null}
                 <button type="button" className="status-log-panel-clear" onClick={handleCopy}>
                   copy

@@ -35,6 +35,8 @@ export function mergeLogsPanelHealth(connection, dawEngineReady, engineDiagnosti
     return {
       dashboardOnline: Boolean(desktopHealth.dashboardOnline ?? connection === 'online'),
       engineOnline: Boolean(desktopHealth.engineOnline ?? connection === 'online'),
+      engineManagedByDesktop: Boolean(desktopHealth.engineManagedByDesktop),
+      lastEngineError: desktopHealth.lastEngineError ?? null,
       nativeProcessRunning: Boolean(desktopHealth.nativeProcessRunning),
       ipcConnected: Boolean(desktopHealth.ipcConnected),
       tracktionReady: Boolean(desktopHealth.tracktionReady),

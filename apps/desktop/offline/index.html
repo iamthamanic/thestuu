@@ -109,8 +109,9 @@
       document.getElementById('socket-path').textContent = s.socketPath || '—';
 
       const err = document.getElementById('error-box');
-      if (s.startupError) {
-        err.textContent = s.startupError;
+      const messages = [s.engineStartupError, s.startupError].filter(Boolean);
+      if (messages.length) {
+        err.textContent = messages.join(' | ');
         err.classList.add('visible');
       } else {
         err.textContent = '';
@@ -131,6 +132,7 @@
         tracktionReady: d.tracktionReady,
         audioDeviceReady: d.audioDeviceReady,
         dawReady: d.dawReady,
+        engineStartupError: d.lastEngineError,
         startupError: d.lastNativeError,
         socketPath: d.socketPath,
         dashboardUrl: d.dashboardUrl,

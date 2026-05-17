@@ -13,6 +13,11 @@
           "name": "thestuu-native",
           "sidecar": true,
           "args": true
+        },
+        {
+          "name": "node",
+          "cmd": "node",
+          "args": true
         }
       ]
     },
@@ -22,6 +27,11 @@
         {
           "name": "thestuu-native",
           "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "node",
+          "cmd": "node",
           "args": true
         }
       ]

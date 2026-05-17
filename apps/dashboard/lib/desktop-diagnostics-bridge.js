@@ -24,12 +24,15 @@ function getInvoke() {
 const defaultHealth = () => ({
   dashboardOnline: false,
   engineOnline: false,
+  engineManagedByDesktop: false,
+  engineProcessRunning: false,
   nativeProcessRunning: false,
   ipcConnected: false,
   tracktionReady: false,
   audioDeviceReady: false,
   dawReady: false,
   socketPath: '',
+  lastEngineError: null,
   lastNativeError: null,
   errorCategory: 'unknown',
   nativeFlags: {},
@@ -45,12 +48,15 @@ export function mapDesktopDiagnostics(diag) {
   return {
     dashboardOnline: Boolean(diag.dashboardOnline),
     engineOnline: Boolean(diag.engine?.online),
+    engineManagedByDesktop: Boolean(diag.engineManagedByDesktop),
+    engineProcessRunning: Boolean(diag.engineProcessRunning ?? diag.engine?.online),
     nativeProcessRunning: Boolean(diag.nativeProcessRunning),
     ipcConnected: Boolean(diag.ipcConnected),
     tracktionReady: Boolean(diag.tracktionReady),
     audioDeviceReady: Boolean(diag.audioDeviceReady),
     dawReady: Boolean(diag.dawReady),
     socketPath: typeof diag.socketPath === 'string' ? diag.socketPath : '',
+    lastEngineError: typeof diag.lastEngineError === 'string' ? diag.lastEngineError : null,
     lastNativeError: typeof diag.lastNativeError === 'string' ? diag.lastNativeError : null,
     errorCategory: typeof diag.errorCategory === 'string' ? diag.errorCategory : 'unknown',
     nativeFlags: diag.nativeFlags && typeof diag.nativeFlags === 'object' ? diag.nativeFlags : {},
@@ -66,6 +72,9 @@ export function mapTauriLogEntry(entry) {
   if (source === 'shell') source = LIVE_LOG_SOURCES.TAURI_SHELL;
   if (source === 'native-stdout' || source === 'native-stderr') {
     source = LIVE_LOG_SOURCES.NATIVE_ENGINE;
+  }
+  if (source === 'engine-stdout' || source === 'engine-stderr') {
+    source = LIVE_LOG_SOURCES.ENGINE;
   }
 
   return normalizeStructuredLogEntry({
@@ -113,6 +122,12 @@ export async function restartNativeEngine() {
   return invoke('restart_native_engine');
 }
 
+export async function restartNodeEngine() {
+  const invoke = getInvoke();
+  if (!invoke) return null;
+  return invoke('restart_node_engine');
+}
+
 export async function exportDiagnosticsBundle() {
   const invoke = getInvoke();
   if (!invoke) return null;
@@ -150,13 +165,16 @@ export function subscribeDesktopDiagnostics(onHealth, onLog) {
     const p = event.payload || {};
     onHealth(mapDesktopDiagnostics({
       dashboardOnline: p.uiOnline,
-      engine: { online: p.uiOnline },
+      engine: { online: p.engineOnline ?? p.uiOnline },
+      engineManagedByDesktop: p.engineManagedByDesktop,
+      engineProcessRunning: p.engineOnline,
       nativeProcessRunning: p.nativeProcessRunning,
       ipcConnected: p.ipcConnected,
       tracktionReady: p.tracktionReady,
       audioDeviceReady: p.audioDeviceReady,
       dawReady: p.dawReady,
       socketPath: p.socketPath,
+      lastEngineError: p.engineStartupError,
       lastNativeError: p.startupError,
     }));
   }).then((fn) => unsubs.push(fn));

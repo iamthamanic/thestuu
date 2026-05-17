@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::native_health::{resolve_socket_path, NativeHealthSnapshot};
 use crate::native_sidecar::NativeSidecarManager;
+use crate::node_sidecar::NodeSidecarManager;
 
 const LOG_CAP: usize = 2000;
 const ENGINE_DEFAULT_PORT: u16 = 3990;
@@ -104,6 +105,9 @@ pub struct DesktopDiagnostics {
     pub socket_path: String,
     pub native_mode_enabled: bool,
     pub native_flags: NativeFlagsSnapshot,
+    pub engine_managed_by_desktop: bool,
+    pub engine_process_running: bool,
+    pub last_engine_error: Option<String>,
     pub last_native_error: Option<String>,
     pub error_category: String,
     pub health: NativeHealthSnapshot,
@@ -172,6 +176,22 @@ impl DiagnosticsLog {
         self.push("native-stderr", LogLevel::Warn, message);
     }
 
+    pub fn push_engine_stdout(&self, message: impl Into<String>) {
+        let msg = message.into();
+        let level = if msg.to_lowercase().contains("error") {
+            LogLevel::Error
+        } else if msg.to_lowercase().contains("warn") {
+            LogLevel::Warn
+        } else {
+            LogLevel::Info
+        };
+        self.push("engine-stdout", level, msg);
+    }
+
+    pub fn push_engine_stderr(&self, message: impl Into<String>) {
+        self.push("engine-stderr", LogLevel::Warn, message);
+    }
+
     pub fn entries(&self) -> Vec<LogEntry> {
         self.inner
             .lock()
@@ -226,18 +246,23 @@ pub fn categorize_message(message: &str) -> LogCategory {
 }
 
 pub fn derive_error_category(
-    startup_error: &Option<String>,
+    engine_startup_error: &Option<String>,
+    native_startup_error: &Option<String>,
     ipc_connected: bool,
     tracktion_ready: bool,
     audio_device_ready: bool,
     engine_online: bool,
 ) -> String {
-    if let Some(err) = startup_error {
+    if let Some(err) = engine_startup_error {
         let cat = categorize_message(err);
         return cat.as_str().to_string();
     }
     if !engine_online {
         return LogCategory::Startup.as_str().to_string();
+    }
+    if let Some(err) = native_startup_error {
+        let cat = categorize_message(err);
+        return cat.as_str().to_string();
     }
     if !ipc_connected {
         return LogCategory::Ipc.as_str().to_string();
@@ -382,12 +407,15 @@ pub fn read_native_flags() -> NativeFlagsSnapshot {
 }
 
 pub fn build_diagnostics(
-    manager: &NativeSidecarManager,
+    native_manager: &NativeSidecarManager,
+    node_manager: &NodeSidecarManager,
     dashboard_online: bool,
     dashboard_url: &str,
 ) -> DesktopDiagnostics {
-    manager.refresh_health();
-    let sidecar = manager.snapshot();
+    native_manager.refresh_health();
+    node_manager.refresh_health();
+    let sidecar = native_manager.snapshot();
+    let node = node_manager.snapshot();
     let engine = probe_engine_health();
     let flags = read_native_flags();
     let native_mode_enabled = flags.native_transport
@@ -400,13 +428,21 @@ pub fn build_diagnostics(
     let audio_device_ready = sidecar.health.audio_device_ready;
     let daw_ready = ipc_connected && tracktion_ready && audio_device_ready;
 
+    let last_engine_error = node
+        .startup_error
+        .clone()
+        .or_else(|| engine.error.clone());
+
     let last_native_error = sidecar
         .startup_error
         .clone()
         .or_else(|| sidecar.health.last_error.clone());
 
+    let engine_process_running = engine.online || node.process_running;
+
     let error_category = derive_error_category(
-        &last_native_error,
+        &node.startup_error,
+        &sidecar.startup_error,
         ipc_connected,
         tracktion_ready,
         audio_device_ready,
@@ -426,6 +462,9 @@ pub fn build_diagnostics(
         socket_path: sidecar.socket_path,
         native_mode_enabled,
         native_flags: flags,
+        engine_managed_by_desktop: node.managed_by_desktop,
+        engine_process_running,
+        last_engine_error,
         last_native_error,
         error_category,
         health: sidecar.health.clone(),
