@@ -13,7 +13,33 @@ coverage
 /.shimwrapper
 /.semgrep-home
 /.venv-semgrep
-apps/native-engine/build
+
+# Native engine — local vendor + all CMake build outputs
+vendor/
 apps/native-engine/vendor
+apps/native-engine/build
+apps/native-engine/build-tracktion
+
+# Compiled native binary (any build dir)
+**/thestuu-native
+**/thestuu-native.exe
+
+# CMake / compiler artifacts
+**/CMakeCache.txt
+**/CMakeFiles/
+**/*.o
+**/*.a
+**/*.dylib
+**/*.so
+**/CompilerIdC/a.out
+**/CompilerIdCXX/a.out
+**/CMakeDetermineCompilerABI_*.bin
+
+# Tauri / Rust
+apps/desktop/src-tauri/target/
+
+# Media / local runtime
 *.wav
+*.sock
+
 .DS_Store
