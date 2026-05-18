@@ -20,6 +20,7 @@
     "test:daw-authority": "npm run test --prefix apps/engine",
     "qa:native-daw": "node scripts/qa-native-daw.mjs",
     "qa:legacy-daw": "node scripts/qa-legacy-daw-smoke.mjs",
+    "build:native-release": "npm run build:release --workspace @thestuu/native-engine",
     "desktop:dev": "npm run dev --prefix apps/desktop",
     "desktop:build": "npm run build --prefix apps/desktop"
   }

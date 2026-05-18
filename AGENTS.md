@@ -139,7 +139,7 @@ Native build expects a local `tracktion_engine` tree — **not** committed to gi
 export STUU_NATIVE_VENDOR_DIR="$(pwd)/vendor/tracktion_engine"
 ```
 
-CMake output: `apps/native-engine/build/thestuu-native` (ignored by `.gitignore`).
+CMake dev output: `apps/native-engine/build/thestuu-native`. Release/Tauri sidecar: `apps/native-engine/build-release/thestuu-native` (`npm run build:native-release` — see `docs/native-engine-release.md`). All ignored by `.gitignore`.
 
 ---
 
@@ -210,7 +210,8 @@ Allowed JSON-only (sidecar): clip `gain`, fades, `waveform_peaks`, `name`, `colo
 |----------------|--------|
 | `node_modules/` | npm install |
 | `vendor/` | Tracktion/JUCE — clone locally (`scripts/setup-tracktion.sh`) |
-| `apps/native-engine/build/` | CMake output (default build dir) |
+| `apps/native-engine/build/` | CMake dev output (`npm run start`) |
+| `apps/native-engine/build-release/` | Release + LTO + stripped binary (Tauri `externalBin`) |
 | `apps/native-engine/build-tracktion/` | Alternate CMake build dir (must not be tracked) |
 | `apps/desktop/src-tauri/target/` | Rust/Tauri build |
 | `*.o`, `*.a`, `*.dylib`, `a.out`, `CMakeCache.txt` under build dirs | Generated objects |
@@ -316,5 +317,6 @@ See `docs/performance.md`.
 | `docs/desktop-diagnostics.md` | LOGS panel and Tauri diagnostics |
 | `docs/desktop-tauri.md` | Desktop shell + Node/native sidecars |
 | `docs/performance.md` | Performance QA and env vars |
+| `docs/native-engine-release.md` | Release build, strip, binary sizes |
 | `README.md` | Human onboarding and commands |
 | `.cursor/rules/daw-state-authority.mdc` | Cursor-specific DAW rule mirror |

@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 16,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release (LTO, distributable)",
+      "description": "Optimized release build into build-release/ (run scripts/build-release.sh)",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Dev (CLI / npm run start)",
+      "description": "Fast iteration build into build/ (symbols retained)",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "targets": ["thestuu-native"]
+    },
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "targets": ["thestuu-native"]
+    }
+  ]
+}

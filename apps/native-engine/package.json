@@ -4,10 +4,13 @@
   "private": true,
   "scripts": {
     "bootstrap-vendor": "bash scripts/bootstrap-vendor.sh",
-    "build": "bash scripts/build-release.sh",
-    "build:tracktion": "npm run build",
+    "build": "bash scripts/build-dev.sh",
+    "build:dev": "bash scripts/build-dev.sh",
+    "build:release": "bash scripts/build-release.sh",
+    "build:tracktion": "npm run build:release",
+    "measure": "bash scripts/measure-native-binary.sh",
     "start": "./build/thestuu-native --socket ${STUU_NATIVE_SOCKET:-/tmp/thestuu-native.sock}",
-    "dev": "npm run build && npm run start",
+    "dev": "npm run build:dev && npm run start",
     "typecheck": "echo 'native-engine: no typecheck step yet'"
   }
 }

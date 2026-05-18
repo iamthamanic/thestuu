@@ -122,8 +122,10 @@ Native-first env for spawned Node (aligned with `apps/cli` `buildEngineSpawnEnv`
 Configured in `apps/desktop/src-tauri/tauri.conf.json`:
 
 ```json
-"externalBin": ["../../native-engine/build/thestuu-native"]
+"externalBin": ["../../native-engine/build-release/thestuu-native"]
 ```
+
+Build the sidecar first: `npm run build:native-release` (see `docs/native-engine-release.md`). `beforeBuildCommand` runs this automatically for `desktop:build`.
 
 Tauri expects a target-triplet suffix at build time, e.g.:
 
@@ -134,12 +136,15 @@ Tauri expects a target-triplet suffix at build time, e.g.:
 | Linux x86_64 | `thestuu-native-x86_64-unknown-linux-gnu` |
 | Windows | `thestuu-native-x86_64-pc-windows-msvc.exe` |
 
-`apps/desktop/src-tauri/build.rs` copies `apps/native-engine/build/thestuu-native` (or `Release/`) to the suffixed name when present.
+`apps/desktop/src-tauri/build.rs` copies `apps/native-engine/build-release/thestuu-native` (stripped release) to the suffixed name when present; falls back to `build/` for local dev.
 
-**Dev binary paths (CMake, not committed):**
+**Binary paths (CMake, not committed):**
 
-- `apps/native-engine/build/thestuu-native`
-- `apps/native-engine/build/Release/thestuu-native` (MSVC / multi-config)
+| Use | Path |
+|-----|------|
+| Tauri / packaging | `apps/native-engine/build-release/thestuu-native` |
+| CLI dev (`npm run start`) | `apps/native-engine/build/thestuu-native` |
+| MSVC multi-config | `.../Release/thestuu-native` |
 
 Rust spawn API: `app.shell().sidecar("thestuu-native")` with args `--socket <path>`.
 
@@ -174,7 +179,7 @@ Target order when complete: native → engine → dashboard → Tauri window.
 
 ### macOS
 
-- Build native: CMake target `thestuu-native` under `apps/native-engine/build/`.
+- Build native release: `npm run build:native-release` → `apps/native-engine/build-release/thestuu-native`.
 - `npm run desktop:build` → `.app` under `src-tauri/target/release/bundle/`.
 - Notarization / signing: not configured.
 

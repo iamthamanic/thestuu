@@ -3,6 +3,35 @@ project(thestuu-native C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
+# Release + LTO for distributable builds (see scripts/build-release.sh, CMakePresets.json).
+include(CheckIPOSupported)
+check_ipo_supported(RESULT STUU_IPO_SUPPORTED OUTPUT STUU_IPO_ERROR)
+if(STUU_IPO_SUPPORTED)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+else()
+  message(STATUS "IPO/LTO not supported for this toolchain: ${STUU_IPO_ERROR}")
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(
+      "$<$<CONFIG:Release>:-ffunction-sections>"
+      "$<$<CONFIG:Release>:-fdata-sections>"
+    )
+    if(APPLE)
+      add_link_options(
+        "$<$<CONFIG:Release>:-Wl,-dead_strip>"
+        "$<$<CONFIG:Release>:-Wl,-dead_strip_dylibs>"
+      )
+    else()
+      add_link_options("$<$<CONFIG:Release>:-Wl,--gc-sections>")
+    endif()
+  elseif(MSVC)
+    add_compile_options("$<$<CONFIG:Release>:/Gy>")
+    add_link_options("$<$<CONFIG:Release>:/OPT:REF>")
+  endif()
+endif()
+
 set(STUU_THIRD_PARTY_DIR "" CACHE PATH "Path to tracktion_engine repo (clone with --recurse-submodules)")
 
 # TheStuu erfordert Tracktion; Stub-Backend wurde entfernt.
@@ -42,6 +71,7 @@ target_compile_definitions(thestuu-native PRIVATE
 )
 if(APPLE)
   target_compile_options(thestuu-native PRIVATE "-fno-aligned-allocation")
+  target_compile_options(thestuu-native PRIVATE "$<$<CONFIG:Release>:-g>")
   set_target_properties(thestuu-native PROPERTIES
     MACOSX_BUNDLE FALSE
     OSX_DEPLOYMENT_TARGET "10.13"

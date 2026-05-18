@@ -345,7 +345,8 @@ pub fn resolve_native_binary_path(repo_root: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let build_dir = repo_root.join("apps/native-engine/build");
+    let release_dir = repo_root.join("apps/native-engine/build-release");
+    let dev_dir = repo_root.join("apps/native-engine/build");
     let names = if cfg!(windows) {
         ["thestuu-native.exe", "thestuu-native.exe"]
     } else {
@@ -353,8 +354,10 @@ pub fn resolve_native_binary_path(repo_root: &Path) -> Result<PathBuf, String> {
     };
 
     let candidates = [
-        build_dir.join(names[0]),
-        build_dir.join("Release").join(names[1]),
+        dev_dir.join(names[0]),
+        dev_dir.join("Release").join(names[1]),
+        release_dir.join(names[0]),
+        release_dir.join("Release").join(names[1]),
     ];
 
     for candidate in &candidates {

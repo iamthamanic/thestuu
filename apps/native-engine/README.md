@@ -50,6 +50,18 @@ npm run dev
 
 Die CLI übergibt `STUU_THIRD_PARTY_DIR` an CMake; der Native-Build nutzt dann JUCE und Tracktion und liefert echten Audio-Output.
 
+### Release build (Tauri / packaging)
+
+Stripped distributable with LTO and split debug symbols (`dSYM` on macOS):
+
+```bash
+export STUU_NATIVE_VENDOR_DIR="$(pwd)/vendor/tracktion_engine"
+npm run build:native-release
+bash apps/native-engine/scripts/measure-native-binary.sh
+```
+
+See `docs/native-engine-release.md` for paths and expected sizes.
+
 ### Alternative: Vendor-Pfad beim Start
 
 ```bash

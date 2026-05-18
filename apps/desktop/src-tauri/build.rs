@@ -15,17 +15,14 @@ fn link_native_sidecar_binary() {
     };
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let build_dir = manifest_dir.join("../../native-engine/build");
+    let native_engine = manifest_dir.join("../../native-engine");
+    let release_dir = native_engine.join("build-release");
+    let dev_dir = native_engine.join("build");
     let suffixed_name = if cfg!(windows) {
         format!("thestuu-native-{target}.exe")
     } else {
         format!("thestuu-native-{target}")
     };
-
-    let dst = build_dir.join(&suffixed_name);
-    if dst.is_file() {
-        return;
-    }
 
     let plain_name = if cfg!(windows) {
         "thestuu-native.exe"
@@ -33,10 +30,23 @@ fn link_native_sidecar_binary() {
         "thestuu-native"
     };
 
+    // Prefer stripped release binary (npm run build:native-release); fall back to dev build/.
+    for build_dir in [release_dir.as_path(), dev_dir.as_path()] {
+        let dst = build_dir.join(&suffixed_name);
+        if dst.is_file() {
+            return;
+        }
+    }
+
     let sources = [
-        build_dir.join(plain_name),
-        build_dir.join("Release").join(plain_name),
+        release_dir.join(plain_name),
+        release_dir.join("Release").join(plain_name),
+        dev_dir.join(plain_name),
+        dev_dir.join("Release").join(plain_name),
     ];
+
+    let build_dir = release_dir.as_path();
+    let dst = build_dir.join(&suffixed_name);
 
     for src in &sources {
         if src.is_file() {

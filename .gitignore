@@ -38,6 +38,8 @@ coverage/
 vendor/
 apps/native-engine/vendor/
 apps/native-engine/build/
+apps/native-engine/build-release/
+apps/native-engine/build-release/**
 apps/native-engine/build-tracktion/
 
 # =============================================================================
@@ -45,6 +47,9 @@ apps/native-engine/build-tracktion/
 # =============================================================================
 **/thestuu-native
 **/thestuu-native.exe
+**/thestuu-native.unstripped
+**/thestuu-native.debug
+**/*.dSYM/
 
 # =============================================================================
 # CMake and compiler artifacts

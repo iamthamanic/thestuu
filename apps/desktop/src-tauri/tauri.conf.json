@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev --prefix ../dashboard",
     "devUrl": "http://127.0.0.1:3010",
-    "beforeBuildCommand": "npm run build --prefix ../dashboard",
+    "beforeBuildCommand": "npm run build:release --prefix ../native-engine && npm run build --prefix ../dashboard",
     "frontendDist": "../../dashboard/out"
   },
   "app": {
@@ -28,7 +28,7 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "../../native-engine/build/thestuu-native"
+      "../../native-engine/build-release/thestuu-native"
     ],
     "icon": [
       "icons/32x32.png",
