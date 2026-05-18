@@ -12,8 +12,8 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "node apps/cli/bin/thestuu.js start",
-    "start": "node apps/cli/bin/thestuu.js start",
+    "dev": "node apps/cli/bin/thestuu.js dev",
+    "start": "node apps/cli/bin/thestuu.js dev",
     "dev:engine": "npm run start --prefix apps/engine",
     "dev:dashboard": "npm run dev --prefix apps/dashboard",
     "check:daw-authority": "bash scripts/check-daw-authority.sh",
@@ -21,7 +21,7 @@
     "qa:native-daw": "node scripts/qa-native-daw.mjs",
     "qa:legacy-daw": "node scripts/qa-legacy-daw-smoke.mjs",
     "build:native-release": "npm run build:release --workspace @thestuu/native-engine",
-    "desktop:dev": "npm run dev --prefix apps/desktop",
+    "desktop:dev": "node apps/cli/bin/thestuu.js dev --desktop",
     "desktop:build": "npm run build --prefix apps/desktop"
   }
 }

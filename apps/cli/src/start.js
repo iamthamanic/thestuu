@@ -7,6 +7,13 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import open from 'open';
 import { createDefaultProject, parseProject, serializeProject } from '@thestuu/shared-json';
+import { cleanDevSession, CANONICAL_NATIVE_SOCKET } from './dev-clean.js';
+import {
+  fetchEngineHealth,
+  isEngineDawReady,
+  isEngineHealthy,
+  waitForEngineDawReady,
+} from './engine-health.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -254,15 +261,6 @@ function requestJson(url, timeoutMs = 1200) {
   });
 }
 
-async function isEngineHealthy(port, host = '127.0.0.1', timeoutMs = 1200) {
-  try {
-    const { statusCode, json } = await requestJson(`http://${host}:${port}/health`, timeoutMs);
-    return statusCode === 200 && json?.ok === true && json?.service === 'thestuu-engine';
-  } catch {
-    return false;
-  }
-}
-
 async function hasRunningDashboardDevProcess(repoRoot) {
   if (process.platform === 'win32') {
     return false;
@@ -503,6 +501,14 @@ function buildEngineSpawnEnv(baseEnv, opts) {
   return env;
 }
 
+function spawnDesktopDev(repoRoot, env) {
+  return spawn(npmCmd(), ['run', 'tauri', 'dev'], {
+    cwd: path.join(repoRoot, 'apps', 'desktop'),
+    env,
+    stdio: 'inherit',
+  });
+}
+
 export async function runStartCommand(options) {
   const commandFile = fileURLToPath(import.meta.url);
   const cliDir = path.resolve(path.dirname(commandFile), '..');
@@ -512,6 +518,18 @@ export async function runStartCommand(options) {
   const host = process.env.STUU_HOST || '127.0.0.1';
   const vendorDirRaw = (options.nativeVendorDir || process.env.STUU_NATIVE_VENDOR_DIR || '').trim();
   const vendorDir = vendorDirRaw || path.join(repoRoot, DEFAULT_VENDOR_SUBPATH);
+
+  const nativeSocketPath = options.nativeSocket
+    ? path.resolve(options.nativeSocket)
+    : CANONICAL_NATIVE_SOCKET;
+
+  if (options.clean) {
+    await cleanDevSession({
+      enginePort: options.enginePort,
+      dashboardPort: options.port,
+      nativeSocket: nativeSocketPath,
+    });
+  }
 
   if (options.native !== false) {
     try {
@@ -538,31 +556,40 @@ export async function runStartCommand(options) {
 
   let nativeChild = null;
   let engineChild = null;
+  let desktopChild = null;
   let engineMode = 'spawned';
-  const nativeSocketPath = options.nativeSocket
-    ? path.resolve(options.nativeSocket)
-    : path.join(os.tmpdir(), `thestuu-native-${process.pid}.sock`);
-  const engineAlreadyOpen = await isPortOpen(options.enginePort, host, 800);
-  if (engineAlreadyOpen) {
-    const engineHealthy = await isEngineHealthy(options.enginePort, host, 1200);
-    if (!engineHealthy) {
-      const commandOnPort = await getListeningCommandOnPort(options.enginePort);
-      const looksLikeEngineProcess = typeof commandOnPort === 'string'
-        && /\bnode\b.*\bsrc\/server\.js\b/.test(commandOnPort);
-      if (!looksLikeEngineProcess) {
-        throw new Error(
-          `Engine port ${host}:${options.enginePort} is already in use by a non-TheStuu service. ` +
-          'Stop the conflicting process or choose another --engine-port.',
-        );
-      }
+
+  let engineAlreadyOpen = await isPortOpen(options.enginePort, host, 800);
+  if (engineAlreadyOpen && options.reuse) {
+    const dawReady = await isEngineDawReady(options.enginePort, host, nativeSocketPath, 2500);
+    if (dawReady) {
+      engineMode = 'reused-existing';
+      console.log(`[thestuu-cli] reusing engine on :${options.enginePort} (native/Tracktion ready, socket ${nativeSocketPath})`);
+    } else {
+      const { json } = await fetchEngineHealth(options.enginePort, host, 2000);
       console.warn(
-        `[thestuu-cli] engine health probe unavailable on ${host}:${options.enginePort}; ` +
-        `reusing existing engine process (${commandOnPort}).`,
+        `[thestuu-cli] engine on :${options.enginePort} is not DAW-ready (nativeTransport=${Boolean(json?.nativeTransport)}). ` +
+        'Starting a fresh stack (omit --reuse or run without stale processes).',
+      );
+      engineAlreadyOpen = false;
+    }
+  } else if (engineAlreadyOpen) {
+    const commandOnPort = await getListeningCommandOnPort(options.enginePort);
+    const looksLikeEngineProcess = typeof commandOnPort === 'string'
+      && /\bnode\b.*\bsrc\/server\.js\b/.test(commandOnPort);
+    if (!looksLikeEngineProcess) {
+      throw new Error(
+        `Engine port ${host}:${options.enginePort} is already in use by a non-TheStuu service. ` +
+        'Stop the conflicting process, run with --clean (default), or use --reuse if it is your engine.',
       );
     }
-    engineMode = 'reused-existing';
-    console.log(`[thestuu-cli] engine port ${host}:${options.enginePort} already active, reusing existing process.`);
-  } else {
+    throw new Error(
+      `Engine port ${host}:${options.enginePort} is already in use. ` +
+      'Default dev start runs --clean; use --reuse only if that engine uses the same native socket.',
+    );
+  }
+
+  if (!engineAlreadyOpen) {
     if (options.native !== false) {
       try {
         await fs.unlink(nativeSocketPath);
@@ -643,6 +670,22 @@ export async function runStartCommand(options) {
     }
   }
 
+  if (options.native !== false && engineMode === 'spawned') {
+    const dawReady = await waitForEngineDawReady(
+      options.enginePort,
+      host,
+      nativeSocketPath,
+      options.dawReadyTimeoutMs ?? 120000,
+    );
+    if (!dawReady) {
+      throw new Error(
+        `Native/Tracktion did not become ready within timeout (engine :${options.enginePort}, socket ${nativeSocketPath}). ` +
+        'Check LOGS / terminal for native-engine errors.',
+      );
+    }
+    console.log('[thestuu-cli] native/Tracktion ready (DAW online)');
+  }
+
   const dashboardEnv = {
     ...commonEnv,
     PORT: String(options.port),
@@ -655,7 +698,18 @@ export async function runStartCommand(options) {
   let dashboardMode = 'spawned';
   let dashboardChild = null;
 
-  if (await isPortOpen(options.port, host, 800)) {
+  if (options.desktop) {
+    dashboardMode = 'tauri';
+    const desktopEnv = {
+      ...commonEnv,
+      STUU_NATIVE_SOCKET: nativeSocketPath,
+      THESTUU_NATIVE_SOCKET: nativeSocketPath,
+      THESTUU_ENGINE_URL: `http://${host}:${options.enginePort}`,
+      NEXT_PUBLIC_ENGINE_URL: `http://${host}:${options.enginePort}`,
+    };
+    console.log('[thestuu-cli] launching Tauri desktop (dashboard via tauri dev)…');
+    desktopChild = spawnDesktopDev(repoRoot, desktopEnv);
+  } else if (await isPortOpen(options.port, host, 800)) {
     dashboardMode = 'reused-existing';
     console.log(`[thestuu-cli] dashboard port ${host}:${options.port} already active, reusing existing process.`);
   } else {
@@ -704,7 +758,7 @@ export async function runStartCommand(options) {
     }
   }
 
-  attachShutdown([nativeChild, engineChild, dashboardChild]);
+  attachShutdown([nativeChild, engineChild, dashboardChild, desktopChild]);
 
   const dashboardUrl = `http://${host}:${options.port}`;
 
@@ -712,17 +766,21 @@ export async function runStartCommand(options) {
   console.log(`[thestuu-cli] project: ${projectPath}`);
   console.log(`[thestuu-cli] engine: http://${host}:${options.enginePort}`);
   console.log(`[thestuu-cli] engine mode: ${engineMode}`);
-  console.log(`[thestuu-cli] dashboard: ${dashboardUrl}`);
+  if (options.desktop) {
+    console.log(`[thestuu-cli] desktop: Tauri → ${dashboardUrl}`);
+  } else {
+    console.log(`[thestuu-cli] dashboard: ${dashboardUrl}`);
+  }
   console.log(`[thestuu-cli] dashboard mode: ${dashboardMode}`);
   if (options.native !== false && nativeChild) {
     console.log(`[thestuu-cli] native socket: ${nativeSocketPath}`);
     console.log('[thestuu-cli] native backend: tracktion');
     console.log(`[thestuu-cli] native vendor dir: ${vendorDir}`);
   } else if (options.native !== false) {
-    console.log('[thestuu-cli] native mode: reused with existing engine process');
+    console.log(`[thestuu-cli] native socket: ${nativeSocketPath} (reused with engine)`);
   }
 
-  if (options.browser) {
+  if (options.browser && !options.desktop) {
     await open(dashboardUrl);
   }
 

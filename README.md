@@ -15,10 +15,13 @@ Die App ist als Monorepo aufgebaut und trennt klar zwischen UI, Orchestrierung u
 ```bash
 npm install
 bash scripts/setup-tracktion.sh   # einmalig: Tracktion/JUCE Vendor
-npm run start
+export STUU_NATIVE_VENDOR_DIR="$(pwd)/vendor/tracktion_engine"
+npm run dev
 ```
 
-Das startet **alles zusammen**:
+`npm run dev` (und `npm run start`) starten **alles zusammen** — mit Cleanup alter Prozesse auf `:3990` / `:3010` und festem Native-Socket `/tmp/thestuu-native.sock` (gleicher Pfad wie Tauri):
+
+Das startet:
 - **native-engine** (`thestuu-native`, Tracktion/JUCE)
 - **Engine** (Node.js, Socket.IO auf `127.0.0.1:3990`)
 - **Dashboard** (Next.js auf `http://127.0.0.1:3010`)
@@ -31,9 +34,12 @@ Der Browser oeffnet sich automatisch (ausser mit `--no-browser`).
 | Engine (HTTP health) | http://127.0.0.1:3990 |
 | Projekte | `~/.thestuu/projects/` |
 | Config | `~/.thestuu/config.json` |
-| Native IPC Socket | `/tmp/thestuu-native-<pid>.sock` (Standard via CLI) |
+| Native IPC Socket | `/tmp/thestuu-native.sock` (CLI, Engine, Tauri) |
 
-**Standard-Modus:** `npm run start` setzt **native-first** DAW-Flags (`STUU_NATIVE_CLIP_OPS=1`, Track/Undo/Sidecar, kein Legacy-Sync). Fuer JSON-only QA: `npx thestuu start --legacy-daw`.
+**Desktop:** `npm run dev -- --desktop` oder `npm run desktop:dev`  
+**Details:** `docs/dev.md`
+
+**Standard-Modus:** `npm run dev` setzt **native-first** DAW-Flags. Fuer JSON-only QA: `npm run start -- --legacy-daw --no-browser`.
 
 ---
 
@@ -53,27 +59,27 @@ Der Browser oeffnet sich automatisch (ausser mit `--no-browser`).
 
 | Komponente | Ordner | Start einzeln |
 |------------|--------|----------------|
-| **CLI (voller Stack)** | `apps/cli` | `npm run start` (Root) |
+| **CLI (voller Stack)** | `apps/cli` | `npm run dev` (Root) |
 | **Dashboard** | `apps/dashboard` | `npm run dev --prefix apps/dashboard` |
 | **Engine** | `apps/engine` | `npm run start --prefix apps/engine` |
 | **Native** | `apps/native-engine` | `./apps/native-engine/build/thestuu-native` |
-| **Desktop (Tauri)** | `apps/desktop` | `npm run desktop:dev` (Dashboard muss erreichbar sein) |
+| **Desktop (Tauri)** | `apps/desktop` | `npm run desktop:dev` (= `npm run dev -- --desktop`) |
 
-**Wichtig:** Fuer echte DAW-Funktion immer den **vollen Stack** via `npm run start` nutzen. Nur das Dashboard ohne Engine/Native zeigt die UI, aber Transport/Clips/Audio sind offline.
+**Wichtig:** Fuer echte DAW-Funktion immer `npm run dev` (ein Befehl). Nur Dashboard ohne Engine/Native → **NO AUDIO** in der UI.
 
 ---
 
 ## CLI Optionen
 
 ```bash
-npx thestuu start
-npx thestuu start --port 3010 --engine-port 3990 --no-browser
-npx thestuu start --legacy-daw          # Legacy JSON-Modus (QA, nicht fuer Performance-Ziel)
-npx thestuu start --no-native           # Nur JS-Transport-Stub (Entwicklung)
-npx thestuu start --project mein-projekt.stu
+npm run dev
+npm run dev -- --desktop
+npm run dev -- --reuse                 # stale Prozesse nicht killen (nur wenn DAW schon ready)
+npm run start -- --no-browser
+npm run start -- --legacy-daw
 ```
 
-Hilfe: `npx thestuu start --help`
+Hilfe: `node apps/cli/bin/thestuu.js --help`
 
 ---
 

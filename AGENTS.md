@@ -15,7 +15,7 @@ Dashboard (Next.js)     →  renders confirmed state; optimistic UI must reconci
 Engine (Node.js)        →  router / cache / orchestrator only — NOT a second DAW
 native-engine (C++/TE)  →  authoritative DAW: transport, clips, tracks, mixer, plugins, undo, project I/O
 Tauri (apps/desktop)    →  shell + process lifecycle only — NOT DAW state
-CLI (apps/cli)          →  spawns and coordinates the stack (npm run start)
+CLI (apps/cli)          →  spawns and coordinates the stack (`npm run dev`)
 ```
 
 ### Native / Tracktion owns DAW-critical state
@@ -120,9 +120,10 @@ Do **not** treat DevTools console as the canonical place for native-engine, IPC,
 
 | Goal | Command |
 |------|---------|
-| Full stack (normal) | `npm run start` |
-| Stack without browser | `npm run start -- --no-browser` |
-| Legacy QA | `npm run start -- --legacy-daw --no-browser` |
+| Full stack (normal) | `npm run dev` |
+| Desktop window | `npm run dev -- --desktop` or `npm run desktop:dev` |
+| Stack without browser | `npm run dev -- --no-browser` |
+| Legacy QA | `npm run dev -- --legacy-daw --no-browser` |
 | Dashboard only (needs engine) | `npm run dev --prefix apps/dashboard` |
 | Desktop shell | `npm run desktop:dev` (reuses or spawns native + Node; dashboard must be up for full UI) |
 
@@ -318,5 +319,6 @@ See `docs/performance.md`.
 | `docs/desktop-tauri.md` | Desktop shell + Node/native sidecars |
 | `docs/performance.md` | Performance QA and env vars |
 | `docs/native-engine-release.md` | Release build, strip, binary sizes |
+| `docs/dev.md` | Single dev entry (`npm run dev`), socket/ports |
 | `README.md` | Human onboarding and commands |
 | `.cursor/rules/daw-state-authority.mdc` | Cursor-specific DAW rule mirror |
