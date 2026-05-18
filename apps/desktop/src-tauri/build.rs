@@ -7,11 +7,14 @@ fn main() {
     tauri_build::build();
 }
 
-/// Tauri externalBin expects `thestuu-native-{TARGET}` beside the dev binary path.
+/// Tauri externalBin expects `thestuu-native-{TARGET_TRIPLE}` next to the path in tauri.conf.json.
 fn link_native_sidecar_binary() {
-    let target = match env::var("TARGET") {
+    let target = match env::var("TARGET").or_else(|_| env::var("TAURI_ENV_TARGET_TRIPLE")) {
         Ok(value) => value,
-        Err(_) => return,
+        Err(_) => {
+            println!("cargo:warning=TARGET unset; skipping native sidecar link (run npm run build:native-release)");
+            return;
+        }
     };
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -30,14 +33,6 @@ fn link_native_sidecar_binary() {
         "thestuu-native"
     };
 
-    // Prefer stripped release binary (npm run build:native-release); fall back to dev build/.
-    for build_dir in [release_dir.as_path(), dev_dir.as_path()] {
-        let dst = build_dir.join(&suffixed_name);
-        if dst.is_file() {
-            return;
-        }
-    }
-
     let sources = [
         release_dir.join(plain_name),
         release_dir.join("Release").join(plain_name),
@@ -45,17 +40,32 @@ fn link_native_sidecar_binary() {
         dev_dir.join("Release").join(plain_name),
     ];
 
-    let build_dir = release_dir.as_path();
-    let dst = build_dir.join(&suffixed_name);
-
+    let mut src_path: Option<PathBuf> = None;
     for src in &sources {
         if src.is_file() {
-            if let Some(parent) = dst.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::copy(src, &dst);
+            src_path = Some(src.clone());
             println!("cargo:rerun-if-changed={}", src.display());
             break;
         }
+    }
+
+    let Some(src) = src_path else {
+        println!(
+            "cargo:warning=native binary missing; run: npm run build:native-release (checked release + dev trees)"
+        );
+        return;
+    };
+
+    for out_dir in [release_dir.as_path(), dev_dir.as_path()] {
+        let dst = out_dir.join(&suffixed_name);
+        if let Some(parent) = dst.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                panic!("create_dir_all {}: {error}", parent.display());
+            }
+        }
+        if let Err(error) = fs::copy(&src, &dst) {
+            panic!("copy {} -> {}: {error}", src.display(), dst.display());
+        }
+        println!("cargo:rerun-if-changed={}", dst.display());
     }
 }

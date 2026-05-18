@@ -69,7 +69,7 @@ chmod +x "${BIN}"
 
 UNSTRIPPED="${BUILD_DIR}/thestuu-native.unstripped"
 cp -f "${BIN}" "${UNSTRIPPED}"
-echo "[thestuu-native] release (pre-strip): $(human_size "${BIN}")"
+echo "[thestuu-native] release (pre-strip): $(human_size "${UNSTRIPPED}")"
 
 bash "${SCRIPT_DIR}/strip-native-binary.sh" "${BIN}" "${BUILD_DIR}"
 
@@ -84,5 +84,15 @@ elif [[ -f "${BUILD_DIR}/thestuu-native.debug" ]]; then
 fi
 echo "  stripped size:    $(human_size "${BIN}")"
 echo "  unstripped size:  $(human_size "${UNSTRIPPED}")"
+
+# Tauri externalBin requires target-triplet suffix beside the path in tauri.conf.json.
+HOST_TRIPLE="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' || true)"
+if [[ -n "${HOST_TRIPLE}" ]]; then
+  TAURI_SIDECAR="${BUILD_DIR}/thestuu-native-${HOST_TRIPLE}"
+  cp -f "${BIN}" "${TAURI_SIDECAR}"
+  chmod +x "${TAURI_SIDECAR}"
+  echo "  Tauri sidecar:    ${TAURI_SIDECAR}"
+fi
+
 echo ""
 echo "Tauri: npm run build:native-release (repo root) then npm run desktop:build"
