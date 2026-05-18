@@ -49,7 +49,7 @@ import {
   Redo2,
 } from 'lucide-react';
 import 'reactflow/dist/style.css';
-import { createEngineSocket } from '../lib/socket';
+import { createEngineSocket, resolveEngineUrl } from '../lib/socket';
 import { clipIntersectsViewport, getVisibleBarRange, trackRowIntersectsViewport } from '../lib/clip-visibility.js';
 import {
   getPerformanceProfile,
@@ -235,8 +235,6 @@ const FADE_CURVE_NODE_MIN_PX = 10;
 /** Below this fade width (px) we treat the clip as having no fade — no curve, no handles. */
 const FADE_VISIBLE_MIN_PX = 0.5;
 const DEFAULT_EDIT_TOOL = 'select';
-const ENGINE_BASE_URL = process.env.NEXT_PUBLIC_ENGINE_URL || 'http://127.0.0.1:3990';
-
 /** Safe basename for exported project JSON (no path separators or illegal filename chars). */
 function sanitizeProjectJsonBasename(raw) {
   if (raw == null || typeof raw !== 'string') return '';
@@ -376,7 +374,7 @@ function resolveTracktionPluginUiMeta(pluginUid, pluginName) {
     : `internal:tracktion:${token}`;
   return {
     ...baseMeta,
-    previewSrc: `${ENGINE_BASE_URL}/plugin-preview?uid=${encodeURIComponent(previewPluginUid)}&w=${TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.width}&h=${TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.height}`,
+    previewSrc: `${resolveEngineUrl()}/plugin-preview?uid=${encodeURIComponent(previewPluginUid)}&w=${TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.width}&h=${TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.height}`,
     fallbackPreviewSrc: `/plugin-previews/tracktion/${token}.svg`,
     previewWidth: TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.width,
     previewHeight: TRACKTION_PLUGIN_PREVIEW_DIMENSIONS.height,
@@ -1372,7 +1370,7 @@ function eventHasFilePayload(event) {
 }
 
 async function uploadFileToEngine(file) {
-  const uploadUrl = new URL('/media/upload', ENGINE_BASE_URL);
+  const uploadUrl = new URL('/media/upload', resolveEngineUrl());
   uploadUrl.searchParams.set('filename', file.name || `import_${Date.now()}`);
   const response = await fetch(uploadUrl.toString(), {
     method: 'POST',
@@ -2673,7 +2671,7 @@ export default function StuuShell() {
   const [, setFloatingWindowZCounter] = useState(() => getNextFloatingWindowZCounter(loadFloatingWindowLayoutsFromStorage()));
   const [enginePort, setEnginePort] = useState(() => {
     try {
-      const u = new URL(ENGINE_BASE_URL);
+      const u = new URL(resolveEngineUrl());
       return u.port ? Number(u.port) : 3990;
     } catch {
       return 3990;

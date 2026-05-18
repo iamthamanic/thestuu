@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.thestuu.app",
   "build": {
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
-    "frontendDist": "../offline"
+    "beforeDevCommand": "npm run dev --prefix ../dashboard",
+    "devUrl": "http://127.0.0.1:3010",
+    "beforeBuildCommand": "npm run build --prefix ../dashboard",
+    "frontendDist": "../../dashboard/out"
   },
   "app": {
     "withGlobalTauri": true,
@@ -16,8 +17,7 @@
         "title": "TheStuu",
         "width": 1440,
         "height": 900,
-        "resizable": true,
-        "url": "index.html"
+        "resizable": true
       }
     ],
     "security": {

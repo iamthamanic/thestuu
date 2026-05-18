@@ -6,7 +6,7 @@ Tauri is a **desktop window and OS integration layer only**. It does not own, mu
 |-------|------|
 | `apps/native-engine` | **DAW truth** (Tracktion) — clips, tracks, transport, mixer, undo |
 | `apps/engine` | Node router + JSON sidecar (patterns, view, metadata) |
-| `apps/dashboard` | Next.js UI |
+| `apps/dashboard` | Next.js UI (static export `out/` for packaged desktop; dev server on `:3010`) |
 | `apps/cli` | Dev/start workflow (`npm run start`) |
 | `apps/desktop` | **Tauri shell** — window, native + Node lifecycle, diagnostics |
 
@@ -78,7 +78,7 @@ Tauri startup order:
 
 1. **native-engine** — spawn or reuse Unix socket
 2. **Node engine** — spawn `node apps/engine/src/server.js` with `STUU_NATIVE_SOCKET` matching native, or reuse existing `/health` on port 3990
-3. **Dashboard URL** — navigate webview when `THESTUU_DASHBOARD_URL` is reachable (does not spawn Next.js; run dashboard separately or use `npm run start` in another terminal)
+3. **Dashboard** — **dev:** Tauri `devUrl` → `http://127.0.0.1:3010` (`beforeDevCommand` runs `npm run dev` in `apps/dashboard`). **Release:** bundled static export from `apps/dashboard/out` (no Next.js server at runtime). Socket.IO still targets the Node engine at `http://127.0.0.1:3990` (`NEXT_PUBLIC_ENGINE_URL` / `THESTUU_ENGINE_URL`).
 
 Managed processes are stopped on app exit **only when Tauri launched them**. Reused processes from `npm run start` are left running.
 
@@ -96,13 +96,16 @@ Tauri **reuses** existing native socket and Node `/health`. It does **not** kill
 |---------|-------------|
 | `npm run start` | CLI: native + engine + dashboard (unchanged) |
 | `npm run desktop:dev` | Tauri dev window + native + Node sidecar lifecycle |
-| `npm run desktop:build` | Tauri release bundle (native binary must exist for sidecar) |
+| `npm run desktop:build` | Builds dashboard static export + Tauri release bundle (native binary must exist for sidecar) |
+| `npm run build --prefix apps/dashboard` | Static export only → `apps/dashboard/out/` (~1–2 MB; `.next/` is dev/build cache only) |
 
 ### Environment
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `THESTUU_DASHBOARD_URL` | `http://127.0.0.1:3010` | Dashboard URL for webview navigation |
+| `THESTUU_DASHBOARD_URL` | `http://127.0.0.1:3010` (dev) | Dashboard URL for dev webview navigation |
+| `THESTUU_ENGINE_URL` | `http://127.0.0.1:3990` | Injected into static UI in release builds (`window.__THESTUU_ENGINE_URL__`) |
+| `NEXT_PUBLIC_ENGINE_URL` | `http://127.0.0.1:3990` | Baked into static export at build time (Socket.IO + HTTP to Node) |
 | `ENGINE_HOST` | `127.0.0.1` | Node engine bind host |
 | `ENGINE_PORT` | `3990` | Node engine port (`/health` probe + spawn env) |
 | `STUU_NATIVE_SOCKET` | `/tmp/thestuu-native.sock` | Unix socket for native IPC (match CLI when reusing) |

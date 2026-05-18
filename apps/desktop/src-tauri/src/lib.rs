@@ -20,7 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
-const DEFAULT_DASHBOARD_URL: &str = "http://127.0.0.1:3010";
+const DEFAULT_DEV_DASHBOARD_URL: &str = "http://127.0.0.1:3010";
+const DEFAULT_ENGINE_URL: &str = "http://127.0.0.1:3990";
 const STATUS_EVENT: &str = "desktop://status";
 const DIAGNOSTICS_EVENT: &str = "desktop://diagnostics";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -44,8 +45,26 @@ pub struct DesktopStatus {
     pub dashboard_url: String,
 }
 
+/// Dev: Next.js on :3010. Release: static export bundled in `frontendDist` (no HTTP server).
+fn use_dev_dashboard() -> bool {
+    cfg!(debug_assertions)
+        || std::env::var("THESTUU_DASHBOARD_DEV")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
 fn dashboard_url() -> String {
-    std::env::var("THESTUU_DASHBOARD_URL").unwrap_or_else(|_| DEFAULT_DASHBOARD_URL.to_string())
+    if use_dev_dashboard() {
+        std::env::var("THESTUU_DASHBOARD_URL")
+            .unwrap_or_else(|_| DEFAULT_DEV_DASHBOARD_URL.to_string())
+    } else {
+        std::env::var("THESTUU_DASHBOARD_URL")
+            .unwrap_or_else(|_| "asset://localhost".to_string())
+    }
+}
+
+fn engine_url_for_static_ui() -> String {
+    std::env::var("THESTUU_ENGINE_URL").unwrap_or_else(|_| DEFAULT_ENGINE_URL.to_string())
 }
 
 fn dashboard_socket_addr() -> Option<SocketAddr> {
@@ -59,6 +78,9 @@ fn dashboard_socket_addr() -> Option<SocketAddr> {
 }
 
 fn is_dashboard_reachable() -> bool {
+    if !use_dev_dashboard() {
+        return true;
+    }
     let Some(addr) = dashboard_socket_addr() else {
         return false;
     };
@@ -109,11 +131,8 @@ fn emit_diagnostics(
     let _ = app.emit(STATUS_EVENT, status_from_diag(&diag));
 }
 
-fn is_diagnostics_page(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
-        .and_then(|w| w.url().ok())
-        .map(|u| u.as_str().contains("diagnostics.html"))
-        .unwrap_or(false)
+fn is_diagnostics_page(_app: &AppHandle) -> bool {
+    false
 }
 
 fn start_status_poller(
@@ -128,7 +147,11 @@ fn start_status_poller(
             emit_diagnostics(&app, &native_manager, &node_manager);
 
             let diag = build_full_diagnostics(&native_manager, &node_manager);
-            if diag.dashboard_online && diag.daw_ready && !is_diagnostics_page(&app) {
+            if use_dev_dashboard()
+                && diag.dashboard_online
+                && diag.daw_ready
+                && !is_diagnostics_page(&app)
+            {
                 if let Some(window) = app.get_webview_window("main") {
                     if let Ok(url) = diag.dashboard_url.parse() {
                         let _ = window.navigate(url);
@@ -268,12 +291,22 @@ fn copy_diagnostics_text(
 #[tauri::command]
 fn open_diagnostics(app: AppHandle) -> Result<(), String> {
     manager_log_open(&app);
-    navigate_main_window(&app, "diagnostics.html")
+    navigate_main_window(&app, "index.html")
 }
 
 #[tauri::command]
 fn open_shell_home(app: AppHandle) -> Result<(), String> {
     navigate_main_window(&app, "index.html")
+}
+
+fn inject_static_dashboard_engine_url(window: &tauri::WebviewWindow) {
+    if use_dev_dashboard() {
+        return;
+    }
+    let engine_url = engine_url_for_static_ui();
+    let escaped = engine_url.replace('\\', "\\\\").replace('\'', "\\'");
+    let script = format!("window.__THESTUU_ENGINE_URL__ = '{escaped}';");
+    let _ = window.eval(&script);
 }
 
 fn manager_log_open(app: &AppHandle) {
@@ -311,6 +344,9 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            if let Some(window) = app.get_webview_window("main") {
+                inject_static_dashboard_engine_url(&window);
+            }
             native_manager.startup(&handle);
             native_manager.refresh_health();
             let socket = native_manager.socket_path();

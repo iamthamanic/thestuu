@@ -3,6 +3,7 @@
 # =============================================================================
 node_modules/
 .next/
+apps/dashboard/out/
 dist/
 coverage/
 .nyc_output/
