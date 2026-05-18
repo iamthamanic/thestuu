@@ -2654,6 +2654,7 @@ export default function StuuShell() {
 
   const [connection, setConnection] = useState('connecting');
   const [engineDiagnostics, setEngineDiagnostics] = useState(null);
+  const [recoveryStatus, setRecoveryStatus] = useState(null);
   const [connectionLogs, setConnectionLogs] = useState([]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [settingsTab, setSettingsTab] = useState('AUDIO');
@@ -3156,6 +3157,18 @@ export default function StuuShell() {
       handleEngineDiagnostics(payload);
     });
     socket.on('engine:diagnostics', handleEngineDiagnostics);
+    const handleEngineRecovery = (payload) => {
+      setRecoveryStatus(payload);
+      if (payload?.crashDetected) {
+        appendConnectionLogEntry({
+          level: 'warn',
+          source: 'engine',
+          category: 'recovery',
+          text: '[recovery] previous session ended without clean shutdown',
+        });
+      }
+    };
+    socket.on('engine:recovery', handleEngineRecovery);
     socket.on('engine:logs:init', handleEngineLogsInit);
     socket.on('engine:log', handleEngineLog);
     socket.on('engine:state', (payload) => {
@@ -3293,6 +3306,7 @@ export default function StuuShell() {
       socket.off('engine:log', handleEngineLog);
       socket.off('engine:ready');
       socket.off('engine:diagnostics');
+      socket.off('engine:recovery', handleEngineRecovery);
       unbindMeters();
       socket.off('engine:state');
       socket.off('engine:analyzer');
@@ -8923,6 +8937,47 @@ export default function StuuShell() {
   const canUndoProject = Boolean(state?.history?.canUndo);
   const canRedoProject = Boolean(state?.history?.canRedo);
   const dawEngineReady = connection === 'online' && state?.nativeTransport === true;
+  const handleRecoveryRestore = useCallback((candidatePath) => {
+    const socket = socketRef.current;
+    if (!socket || !candidatePath) return;
+    socket.emit('recovery:restore', { path: candidatePath }, (res) => {
+      if (res?.ok) {
+        appendConnectionLogEntry({
+          level: 'info',
+          source: 'engine',
+          category: 'recovery',
+          text: `[recovery] restored ${String(candidatePath).split(/[/\\]/).pop() || candidatePath}`,
+        });
+        socket.emit('recovery:list', {}, (listRes) => {
+          if (listRes?.ok) {
+            setRecoveryStatus({
+              crashDetected: listRes.crashDetected,
+              candidates: listRes.candidates,
+              autosaveDir: listRes.autosaveDir,
+            });
+          }
+        });
+      } else {
+        appendConnectionLogEntry({
+          level: 'error',
+          source: 'engine',
+          category: 'recovery',
+          text: `[recovery] restore failed: ${res?.error || 'unknown'}`,
+        });
+      }
+    });
+  }, [appendConnectionLogEntry]);
+
+  const handleRecoveryDismiss = useCallback(() => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    socket.emit('recovery:dismiss', {}, (res) => {
+      if (res?.ok) {
+        setRecoveryStatus((prev) => (prev ? { ...prev, crashDetected: false } : null));
+      }
+    });
+  }, []);
+
   const renderConnectionStatusWithLogs = () => (
     <ConnectionStatusLogs
       connection={connection}
@@ -8930,6 +8985,9 @@ export default function StuuShell() {
       dawEngineReady={dawEngineReady}
       nativeTransport={state?.nativeTransport === true}
       engineDiagnostics={engineDiagnostics}
+      recoveryStatus={recoveryStatus}
+      onRecoveryRestore={handleRecoveryRestore}
+      onRecoveryDismiss={handleRecoveryDismiss}
       connectionLogs={connectionLogs}
       setConnectionLogs={setConnectionLogs}
       appendLogEntry={appendConnectionLogEntry}

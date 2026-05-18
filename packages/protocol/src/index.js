@@ -113,6 +113,7 @@ export const ENGINE_EVENTS = Object.freeze({
   ANALYZER: 'engine:analyzer',
   LOG: 'engine:log',
   LOGS_INIT: 'engine:logs:init',
+  RECOVERY: 'engine:recovery',
 });
 
 /** Dashboard → engine client events (not colon commands). */

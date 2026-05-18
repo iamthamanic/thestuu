@@ -22,6 +22,7 @@ export const LIVE_LOG_CATEGORIES = Object.freeze({
   PLUGIN: 'plugin',
   PROJECT: 'project',
   TRANSPORT: 'transport',
+  RECOVERY: 'recovery',
   UNKNOWN: 'unknown',
 });
 

@@ -31,6 +31,9 @@ import { mergeLogsPanelHealth } from '../lib/engine-diagnostics.js';
  * @param {boolean} props.dawEngineReady
  * @param {boolean} props.nativeTransport
  * @param {object | null} props.engineDiagnostics
+ * @param {object | null} [props.recoveryStatus]
+ * @param {(path: string) => void} [props.onRecoveryRestore]
+ * @param {() => void} [props.onRecoveryDismiss]
  * @param {import('react').Dispatch<import('react').SetStateAction<Array>>} props.setConnectionLogs
  * @param {Array} props.connectionLogs
  * @param {(entry: object) => void} props.appendLogEntry
@@ -41,6 +44,9 @@ export default function ConnectionStatusLogs({
   dawEngineReady,
   nativeTransport,
   engineDiagnostics,
+  recoveryStatus,
+  onRecoveryRestore,
+  onRecoveryDismiss,
   connectionLogs,
   setConnectionLogs,
   appendLogEntry,
@@ -82,6 +88,12 @@ export default function ConnectionStatusLogs({
   const legacyClipOpsOff =
     engineDiagnostics?.nativeDawFlags?.clipOps === false
     || health.dawAuthority === 'legacy-json';
+
+  const recoveryCandidates = Array.isArray(recoveryStatus?.candidates)
+    ? recoveryStatus.candidates.filter((c) => c?.newerThanPrimary && c?.valid !== false)
+    : [];
+  const showRecoveryPanel = Boolean(recoveryStatus?.crashDetected) || recoveryCandidates.length > 0;
+  const sessionRecovery = engineDiagnostics?.sessionRecovery;
 
   const updatePortalLayout = useCallback(() => {
     if (typeof window === 'undefined') return;
@@ -322,6 +334,40 @@ export default function ConnectionStatusLogs({
                   Native: {health.lastNativeError}
                 </div>
               ) : null}
+              {showRecoveryPanel ? (
+                <div className="status-log-recovery" role="region" aria-label="Session recovery">
+                  <div className="status-log-recovery-title">
+                    {recoveryStatus?.crashDetected ? 'Crash recovery' : 'Recovery snapshots'}
+                  </div>
+                  {sessionRecovery?.lastSaveError ? (
+                    <div className="status-log-native-error" role="alert">
+                      Last save failed: {sessionRecovery.lastSaveError.error || JSON.stringify(sessionRecovery.lastSaveError)}
+                    </div>
+                  ) : null}
+                  {sessionRecovery?.lastRestoreResult ? (
+                    <div className="status-log-recovery-meta">
+                      Last restore: {sessionRecovery.lastRestoreResult.path || 'ok'}
+                    </div>
+                  ) : null}
+                  {recoveryCandidates.slice(0, 4).map((candidate) => (
+                    <div key={candidate.id || candidate.path} className="status-log-recovery-row">
+                      <span className="status-log-recovery-label">{candidate.label || candidate.path}</span>
+                      <button
+                        type="button"
+                        className="status-log-panel-clear"
+                        onClick={() => onRecoveryRestore?.(candidate.path)}
+                      >
+                        restore
+                      </button>
+                    </div>
+                  ))}
+                  {recoveryStatus?.crashDetected ? (
+                    <button type="button" className="status-log-panel-clear" onClick={() => onRecoveryDismiss?.()}>
+                      dismiss crash notice
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="status-log-panel-actions">
                 {isTauri ? (
                   <>
@@ -363,6 +409,8 @@ export default function ConnectionStatusLogs({
                   <option value="ipc">ipc</option>
                   <option value="audio">audio</option>
                   <option value="startup">startup</option>
+                  <option value="recovery">recovery</option>
+                  <option value="project">project</option>
                   <option value="desktop-lifecycle">desktop-lifecycle</option>
                 </select>
               </div>

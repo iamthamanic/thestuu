@@ -21,6 +21,9 @@ export function mapEngineDiagnostics(raw) {
     dawAuthority: typeof raw.dawAuthority === 'string' ? raw.dawAuthority : 'unknown',
     nativeSocketPath: typeof raw.nativeSocketPath === 'string' ? raw.nativeSocketPath : '',
     nativeDawFlags: flags,
+    sessionRecovery: raw.sessionRecovery && typeof raw.sessionRecovery === 'object'
+      ? raw.sessionRecovery
+      : null,
   };
 }
 

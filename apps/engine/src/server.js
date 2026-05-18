@@ -37,12 +37,35 @@ import {
   mergeNativeMetersPayload,
   placeholderMetersForPlaylist,
 } from './meter-payload.js';
+import { saveProjectAtomic } from './project-persistence.js';
+import {
+  buildAutosaveSnapshotPath,
+  getRecoveryPaths,
+  scanRecoveryCandidates,
+  writeSessionMarker,
+} from './session-recovery.js';
+import {
+  createPluginDiagnosticsState,
+  recordPluginDisconnectDuringAction,
+  recordPluginLoadFailure,
+  recordPluginScanFailure,
+  snapshotPluginDiagnostics,
+} from './plugin-diagnostics.js';
 
 const enginePort = Number(process.env.ENGINE_PORT || 3990);
 const engineHost = process.env.ENGINE_HOST || '127.0.0.1';
 const stuuHome = process.env.STUU_HOME || path.join(os.homedir(), '.thestuu');
 const projectsDir = path.join(stuuHome, 'projects');
 const defaultProjectPath = path.join(projectsDir, 'welcome.stu');
+const recoveryPaths = getRecoveryPaths(stuuHome);
+const autosaveEnabled = process.env.STUU_AUTOSAVE !== '0';
+const autosaveIntervalMs = (() => {
+  const raw = Number(process.env.STUU_AUTOSAVE_INTERVAL_MS);
+  if (Number.isFinite(raw) && raw >= 5000) {
+    return Math.min(600000, Math.round(raw));
+  }
+  return 60000;
+})();
 const appPreferencesPath = path.join(stuuHome, 'app-preferences.json');
 const structureTemplatesDir = path.join(stuuHome, 'structure-templates');
 const nativeSocketPath = process.env.STUU_NATIVE_SOCKET || '/tmp/thestuu-native.sock';
@@ -130,6 +153,13 @@ const engineLogBuffer = [];
 let engineLogSeq = 0;
 let engineLogIo = null;
 let consoleLogMirrorInstalled = false;
+let recoveryScanResult = null;
+let autosaveTimerId = null;
+let sessionDirty = false;
+let autosaveInFlight = false;
+let lastNativeDisconnectReason = null;
+let nativePluginActionDepth = 0;
+const pluginDiagnostics = createPluginDiagnosticsState();
 
 function normalizeEngineLogLevel(level) {
   if (level === 'error' || level === 'warn' || level === 'info') {
@@ -162,6 +192,78 @@ function pushEngineLogLine(text, level = 'log') {
     }
     if (engineLogIo) {
       engineLogIo.emit('engine:log', entry);
+    }
+  }
+}
+
+function pushStructuredEngineLog({
+  level = 'log',
+  text,
+  category = 'unknown',
+  event = '',
+  metadata = null,
+  source = 'engine',
+} = {}) {
+  const message = String(text ?? '').replace(/\r/g, '');
+  if (!message.trim()) {
+    return;
+  }
+  const entry = {
+    id: `log_${Date.now()}_${engineLogSeq++}`,
+    ts: Date.now(),
+    level: normalizeEngineLogLevel(level),
+    text: message,
+    source,
+    category,
+    event,
+    metadata: metadata && typeof metadata === 'object' ? metadata : undefined,
+  };
+  engineLogBuffer.push(entry);
+  if (engineLogBuffer.length > ENGINE_LOG_BUFFER_LIMIT) {
+    engineLogBuffer.splice(0, engineLogBuffer.length - ENGINE_LOG_BUFFER_LIMIT);
+  }
+  if (engineLogIo) {
+    engineLogIo.emit('engine:log', entry);
+  }
+}
+
+function pushRecoveryEvent(level, event, message, metadata = null) {
+  pushStructuredEngineLog({
+    level,
+    category: 'recovery',
+    event,
+    text: `[recovery] ${event}: ${message}`,
+    metadata,
+  });
+}
+
+function markSessionDirty() {
+  sessionDirty = true;
+}
+
+function emitRecoveryStatus() {
+  if (!engineLogIo || !recoveryScanResult) {
+    return;
+  }
+  engineLogIo.emit(ENGINE_EVENTS.RECOVERY, {
+    crashDetected: recoveryScanResult.crashDetected,
+    candidates: recoveryScanResult.candidates,
+    lastAutosaveAtMs: recoveryScanResult.lastAutosaveAtMs,
+    lastSaveError: recoveryScanResult.lastSaveError,
+    lastRestoreResult: recoveryScanResult.lastRestoreResult,
+    autosaveDir: recoveryPaths.autosaveDir,
+    markerPath: recoveryPaths.markerPath,
+  });
+}
+
+async function withPluginNativeAction(actionName, fn) {
+  nativePluginActionDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    nativePluginActionDepth = Math.max(0, nativePluginActionDepth - 1);
+    if (nativePluginActionDepth === 0 && !nativeTransportActive) {
+      // disconnect already logged in emitNativeEngineOffline
     }
   }
 }
@@ -1074,6 +1176,21 @@ function getEngineDiagnosticsPayload() {
       legacySync: nativeLegacySyncEnabled,
       transport: nativeTransportEnabled,
     },
+    sessionRecovery: {
+      autosaveEnabled,
+      autosaveIntervalMs,
+      autosaveDir: recoveryPaths.autosaveDir,
+      sessionMarkerPath: recoveryPaths.markerPath,
+      latestAutosavePath: recoveryPaths.latestAutosavePath,
+      crashDetected: Boolean(recoveryScanResult?.crashDetected),
+      candidateCount: Array.isArray(recoveryScanResult?.candidates) ? recoveryScanResult.candidates.length : 0,
+      lastAutosaveAtMs: recoveryScanResult?.lastAutosaveAtMs ?? null,
+      lastSaveError: recoveryScanResult?.lastSaveError ?? null,
+      lastRestoreResult: recoveryScanResult?.lastRestoreResult ?? null,
+      lastNativeDisconnectReason,
+      sessionDirty,
+      pluginDiagnostics: snapshotPluginDiagnostics(pluginDiagnostics),
+    },
   };
 }
 
@@ -1115,6 +1232,20 @@ function isDawTransportAvailable() {
 }
 
 function emitNativeEngineOffline(reason = 'native-disconnected') {
+  lastNativeDisconnectReason = reason;
+  if (nativePluginActionDepth > 0) {
+    recordPluginDisconnectDuringAction(pluginDiagnostics, {
+      reason,
+      actionDepth: nativePluginActionDepth,
+    });
+    pushStructuredEngineLog({
+      level: 'error',
+      category: 'plugin',
+      event: 'disconnect-during-action',
+      text: `[plugin] native disconnected during plugin action (${reason})`,
+      metadata: pluginDiagnostics.lastDisconnectDuringPluginAction,
+    });
+  }
   if (liveRecordMergeIntervalId != null) {
     clearInterval(liveRecordMergeIntervalId);
     liveRecordMergeIntervalId = null;
@@ -1331,9 +1462,29 @@ function setNativePluginCatalogCache(rawPlugins) {
 const NATIVE_VST_SCAN_TIMEOUT_MS = 600000;
 
 async function refreshNativePluginCatalogCache() {
-  const response = await requestNativeTransport('vst:scan', {}, { timeoutMs: NATIVE_VST_SCAN_TIMEOUT_MS });
-  const plugins = Array.isArray(response?.plugins) ? response.plugins : [];
-  return setNativePluginCatalogCache(plugins);
+  return withPluginNativeAction('vst:scan', async () => {
+    try {
+      const response = await requestNativeTransport('vst:scan', {}, { timeoutMs: NATIVE_VST_SCAN_TIMEOUT_MS });
+      const plugins = Array.isArray(response?.plugins) ? response.plugins : [];
+      pluginDiagnostics.lastScanAtMs = Date.now();
+      return setNativePluginCatalogCache(plugins);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const timedOut = message.toLowerCase().includes('timeout');
+      recordPluginScanFailure(pluginDiagnostics, {
+        error: message,
+        timedOut,
+      });
+      pushStructuredEngineLog({
+        level: timedOut ? 'warn' : 'error',
+        category: 'plugin',
+        event: timedOut ? 'scan-timeout' : 'scan-failed',
+        text: `[plugin] vst:scan ${timedOut ? 'timed out' : 'failed'}: ${message}`,
+        metadata: pluginDiagnostics.lastScanFailure,
+      });
+      throw error;
+    }
+  });
 }
 
 async function getNativePluginCatalogEntry(pluginUid, { refreshIfMissing = true } = {}) {
@@ -2320,7 +2471,21 @@ async function restoreNativeVstNodes({ resetEdit = false, skipNativeProjectReimp
       restored += 1;
     } catch (error) {
       failed += 1;
-      errors.push(`node "${node.id}": ${error instanceof Error ? error.message : 'load failed'}`);
+      const message = error instanceof Error ? error.message : 'load failed';
+      errors.push(`node "${node.id}": ${message}`);
+      recordPluginLoadFailure(pluginDiagnostics, {
+        nodeId: node.id,
+        pluginUid: resolveVstNodePluginUid(node),
+        trackId: resolveVstNodeTrackId(node),
+        error: message,
+      });
+      pushStructuredEngineLog({
+        level: 'error',
+        category: 'plugin',
+        event: 'load-failed',
+        text: `[plugin] vst:load failed for node "${node.id}": ${message}`,
+        metadata: pluginDiagnostics.lastLoadFailure,
+      });
     }
   }
 
@@ -4504,15 +4669,154 @@ async function ensureAppPreferencesFile() {
 }
 
 async function saveProject(targetPath, projectData) {
-  const normalizedProject = normalizeProject(projectData);
-  const validation = validateProject(normalizedProject);
-  if (!validation.ok) {
-    throw new Error(validation.errors.join('; '));
-  }
+  const result = await saveProjectAtomic(targetPath, projectData, { backup: true });
+  return result.project;
+}
 
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  await fs.writeFile(targetPath, serializeProject(normalizedProject), 'utf8');
-  return normalizedProject;
+async function exportProjectDataForPersistence(baseProject = state.project) {
+  let projectData = baseProject;
+  if (nativeProjectSidecarEnabled && nativeTransportActive) {
+    const nativeExport = await requestNativeTransport(
+      NATIVE_COMMANDS.PROJECT_EXPORT,
+      {},
+      { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS },
+    );
+    projectData = mergeAuthoritativeProjectState(projectData, nativeExport);
+  }
+  return projectData;
+}
+
+async function runAutosaveSnapshot({ reason = 'interval' } = {}) {
+  if (!autosaveEnabled || autosaveInFlight) {
+    return null;
+  }
+  autosaveInFlight = true;
+  const primaryPath = state.selectedProjectFile || defaultProjectPath;
+  try {
+    await fs.mkdir(recoveryPaths.autosaveDir, { recursive: true });
+    const projectData = await exportProjectDataForPersistence();
+    const snapshotPath = buildAutosaveSnapshotPath(recoveryPaths.autosaveDir, primaryPath);
+    const saved = await saveProjectAtomic(snapshotPath, projectData, { backup: false });
+    await saveProjectAtomic(recoveryPaths.latestAutosavePath, saved.project, { backup: false });
+    const nowMs = Date.now();
+    await writeSessionMarker(recoveryPaths.markerPath, {
+      pid: process.pid,
+      dirty: sessionDirty,
+      cleanShutdown: false,
+      primaryProjectPath: primaryPath,
+      lastAutosaveAtMs: nowMs,
+      lastAutosavePath: snapshotPath,
+      lastAutosaveReason: reason,
+    });
+    pushRecoveryEvent('info', 'autosave', `snapshot ${path.basename(snapshotPath)}`, {
+      path: snapshotPath,
+      reason,
+    });
+    return { path: snapshotPath, latestPath: recoveryPaths.latestAutosavePath };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeSessionMarker(recoveryPaths.markerPath, {
+      lastSaveError: { atMs: Date.now(), kind: 'autosave', error: message },
+    }).catch(() => {});
+    pushRecoveryEvent('error', 'autosave-failed', message, { reason });
+    return null;
+  } finally {
+    autosaveInFlight = false;
+  }
+}
+
+function startAutosaveTimer() {
+  if (!autosaveEnabled || autosaveTimerId != null) {
+    return;
+  }
+  autosaveTimerId = setInterval(() => {
+    if (!sessionDirty) {
+      return;
+    }
+    void runAutosaveSnapshot({ reason: 'interval' });
+  }, autosaveIntervalMs);
+}
+
+async function initializeSessionRecovery() {
+  recoveryScanResult = await scanRecoveryCandidates({
+    stuuHome,
+    projectsDir,
+    primaryProjectPath: state.selectedProjectFile || defaultProjectPath,
+    currentPid: process.pid,
+  });
+  await writeSessionMarker(recoveryPaths.markerPath, {
+    pid: process.pid,
+    startedAtMs: Date.now(),
+    dirty: true,
+    cleanShutdown: false,
+    primaryProjectPath: state.selectedProjectFile || defaultProjectPath,
+    crashMarker: recoveryScanResult.crashDetected,
+  });
+  if (recoveryScanResult.crashDetected) {
+    pushRecoveryEvent('warn', 'crash-detected', 'previous session ended without clean shutdown', {
+      marker: recoveryScanResult.marker,
+    });
+  }
+  const newer = recoveryScanResult.candidates.filter((c) => c.newerThanPrimary && c.kind !== 'primary');
+  if (newer.length > 0) {
+    pushRecoveryEvent('info', 'recovery-candidates', `${newer.length} newer snapshot(s) available`, {
+      candidates: newer.slice(0, 5),
+    });
+  }
+}
+
+async function loadProjectFromPath(filePath, { recordRestore = true, updateSelectedFile = false } = {}) {
+  const raw = await fs.readFile(filePath, 'utf8');
+  if (updateSelectedFile) {
+    state.selectedProjectFile = filePath.startsWith(projectsDir)
+      ? filePath
+      : path.join(projectsDir, path.basename(filePath));
+  }
+  const jsonProject = parseProject(raw);
+  let projectForApply = jsonProject;
+  if (nativeProjectSidecarEnabled && nativeTransportActive) {
+    try {
+      const importPayload = buildNativeImportFromProject(jsonProject);
+      await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
+      const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT, {}, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
+      projectForApply = mergeAuthoritativeProjectState(jsonProject, nativeExport);
+    } catch (sidecarError) {
+      console.warn('[thestuu-engine] project load native sidecar merge failed:', sidecarError instanceof Error ? sidecarError.message : String(sidecarError));
+    }
+  }
+  const didNativeSidecarImport = nativeProjectSidecarEnabled && nativeTransportActive;
+  const restoreResult = await applyProjectState(projectForApply, {
+    resetEdit: true,
+    resetHistory: true,
+    skipNativeProjectReimport: didNativeSidecarImport,
+  });
+  emitState({ recordHistory: false });
+  sessionDirty = false;
+  if (recordRestore) {
+    const restoreMeta = {
+      atMs: Date.now(),
+      path: filePath,
+      restoredPlugins: restoreResult.restored,
+      failedPlugins: restoreResult.failed,
+      errors: restoreResult.errors,
+    };
+    await writeSessionMarker(recoveryPaths.markerPath, { lastRestoreResult: restoreMeta });
+    recoveryScanResult = {
+      ...recoveryScanResult,
+      lastRestoreResult: restoreMeta,
+    };
+    pushRecoveryEvent('info', 'restore', path.basename(filePath), restoreMeta);
+  }
+  return { restoreResult, filePath };
+}
+
+async function markCleanShutdown() {
+  await writeSessionMarker(recoveryPaths.markerPath, {
+    pid: process.pid,
+    dirty: false,
+    cleanShutdown: true,
+    shutdownAtMs: Date.now(),
+  });
 }
 
 async function applyProjectState(projectData, { resetEdit = true, resetHistory = false, skipNativeProjectReimport = false } = {}) {
@@ -5004,6 +5308,7 @@ function bindMutation(socket, eventName, handler) {
   socket.on(eventName, async (payload = {}, callback = () => {}) => {
     try {
       const result = await handler(payload);
+      markSessionDirty();
       emitState();
       respond(callback, { ok: true, ...result });
     } catch (error) {
@@ -5045,6 +5350,7 @@ io.on('connection', (socket) => {
     diagnostics: getEngineDiagnosticsPayload(),
   });
   emitEngineDiagnostics();
+  emitRecoveryStatus();
   socket.emit('engine:logs:init', {
     entries: engineLogBuffer,
   });
@@ -6139,6 +6445,75 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('recovery:list', async (_payload = {}, callback = () => {}) => {
+    try {
+      recoveryScanResult = await scanRecoveryCandidates({
+        stuuHome,
+        projectsDir,
+        primaryProjectPath: state.selectedProjectFile || defaultProjectPath,
+        currentPid: process.pid,
+      });
+      emitRecoveryStatus();
+      respond(callback, {
+        ok: true,
+        crashDetected: recoveryScanResult.crashDetected,
+        candidates: recoveryScanResult.candidates,
+        autosaveDir: recoveryPaths.autosaveDir,
+      });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'recovery:list failed' });
+    }
+  });
+
+  socket.on('recovery:restore', async (payload = {}, callback = () => {}) => {
+    try {
+      const filePath = typeof payload.path === 'string' && payload.path.trim() ? payload.path.trim() : '';
+      if (!filePath) {
+        respond(callback, { ok: false, error: 'path is required' });
+        return;
+      }
+      const loaded = await loadProjectFromPath(filePath, { recordRestore: true });
+      recoveryScanResult = await scanRecoveryCandidates({
+        stuuHome,
+        projectsDir,
+        primaryProjectPath: state.selectedProjectFile || defaultProjectPath,
+        currentPid: process.pid,
+      });
+      emitRecoveryStatus();
+      respond(callback, {
+        ok: true,
+        filePath: loaded.filePath,
+        restoredPlugins: loaded.restoreResult.restored,
+        failedPlugins: loaded.restoreResult.failed,
+        restoreErrors: loaded.restoreResult.errors,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'recovery:restore failed';
+      pushRecoveryEvent('error', 'restore-failed', message);
+      respond(callback, { ok: false, error: message });
+    }
+  });
+
+  socket.on('recovery:dismiss', async (_payload = {}, callback = () => {}) => {
+    try {
+      await writeSessionMarker(recoveryPaths.markerPath, {
+        crashMarker: false,
+        dismissedAtMs: Date.now(),
+      });
+      recoveryScanResult = await scanRecoveryCandidates({
+        stuuHome,
+        projectsDir,
+        primaryProjectPath: state.selectedProjectFile || defaultProjectPath,
+        currentPid: process.pid,
+      });
+      emitRecoveryStatus();
+      pushRecoveryEvent('info', 'dismiss', 'recovery prompt dismissed');
+      respond(callback, { ok: true });
+    } catch (error) {
+      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'recovery:dismiss failed' });
+    }
+  });
+
   socket.on('vst:add', async (payload = {}, callback = () => {}) => {
     try {
       const pluginUid = typeof payload.plugin_uid === 'string' && payload.plugin_uid.trim()
@@ -6175,10 +6550,10 @@ io.on('connection', (socket) => {
 
       let loadedPlugin = null;
       if (nativeTransportActive) {
-        const response = await requestNativeTransport('vst:load', {
+        const response = await withPluginNativeAction('vst:load', () => requestNativeTransport('vst:load', {
           plugin_uid: pluginUid,
           track_id: trackId,
-        });
+        }));
         loadedPlugin = response.plugin || null;
       }
 
@@ -6266,7 +6641,20 @@ io.on('connection', (socket) => {
         nativeSync,
       });
     } catch (error) {
-      respond(callback, { ok: false, error: error instanceof Error ? error.message : 'vst:add failed' });
+      const message = error instanceof Error ? error.message : 'vst:add failed';
+      recordPluginLoadFailure(pluginDiagnostics, {
+        pluginUid: typeof payload?.plugin_uid === 'string' ? payload.plugin_uid : payload?.pluginUid,
+        trackId: payload?.track_id ?? payload?.trackId,
+        error: message,
+      });
+      pushStructuredEngineLog({
+        level: 'error',
+        category: 'plugin',
+        event: 'load-failed',
+        text: `[plugin] vst:add load failed: ${message}`,
+        metadata: pluginDiagnostics.lastLoadFailure,
+      });
+      respond(callback, { ok: false, error: message });
     }
   });
 
@@ -6510,36 +6898,17 @@ io.on('connection', (socket) => {
     try {
       const filename = typeof payload.filename === 'string' && payload.filename.trim() ? payload.filename.trim() : 'welcome.stu';
       const filePath = path.join(projectsDir, filename.endsWith('.stu') ? filename : `${filename}.stu`);
-      const raw = await fs.readFile(filePath, 'utf8');
-      state.selectedProjectFile = filePath;
-      const jsonProject = parseProject(raw);
-      let projectForApply = jsonProject;
-      if (nativeProjectSidecarEnabled && nativeTransportActive) {
-        try {
-          const importPayload = buildNativeImportFromProject(jsonProject);
-          await requestNativeTransport(NATIVE_COMMANDS.PROJECT_IMPORT, importPayload, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
-          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT, {}, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
-          projectForApply = mergeAuthoritativeProjectState(jsonProject, nativeExport);
-        } catch (sidecarError) {
-          console.warn('[thestuu-engine] project:load native sidecar merge failed:', sidecarError instanceof Error ? sidecarError.message : String(sidecarError));
-        }
+      const loaded = await loadProjectFromPath(filePath, { recordRestore: false, updateSelectedFile: true });
+      markSessionDirty();
+      if (loaded.restoreResult.failed > 0 || loaded.restoreResult.errors.length > 0) {
+        console.warn('[thestuu-engine] project:load native VST restore issues:', loaded.restoreResult.errors.join(' | '));
       }
-      const didNativeSidecarImport = nativeProjectSidecarEnabled && nativeTransportActive;
-      const restoreResult = await applyProjectState(projectForApply, {
-        resetEdit: true,
-        resetHistory: true,
-        skipNativeProjectReimport: didNativeSidecarImport,
-      });
-      if (restoreResult.failed > 0 || restoreResult.errors.length > 0) {
-        console.warn('[thestuu-engine] project:load native VST restore issues:', restoreResult.errors.join(' | '));
-      }
-      emitState({ recordHistory: false });
       callback({
         ok: true,
-        filePath,
-        restoredPlugins: restoreResult.restored,
-        failedPlugins: restoreResult.failed,
-        restoreErrors: restoreResult.errors,
+        filePath: loaded.filePath,
+        restoredPlugins: loaded.restoreResult.restored,
+        failedPlugins: loaded.restoreResult.failed,
+        restoreErrors: loaded.restoreResult.errors,
       });
     } catch (error) {
       callback({ ok: false, error: error instanceof Error ? error.message : 'Unknown load error' });
@@ -6711,28 +7080,33 @@ io.on('connection', (socket) => {
     try {
       const filename = typeof payload.filename === 'string' && payload.filename.trim() ? payload.filename.trim() : path.basename(state.selectedProjectFile);
       const filePath = path.join(projectsDir, filename.endsWith('.stu') ? filename : `${filename}.stu`);
-      let projectData = payload.project || state.project;
-      if (nativeProjectSidecarEnabled && nativeTransportActive) {
-        try {
-          const nativeExport = await requestNativeTransport(NATIVE_COMMANDS.PROJECT_EXPORT, {}, { timeoutMs: NATIVE_PROJECT_IO_TIMEOUT_MS });
-          projectData = mergeAuthoritativeProjectState(projectData, nativeExport);
-          state.project = projectData;
-        } catch (exportError) {
-          console.warn('[thestuu-engine] project:save native export merge failed:', exportError instanceof Error ? exportError.message : String(exportError));
-        }
-      }
+      const projectData = await exportProjectDataForPersistence(payload.project || state.project);
+      state.project = projectData;
 
       const normalizedProject = await saveProject(filePath, projectData);
       state.selectedProjectFile = filePath;
       state.project = normalizedProject;
+      sessionDirty = false;
+      await writeSessionMarker(recoveryPaths.markerPath, {
+        primaryProjectPath: filePath,
+        lastSaveAtMs: Date.now(),
+        lastSaveError: null,
+        dirty: false,
+      });
       if (nativeTransportActive) {
         await requestNativeTransport('transport.set_bpm', { bpm: state.project.bpm });
       }
 
+      pushRecoveryEvent('info', 'save', `saved ${path.basename(filePath)}`, { filePath });
       emitState();
       callback({ ok: true, filePath });
     } catch (error) {
-      callback({ ok: false, error: error instanceof Error ? error.message : 'Unknown save error' });
+      const message = error instanceof Error ? error.message : 'Unknown save error';
+      await writeSessionMarker(recoveryPaths.markerPath, {
+        lastSaveError: { atMs: Date.now(), kind: 'save', error: message },
+      }).catch(() => {});
+      pushRecoveryEvent('error', 'save-failed', message, { filePath: payload.filename });
+      callback({ ok: false, error: message });
     }
   });
 
@@ -6876,10 +7250,16 @@ const engineTickTimer = setInterval(() => {
 async function boot() {
   await ensureAppPreferencesFile();
   await ensureStructureTemplatesDir();
+  await fs.mkdir(recoveryPaths.autosaveDir, { recursive: true });
   await ensureProjectFile();
+  await initializeSessionRecovery();
   await startNativeTransportBridge();
   if (!nativeTransportActive) {
     updateTransportSnapshot(Date.now());
+  }
+  startAutosaveTimer();
+  if (nativeTransportActive) {
+    void runAutosaveSnapshot({ reason: 'boot' });
   }
 
   httpServer.on('error', (err) => {
@@ -6906,11 +7286,17 @@ async function boot() {
 
 function shutdown(signal) {
   console.log(`[thestuu-engine] received ${signal}, shutting down...`);
+  if (autosaveTimerId != null) {
+    clearInterval(autosaveTimerId);
+    autosaveTimerId = null;
+  }
   clearInterval(engineTickTimer);
   nativeTransportClient?.stop();
-  io.close(() => {
-    httpServer.close(() => {
-      process.exit(0);
+  void markCleanShutdown().finally(() => {
+    io.close(() => {
+      httpServer.close(() => {
+        process.exit(0);
+      });
     });
   });
 }

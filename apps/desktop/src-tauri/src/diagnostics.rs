@@ -285,6 +285,25 @@ pub fn engine_url() -> String {
     format!("http://{host}:{port}")
 }
 
+pub fn fetch_engine_health_json() -> Option<Value> {
+    let url = engine_url();
+    let addr = resolve_http_addr(&url)?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let host_header = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url.as_str());
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let body = response.split("\r\n\r\n").nth(1)?.trim();
+    serde_json::from_str::<Value>(body).ok()
+}
+
 pub fn probe_engine_health() -> EngineStatus {
     let url = engine_url();
     let health_path = format!("{url}/health");
@@ -476,6 +495,12 @@ pub fn export_bundle(
     logs: &[LogEntry],
     app_version: &str,
 ) -> Value {
+    let engine_health = fetch_engine_health_json();
+    let session_recovery = engine_health
+        .as_ref()
+        .and_then(|h| h.get("diagnostics"))
+        .and_then(|d| d.get("sessionRecovery"))
+        .cloned();
     json!({
         "exportedAtMs": now_ms(),
         "appVersion": app_version,
@@ -483,6 +508,27 @@ pub fn export_bundle(
         "status": diag,
         "logs": logs,
         "socketPathDefault": resolve_socket_path(),
+        "engineHealth": engine_health,
+        "sessionRecovery": session_recovery,
+        "crashMarkers": engine_health
+            .as_ref()
+            .and_then(|h| h.get("diagnostics"))
+            .and_then(|d| d.get("sessionRecovery"))
+            .and_then(|r| r.get("crashDetected")),
+        "lastNativeDisconnectReason": engine_health
+            .as_ref()
+            .and_then(|h| h.get("diagnostics"))
+            .and_then(|d| d.get("sessionRecovery"))
+            .and_then(|r| r.get("lastNativeDisconnectReason")),
+        "lastProjectRestoreResult": engine_health
+            .as_ref()
+            .and_then(|h| h.get("diagnostics"))
+            .and_then(|d| d.get("sessionRecovery"))
+            .and_then(|r| r.get("lastRestoreResult")),
+        "autosaveMetadata": engine_health
+            .as_ref()
+            .and_then(|h| h.get("diagnostics"))
+            .and_then(|d| d.get("sessionRecovery")),
     })
 }
 
