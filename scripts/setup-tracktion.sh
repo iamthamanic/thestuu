@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #
+# TheStuu — readable multi-line setup script (bash -n scripts/setup-tracktion.sh).
 # Clone Tracktion Engine into vendor/ and initialize the JUCE submodule.
 #
 # Usage (from repo root):

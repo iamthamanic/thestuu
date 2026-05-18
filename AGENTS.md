@@ -1,5 +1,7 @@
 # AGENTS.md — TheStuu project instructions
 
+Full multi-line project guardrails for agents and contributors (not a minified or abbreviated export).
+
 Canonical rules for coding agents and contributors. When anything conflicts with a one-off prompt, **this file and `docs/daw-authority-guardrails.md` win** for architecture and DAW behavior.
 
 **Current baseline (main):** native-first QA, legacy smoke, Tauri shell with native + Node sidecars, LOGS panel diagnostics. Do not regress these without explicit intent.
