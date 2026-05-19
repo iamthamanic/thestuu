@@ -4715,10 +4715,15 @@ body {
   padding: 0;
   border: none;
   transform: translate(-50%, -50%);
-  cursor: ns-resize;
+  cursor: grab;
   pointer-events: auto;
   touch-action: none;
   background: transparent;
+}
+
+.clip-fade-in-curve-handle:active,
+.clip-fade-out-curve-handle:active {
+  cursor: grabbing;
 }
 
 .clip-fade-in-curve-handle::after,

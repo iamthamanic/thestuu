@@ -162,7 +162,20 @@ Response: `{ trackId, startBars, lengthBars, sourcePath }`.
 
 Planned native-first replacements for Node JSON mutations — see [refactor-plan-daw-authority.md](./refactor-plan-daw-authority.md):
 
-`clip.move`, `clip.resize`, `clip.delete`, `clip.setFade`, `clip.setGain`, `track.create`, `track.delete`, `track.rename`, `track.reorder`, `edit.undo`, `edit.redo`, `edit.save`, `edit.open`, …
+`clip.setFade` (implemented), `clip.setGain` (planned), `track.create`, `track.delete`, `track.rename`, `track.reorder`, `edit.undo`, `edit.redo`, `edit.save`, `edit.open`, …
+
+### `clip.setFade` / `clip:set-fade`
+
+| Field | Type | Notes |
+|-------|------|--------|
+| `track_id` / `trackId` | int | required |
+| `source_path` / `sourcePath` | string | required (disambiguates clip) |
+| `old_start` / `oldStartBars` | number | bars, optional |
+| `fade_in` / `fadeIn` | number | seconds |
+| `fade_out` / `fadeOut` | number | seconds |
+| `fade_in_curve`, `fade_out_curve` | string | `linear`, `convex`, `concave`, `sCurve` |
+
+Response: `{ trackId, fadeIn, fadeOut }`.
 
 Constants: `packages/protocol` (`NATIVE_COMMANDS_TARGET`).
 

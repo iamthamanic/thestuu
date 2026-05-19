@@ -1292,6 +1292,85 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     });
   }
 
+  if (cmd == "clip.setFade" || cmd == "clip:set-fade") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "clip.setFade requires payload");
+    }
+    thestuu::native::ClipFadeBySourceRequest request;
+    request.trackId = static_cast<int32_t>(
+      asInt(getField(*payload, "track_id"), asInt(getField(*payload, "trackId"), 1)));
+    request.sourcePath = asString(getField(*payload, "source_path"));
+    if (request.sourcePath.empty()) {
+      request.sourcePath = asString(getField(*payload, "sourcePath"));
+    }
+    request.oldStartBars = asDouble(getField(*payload, "old_start"), asDouble(getField(*payload, "oldStartBars"), -1.0));
+    request.fadeInSeconds = asDouble(getField(*payload, "fade_in"), asDouble(getField(*payload, "fadeIn"), 0.0));
+    request.fadeOutSeconds = asDouble(getField(*payload, "fade_out"), asDouble(getField(*payload, "fadeOut"), 0.0));
+    auto fadeCurveFromString = [](const MsgValue* v) -> int {
+      if (!v) return 1;
+      std::string s = asString(v);
+      if (s == "convex") return 2;
+      if (s == "concave") return 3;
+      if (s == "sCurve" || s == "scurve") return 4;
+      return 1;
+    };
+    auto readFadeControl = [&](const char* cxSnake,
+                               const char* cySnake,
+                               const char* cxCamel,
+                               const char* cyCamel,
+                               bool& has,
+                               double& cx,
+                               double& cy) {
+      const MsgValue* cxV = getField(*payload, cxSnake);
+      if (!cxV) {
+        cxV = getField(*payload, cxCamel);
+      }
+      const MsgValue* cyV = getField(*payload, cySnake);
+      if (!cyV) {
+        cyV = getField(*payload, cyCamel);
+      }
+      if (cxV != nullptr && cyV != nullptr) {
+        has = true;
+        cx = asDouble(cxV, 0.52);
+        cy = asDouble(cyV, 0.74);
+      }
+    };
+    const MsgValue* fic = getField(*payload, "fade_in_curve");
+    if (!fic) fic = getField(*payload, "fadeInCurve");
+    request.fadeInCurve = fadeCurveFromString(fic);
+    const MsgValue* foc = getField(*payload, "fade_out_curve");
+    if (!foc) foc = getField(*payload, "fadeOutCurve");
+    request.fadeOutCurve = fadeCurveFromString(foc);
+    readFadeControl(
+      "fade_in_cx",
+      "fade_in_cy",
+      "fadeInCx",
+      "fadeInCy",
+      request.hasFadeInControl,
+      request.fadeInCx,
+      request.fadeInCy);
+    readFadeControl(
+      "fade_out_cx",
+      "fade_out_cy",
+      "fadeOutCx",
+      "fadeOutCy",
+      request.hasFadeOutControl,
+      request.fadeOutCx,
+      request.fadeOutCy);
+    std::string error;
+    const bool ok = g_useTracktionTransport
+      ? thestuu::native::setAudioClipFadeBySourceOnMessageThread(request, error)
+      : thestuu::native::setAudioClipFadeBySource(request, error);
+    if (!ok) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(request.trackId)},
+      {"fadeIn", MsgValue(request.fadeInSeconds)},
+      {"fadeOut", MsgValue(request.fadeOutSeconds)},
+    });
+  }
+
   if (cmd == "clip.delete" || cmd == "clip:delete") {
     if (payload == nullptr) {
       return makeErrorResponse(id, "clip.delete requires payload");
@@ -1653,12 +1732,49 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
       if (s == "sCurve" || s == "scurve") return 4;
       return 1;
     };
+    auto readFadeControl = [&](const char* cxSnake,
+                               const char* cySnake,
+                               const char* cxCamel,
+                               const char* cyCamel,
+                               bool& has,
+                               double& cx,
+                               double& cy) {
+      const MsgValue* cxV = getField(*payload, cxSnake);
+      if (!cxV) {
+        cxV = getField(*payload, cxCamel);
+      }
+      const MsgValue* cyV = getField(*payload, cySnake);
+      if (!cyV) {
+        cyV = getField(*payload, cyCamel);
+      }
+      if (cxV != nullptr && cyV != nullptr) {
+        has = true;
+        cx = asDouble(cxV, 0.52);
+        cy = asDouble(cyV, 0.74);
+      }
+    };
     const MsgValue* fic = getField(*payload, "fade_in_curve");
     if (!fic) fic = getField(*payload, "fadeInCurve");
     request.fadeInCurve = fadeCurveFromString(fic);
     const MsgValue* foc = getField(*payload, "fade_out_curve");
     if (!foc) foc = getField(*payload, "fadeOutCurve");
     request.fadeOutCurve = fadeCurveFromString(foc);
+    readFadeControl(
+      "fade_in_cx",
+      "fade_in_cy",
+      "fadeInCx",
+      "fadeInCy",
+      request.hasFadeInControl,
+      request.fadeInCx,
+      request.fadeInCy);
+    readFadeControl(
+      "fade_out_cx",
+      "fade_out_cy",
+      "fadeOutCx",
+      "fadeOutCy",
+      request.hasFadeOutControl,
+      request.fadeOutCx,
+      request.fadeOutCy);
     request.type = asString(getField(*payload, "type"));
     request.sourceOffsetSeconds = asDouble(getField(*payload, "source_offset_seconds"), asDouble(getField(*payload, "sourceOffsetSeconds"), -1.0));
 

@@ -1109,3 +1109,16 @@ export function parseProject(raw) {
 export function getSupportedVersion() {
   return SUPPORTED_VERSION;
 }
+
+export {
+  FADE_CURVE_ORDER,
+  normalizeFadeCurve,
+  controlFromCurveType,
+  curveTypeFromControl,
+  controlFromPointerInFade,
+  resolveFadeControl,
+  buildFadeCurvePathD,
+  getFadeCurveHandlePercent,
+  applyFadeCurveT,
+  getFadeEnvelopeAtX,
+} from './fade-curve.js';

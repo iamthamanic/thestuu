@@ -7,9 +7,10 @@ TheStuu CLI
 Usage:
   thestuu dev [options]     Browser on :3010 (default). Use --desktop for Tauri window.
   thestuu start [options]   Same as dev (alias)
+  thestuu tauri [options]   Same as dev --desktop (Tauri window)
 
 Options:
-  --desktop               Open Tauri window instead of browser (still starts native + engine first)
+  --desktop               Open Tauri window instead of browser (npm run tauri)
   --reuse                 Do not kill :3990/:3010; reuse engine only if native/Tracktion already ready
   --no-clean              Skip killing stale dev processes (same as --reuse for ports)
   --port <number>         Dashboard port (default: 3010)
@@ -25,7 +26,7 @@ Options:
 
 Examples:
   npm run dev
-  npm run dev -- --desktop
+  npm run tauri
   npm run start -- --no-browser
   npm run start -- --reuse
 `);
@@ -45,11 +46,18 @@ function parseArgs(argv) {
     clean: false,
     reuse: false,
     desktop: false,
-    dawReadyTimeoutMs: 120000,
+    dawReadyTimeoutMs: 180000,
   };
 
   const args = [...argv];
-  let command = args[0] === 'dev' || args[0] === 'start' ? args.shift() : 'dev';
+  let command = 'dev';
+  if (args[0] === 'dev' || args[0] === 'start' || args[0] === 'tauri') {
+    command = args.shift();
+  }
+  if (command === 'tauri') {
+    options.desktop = true;
+    options.browser = false;
+  }
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -158,7 +166,7 @@ export async function runCli(argv) {
     return;
   }
 
-  if (command === 'dev' || command === 'start') {
+  if (command === 'dev' || command === 'start' || command === 'tauri') {
     await runStartCommand(options);
     return;
   }

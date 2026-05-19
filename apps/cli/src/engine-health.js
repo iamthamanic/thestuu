@@ -94,11 +94,12 @@ export async function isEngineDawReady(port, host, expectedNativeSocket, timeout
   const diag = json.diagnostics && typeof json.diagnostics === 'object'
     ? json.diagnostics
     : {};
-  const tracktionUp = Boolean(json.nativeTransport || diag.tracktionReady);
-  if (!tracktionUp) {
-    return false;
+  if (diag.dawReady === true) {
+    return true;
   }
-  if (diag.ipcConnected === false) {
+  const tracktionUp = Boolean(json.nativeTransport || diag.tracktionReady);
+  const ipcUp = diag.ipcConnected !== false;
+  if (!tracktionUp || !ipcUp) {
     return false;
   }
   if (!expectedNativeSocket) {

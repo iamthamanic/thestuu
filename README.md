@@ -36,7 +36,8 @@ Der Browser oeffnet sich automatisch (ausser mit `--no-browser`).
 | Config | `~/.thestuu/config.json` |
 | Native IPC Socket | `/tmp/thestuu-native.sock` (CLI, Engine, Tauri) |
 
-**Desktop:** `npm run dev -- --desktop` oder `npm run desktop:dev`  
+**Desktop (Tauri-Fenster):** `npm run tauri` (alias `desktop:dev`)  
+**Release `.app`:** `npm run tauri:build`  
 **Details:** `docs/dev.md`
 
 **Standard-Modus:** `npm run dev` setzt **native-first** DAW-Flags. Fuer JSON-only QA: `npm run start -- --legacy-daw --no-browser`.

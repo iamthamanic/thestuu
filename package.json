@@ -21,7 +21,10 @@
     "qa:native-daw": "node scripts/qa-native-daw.mjs",
     "qa:legacy-daw": "node scripts/qa-legacy-daw-smoke.mjs",
     "build:native-release": "npm run build:release --workspace @thestuu/native-engine",
-    "desktop:dev": "node apps/cli/bin/thestuu.js dev --desktop",
+    "tauri": "node apps/cli/bin/thestuu.js dev --desktop",
+    "tauri:dev": "npm run tauri",
+    "tauri:build": "npm run build:native-release && npm run desktop:build",
+    "desktop:dev": "npm run tauri",
     "desktop:build": "npm run build --prefix apps/desktop"
   }
 }

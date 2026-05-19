@@ -82,7 +82,15 @@ import {
   reorderStructureNodes,
   resizeNodeRight,
 } from '../lib/song-structure.js';
-import { normalizeMasterMix } from '@thestuu/shared-json';
+import {
+  normalizeMasterMix,
+  buildFadeCurvePathD,
+  controlFromPointerInFade,
+  curveTypeFromControl,
+  getFadeCurveHandlePercent,
+  getFadeEnvelopeAtX,
+  resolveFadeControl,
+} from '@thestuu/shared-json';
 
 function ExtractStemsIcon({ size = 24, strokeWidth = 2, ...props }) {
   return (
@@ -153,7 +161,7 @@ const FLOATING_WINDOW_DOCK_GAP = 10;
 const TRACK_CHAIN_VISIBLE_SLOTS = 7;
 const TRACK_CHAIN_MODAL_MIN_SLOTS = TRACK_CHAIN_VISIBLE_SLOTS;
 const TRACK_CHAIN_PLUGIN_NAME_LIMIT = 14;
-const FADE_CURVE_ORDER = ['linear', 'convex', 'concave', 'sCurve'];
+const FADE_NATIVE_PUSH_MS = 100;
 const DEFAULT_METRONOME_ENABLED = false;
 const DEFAULT_WAVEFORM_SAMPLE_COUNT = 1024;
 const MIN_WAVEFORM_SAMPLE_COUNT = 24;
@@ -230,7 +238,6 @@ const CLIP_GAIN_DEFAULT = 1;
 const CLIP_GAIN_DB_PER_PIXEL = 0.2;
 const CLIP_GAIN_DB_MIN = -80;
 const CLIP_GAIN_DB_MAX = 20 * Math.log10(CLIP_GAIN_MAX);
-const FADE_CURVE_DRAG_PX_PER_STEP = 28;
 const FADE_CURVE_NODE_MIN_PX = 10;
 /** Below this fade width (px) we treat the clip as having no fade — no curve, no handles. */
 const FADE_VISIBLE_MIN_PX = 0.5;
@@ -1722,118 +1729,19 @@ function formatClipGainDb(gain) {
   return `${sign}${db.toFixed(1)} dB`;
 }
 
-function getClipFadeCurves(clip, fadeDraftByKey, clipKey) {
+function getClipFadeControls(clip, fadeDraftByKey, clipKey) {
   const draft = fadeDraftByKey?.[clipKey];
-  const fadeInCurve = draft?.fadeInCurve ?? clip?.fade_in_curve;
-  const fadeOutCurve = draft?.fadeOutCurve ?? clip?.fade_out_curve;
+  const fadeInControl = resolveFadeControl('in', clip, draft);
+  const fadeOutControl = resolveFadeControl('out', clip, draft);
   return {
-    fadeInCurve: FADE_CURVE_ORDER.includes(fadeInCurve) ? fadeInCurve : 'linear',
-    fadeOutCurve: FADE_CURVE_ORDER.includes(fadeOutCurve) ? fadeOutCurve : 'linear',
+    fadeInCurve: fadeInControl.curve,
+    fadeOutCurve: fadeOutControl.curve,
+    fadeInControl,
+    fadeOutControl,
   };
 }
 
-function applyFadeCurveT(t, curve) {
-  const clamped = clamp(t, 0, 1);
-  switch (curve) {
-    case 'convex':
-      return clamped * clamped;
-    case 'concave':
-      return Math.sqrt(clamped);
-    case 'sCurve':
-      return clamped * clamped * (3 - 2 * clamped);
-    default:
-      return clamped;
-  }
-}
-
-function quadBezierPoint(t, x0, y0, x1, y1, x2, y2) {
-  const u = 1 - t;
-  const tt = t * t;
-  const uu = u * u;
-  return {
-    x: uu * x0 + 2 * u * t * x1 + tt * x2,
-    y: uu * y0 + 2 * u * t * y1 + tt * y2,
-  };
-}
-
-function getFadeCurveControlY(curve) {
-  switch (curve) {
-    case 'convex':
-      return 94;
-    case 'concave':
-      return 48;
-    case 'sCurve':
-      return 62;
-    default:
-      return 74;
-  }
-}
-
-function getFadeBezierControlX(which, xSpan, curve = 'linear') {
-  const fadeCurve = FADE_CURVE_ORDER.includes(curve) ? curve : 'linear';
-  if (which === 'in') {
-    return xSpan * (fadeCurve === 'concave' ? 0.35 : fadeCurve === 'convex' ? 0.68 : 0.52);
-  }
-  const xStart = 100 - xSpan;
-  return xStart + xSpan * (fadeCurve === 'concave' ? 0.65 : fadeCurve === 'convex' ? 0.32 : 0.48);
-}
-
-function buildFadeCurvePathD(which, fadePx, wrapWidthPx, curve = 'linear') {
-  const wrapW = Math.max(1, Number(wrapWidthPx) || 1);
-  const fadeW = Math.max(0, Number(fadePx) || 0);
-  if (fadeW < FADE_VISIBLE_MIN_PX) {
-    return '';
-  }
-  const fadeCurve = FADE_CURVE_ORDER.includes(curve) ? curve : 'linear';
-  const xSpan = Math.min(99, (fadeW / wrapW) * 100);
-  const controlY = getFadeCurveControlY(fadeCurve);
-  const cx = getFadeBezierControlX(which, xSpan, fadeCurve);
-
-  if (which === 'in') {
-    return `M 0 100 Q ${cx.toFixed(2)} ${controlY}, ${xSpan.toFixed(2)} 0`;
-  }
-
-  const xStart = 100 - xSpan;
-  return `M 100 100 Q ${cx.toFixed(2)} ${controlY}, ${xStart.toFixed(2)} 0`;
-}
-
-/** Point on fade quadratic at t=0.5 — curve handle sits on the white line (FL-style). */
-function getFadeCurveNodePosition(which, fadePx, wrapWidthPx, curve = 'linear') {
-  const fadeW = Math.max(0, Number(fadePx) || 0);
-  if (fadeW < FADE_CURVE_NODE_MIN_PX) {
-    return null;
-  }
-  const wrapW = Math.max(1, Number(wrapWidthPx) || 1);
-  const fadeCurve = FADE_CURVE_ORDER.includes(curve) ? curve : 'linear';
-  const xSpan = Math.min(99, (fadeW / wrapW) * 100);
-  const controlY = getFadeCurveControlY(fadeCurve);
-  const cx = getFadeBezierControlX(which, xSpan, fadeCurve);
-
-  if (which === 'in') {
-    const pt = quadBezierPoint(0.5, 0, 100, cx, controlY, xSpan, 0);
-    return { leftPercent: pt.x, topPercent: pt.y };
-  }
-
-  const xStart = 100 - xSpan;
-  const pt = quadBezierPoint(0.5, 100, 100, cx, controlY, xStart, 0);
-  return { leftPercent: pt.x, topPercent: pt.y };
-}
-
-/** Per-sample fade envelope 0–1 across clip width (for waveform rendering). */
-function getFadeEnvelopeAtX(progress, fadeInFrac, fadeOutFrac, fadeInCurve, fadeOutCurve) {
-  let env = 1;
-  const p = clamp(progress, 0, 1);
-  if (fadeInFrac > 0 && p < fadeInFrac) {
-    env = applyFadeCurveT(p / fadeInFrac, fadeInCurve);
-  }
-  if (fadeOutFrac > 0 && p > 1 - fadeOutFrac) {
-    const t = (1 - p) / fadeOutFrac;
-    env *= applyFadeCurveT(t, fadeOutCurve);
-  }
-  return clamp(env, 0, 1);
-}
-
-function applyFadeEnvelopeToPeaks(peaks, fadeInPx, fadeOutPx, clipWidthPx, fadeInCurve, fadeOutCurve) {
+function applyFadeEnvelopeToPeaks(peaks, fadeInPx, fadeOutPx, clipWidthPx, clip, fadeDraftByKey, clipKey) {
   const normalized = normalizeWaveformPeaks(peaks);
   if (normalized.length === 0) {
     return normalized;
@@ -1844,20 +1752,15 @@ function applyFadeEnvelopeToPeaks(peaks, fadeInPx, fadeOutPx, clipWidthPx, fadeI
   if (fadeInFrac < 0.001 && fadeOutFrac < 0.001) {
     return normalized;
   }
+  const draft = fadeDraftByKey?.[clipKey];
+  const fadeInControl = resolveFadeControl('in', clip, draft);
+  const fadeOutControl = resolveFadeControl('out', clip, draft);
   const last = Math.max(1, normalized.length - 1);
   return normalized.map((peak, index) => {
     const progress = index / last;
-    const env = getFadeEnvelopeAtX(progress, fadeInFrac, fadeOutFrac, fadeInCurve, fadeOutCurve);
+    const env = getFadeEnvelopeAtX(progress, fadeInFrac, fadeOutFrac, fadeInControl, fadeOutControl);
     return Number((peak * env).toFixed(4));
   });
-}
-
-function fadeCurveFromVerticalDrag(originCurve, deltaYPx) {
-  const originIndex = FADE_CURVE_ORDER.indexOf(originCurve);
-  const safeOrigin = originIndex >= 0 ? originIndex : 0;
-  const stepOffset = Math.round(-deltaYPx / FADE_CURVE_DRAG_PX_PER_STEP);
-  const nextIndex = clamp(safeOrigin + stepOffset, 0, FADE_CURVE_ORDER.length - 1);
-  return FADE_CURVE_ORDER[nextIndex];
 }
 
 function getClipGainDisplayValue(clip, gainDraftByKey, clipKey) {
@@ -2719,10 +2622,11 @@ export default function StuuShell() {
   const [clipDisplayOverrides, setClipDisplayOverrides] = useState({});
   const [clipInteraction, setClipInteraction] = useState(null);
   const [fadeHandleInteraction, setFadeHandleInteraction] = useState(/** @type {{ mode: 'length'|'curve'; which: 'in'|'out'; trackId: number; clipId: string; fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; clipLengthSeconds: number } | null} */ (null));
-  const fadeHandleDraftRef = useRef(/** @type {{ fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } | null} */ (null));
+  const fadeHandleDraftRef = useRef(/** @type {{ fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; fadeInCx: number; fadeInCy: number; fadeOutCx: number; fadeOutCy: number } | null} */ (null));
   const fadeDraftRafRef = useRef(null);
-  const fadeHandleStartRef = useRef(/** @type {{ originX: number; originY: number; originCurve: string; originFadeIn: number; originFadeOut: number } | null} */ (null));
-  const [fadeDraftByKey, setFadeDraftByKey] = useState(/** @type {{ [clipKey: string]: { fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string } } } */ ({}));
+  const fadeHandleStartRef = useRef(/** @type {{ originX: number; originY: number; originFadeIn: number; originFadeOut: number; regionRect: DOMRect; clipWidthPx: number; fadeInPx: number; fadeOutPx: number } | null} */ (null));
+  const fadeNativePushRef = useRef({ signature: '', at: 0 });
+  const [fadeDraftByKey, setFadeDraftByKey] = useState(/** @type {{ [clipKey: string]: { fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; fadeInCx: number; fadeInCy: number; fadeOutCx: number; fadeOutCy: number } } } */ ({}));
   const [gainDraftByKey, setGainDraftByKey] = useState(/** @type {{ [clipKey: string]: number } } */ ({}));
   const gainDragDraftRef = useRef(/** @type {number | null} */ (null));
   const gainDragOriginRef = useRef(/** @type {{ originY: number; originDb: number } | null} */ (null));
@@ -8630,30 +8534,45 @@ export default function StuuShell() {
     const clipLengthSeconds = barsToSeconds(clipLengthBars, bpm, timeSignature);
     const fadeIn = Number(clip.fade_in) || 0;
     const fadeOut = Number(clip.fade_out) || 0;
-    const fadeInCurve = FADE_CURVE_ORDER.includes(clip.fade_in_curve) ? clip.fade_in_curve : 'linear';
-    const fadeOutCurve = FADE_CURVE_ORDER.includes(clip.fade_out_curve) ? clip.fade_out_curve : 'linear';
-    const originCurve = which === 'in' ? fadeInCurve : fadeOutCurve;
+    const fadeInControl = resolveFadeControl('in', clip);
+    const fadeOutControl = resolveFadeControl('out', clip);
     const clipKey = getClipSelectionKey(trackId, clip.id);
-    fadeHandleDraftRef.current = { fadeIn, fadeOut, fadeInCurve, fadeOutCurve };
+    const barWidthPx = barWidthRef.current;
+    const clipWidthPx = Math.max(1, clipLengthBars * barWidthPx);
+    const fadeInPx = fadeSecondsToWidthPx(fadeIn, barWidthPx, bpm, timeSignature);
+    const fadeOutPx = fadeSecondsToWidthPx(fadeOut, barWidthPx, bpm, timeSignature);
+    const wrap = event.currentTarget.closest('.timeline-clip-waveform-wrap');
+    const regionRect = wrap?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
+    const draft = {
+      fadeIn,
+      fadeOut,
+      fadeInCurve: fadeInControl.curve,
+      fadeOutCurve: fadeOutControl.curve,
+      fadeInCx: fadeInControl.u,
+      fadeInCy: fadeInControl.v,
+      fadeOutCx: fadeOutControl.u,
+      fadeOutCy: fadeOutControl.v,
+    };
+    fadeHandleDraftRef.current = draft;
     fadeHandleStartRef.current = {
       originX: event.clientX,
       originY: event.clientY,
-      originCurve,
       originFadeIn: fadeIn,
       originFadeOut: fadeOut,
+      regionRect,
+      clipWidthPx,
+      fadeInPx,
+      fadeOutPx,
     };
+    fadeNativePushRef.current = { signature: '', at: 0 };
     setFadeHandleInteraction({
       mode,
       which,
       trackId,
       clipId: clip.id,
-      fadeIn,
-      fadeOut,
-      fadeInCurve,
-      fadeOutCurve,
       clipLengthSeconds,
     });
-    setFadeDraftByKey((prev) => ({ ...prev, [clipKey]: { fadeIn, fadeOut, fadeInCurve, fadeOutCurve } }));
+    setFadeDraftByKey((prev) => ({ ...prev, [clipKey]: draft }));
   }
 
   useEffect(() => {
@@ -8663,36 +8582,78 @@ export default function StuuShell() {
     const bpm = Number(transportSnapshotRef.current?.bpm) || 120;
     const maxFadeSeconds = fadeHandleInteraction.clipLengthSeconds / 2;
     const clipKey = getClipSelectionKey(fadeHandleInteraction.trackId, fadeHandleInteraction.clipId);
+    const { trackId, clipId, mode, which } = fadeHandleInteraction;
+
+    function fadeDraftSignature(draft) {
+      return [
+        draft.fadeIn,
+        draft.fadeOut,
+        draft.fadeInCurve,
+        draft.fadeOutCurve,
+        draft.fadeInCx,
+        draft.fadeInCy,
+        draft.fadeOutCx,
+        draft.fadeOutCy,
+      ].join('|');
+    }
+
+    function pushFadeDraftToEngine(draft, force = false) {
+      const signature = fadeDraftSignature(draft);
+      const now = Date.now();
+      if (!force && signature === fadeNativePushRef.current.signature && now - fadeNativePushRef.current.at < FADE_NATIVE_PUSH_MS) {
+        return;
+      }
+      fadeNativePushRef.current = { signature, at: now };
+      emitMutation('clip:set-fade', {
+        trackId,
+        clipId,
+        fade_in: draft.fadeIn,
+        fade_out: draft.fadeOut,
+        fade_in_curve: draft.fadeInCurve,
+        fade_out_curve: draft.fadeOutCurve,
+        fade_in_cx: draft.fadeInCx,
+        fade_in_cy: draft.fadeInCy,
+        fade_out_cx: draft.fadeOutCx,
+        fade_out_cy: draft.fadeOutCy,
+      });
+    }
 
     function handlePointerMove(moveEvent) {
       const start = fadeHandleStartRef.current;
       const draft = fadeHandleDraftRef.current;
       if (!start || !draft) return;
 
-      let nextFadeIn = draft.fadeIn;
-      let nextFadeOut = draft.fadeOut;
-      let nextFadeInCurve = draft.fadeInCurve;
-      let nextFadeOutCurve = draft.fadeOutCurve;
+      let next = { ...draft };
 
-      if (fadeHandleInteraction.mode === 'length') {
+      if (mode === 'length') {
         const deltaXBars = (moveEvent.clientX - start.originX) / barWidthRef.current;
-        if (fadeHandleInteraction.which === 'in') {
+        if (which === 'in') {
           const newFadeInBars = Math.max(0, secondsToBars(start.originFadeIn, bpm, timeSignature) + deltaXBars);
-          nextFadeIn = Math.min(barsToSeconds(newFadeInBars, bpm, timeSignature), maxFadeSeconds);
+          next.fadeIn = Math.min(barsToSeconds(newFadeInBars, bpm, timeSignature), maxFadeSeconds);
         } else {
           const newFadeOutBars = Math.max(0, secondsToBars(start.originFadeOut, bpm, timeSignature) - deltaXBars);
-          nextFadeOut = Math.min(barsToSeconds(newFadeOutBars, bpm, timeSignature), maxFadeSeconds);
+          next.fadeOut = Math.min(barsToSeconds(newFadeOutBars, bpm, timeSignature), maxFadeSeconds);
         }
       } else {
-        const deltaYPx = moveEvent.clientY - start.originY;
-        if (fadeHandleInteraction.which === 'in') {
-          nextFadeInCurve = fadeCurveFromVerticalDrag(start.originCurve, deltaYPx);
+        const rect = start.regionRect;
+        const fadeW = which === 'in' ? start.fadeInPx : start.fadeOutPx;
+        let localX;
+        const localY = moveEvent.clientY - rect.top;
+        if (which === 'in') {
+          localX = moveEvent.clientX - rect.left;
         } else {
-          nextFadeOutCurve = fadeCurveFromVerticalDrag(start.originCurve, deltaYPx);
+          localX = rect.left + start.clipWidthPx - moveEvent.clientX;
+        }
+        const { u, v } = controlFromPointerInFade(which, localX, localY, fadeW, rect.height);
+        const curve = curveTypeFromControl(u, v);
+        if (which === 'in') {
+          next = { ...next, fadeInCx: u, fadeInCy: v, fadeInCurve: curve };
+        } else {
+          next = { ...next, fadeOutCx: u, fadeOutCy: v, fadeOutCurve: curve };
         }
       }
 
-      fadeHandleDraftRef.current = { fadeIn: nextFadeIn, fadeOut: nextFadeOut, fadeInCurve: nextFadeInCurve, fadeOutCurve: nextFadeOutCurve };
+      fadeHandleDraftRef.current = next;
       if (fadeDraftRafRef.current === null) {
         fadeDraftRafRef.current = window.requestAnimationFrame(() => {
           fadeDraftRafRef.current = null;
@@ -8700,13 +8661,9 @@ export default function StuuShell() {
           if (!live) return;
           setFadeDraftByKey((prev) => ({
             ...prev,
-            [clipKey]: {
-              fadeIn: live.fadeIn,
-              fadeOut: live.fadeOut,
-              fadeInCurve: live.fadeInCurve,
-              fadeOutCurve: live.fadeOutCurve,
-            },
+            [clipKey]: live,
           }));
+          pushFadeDraftToEngine(live, false);
         });
       }
     }
@@ -8718,14 +8675,7 @@ export default function StuuShell() {
       }
       const draft = fadeHandleDraftRef.current;
       if (draft) {
-        emitMutation('clip:set-fade', {
-          trackId: fadeHandleInteraction.trackId,
-          clipId: fadeHandleInteraction.clipId,
-          fade_in: draft.fadeIn,
-          fade_out: draft.fadeOut,
-          fade_in_curve: draft.fadeInCurve,
-          fade_out_curve: draft.fadeOutCurve,
-        });
+        pushFadeDraftToEngine(draft, true);
       }
       fadeHandleDraftRef.current = null;
       fadeHandleStartRef.current = null;
@@ -11085,9 +11035,15 @@ export default function StuuShell() {
                                   const clipFadeOutPx = clipType === 'audio'
                                     ? fadeSecondsToWidthPx(clipFadeOutSec, barWidth, arrangementClipBpm, timeSignature)
                                     : 0;
-                                  const { fadeInCurve: clipFadeInCurve, fadeOutCurve: clipFadeOutCurve } = clipType === 'audio'
-                                    ? getClipFadeCurves(renderedClip, fadeDraftByKey, clipKey)
-                                    : { fadeInCurve: 'linear', fadeOutCurve: 'linear' };
+                                  const {
+                                    fadeInControl: clipFadeInControl,
+                                    fadeOutControl: clipFadeOutControl,
+                                  } = clipType === 'audio'
+                                    ? getClipFadeControls(renderedClip, fadeDraftByKey, clipKey)
+                                    : {
+                                      fadeInControl: { u: 0.52, v: 0.74, curve: 'linear' },
+                                      fadeOutControl: { u: 0.52, v: 0.74, curve: 'linear' },
+                                    };
                                   const waveformPeaksRaw = clipType === 'audio'
                                     ? getAdaptiveWaveformPeaks(peaksForAdaptive, clipWidth)
                                     : [];
@@ -11097,8 +11053,9 @@ export default function StuuShell() {
                                       clipFadeInPx,
                                       clipFadeOutPx,
                                       clipWidth,
-                                      clipFadeInCurve,
-                                      clipFadeOutCurve,
+                                      renderedClip,
+                                      fadeDraftByKey,
+                                      clipKey,
                                     )
                                     : waveformPeaksRaw;
                                   const clipGainValue = clipType === 'audio'
@@ -11111,16 +11068,16 @@ export default function StuuShell() {
                                   const showFadeInUi = clipFadeInPx >= FADE_VISIBLE_MIN_PX;
                                   const showFadeOutUi = clipFadeOutPx >= FADE_VISIBLE_MIN_PX;
                                   const clipFadeInPath = showFadeInUi
-                                    ? buildFadeCurvePathD('in', clipFadeInPx, clipWidth, clipFadeInCurve)
+                                    ? buildFadeCurvePathD('in', clipFadeInPx, clipWidth, clipFadeInControl.u, clipFadeInControl.v)
                                     : '';
                                   const clipFadeOutPath = showFadeOutUi
-                                    ? buildFadeCurvePathD('out', clipFadeOutPx, clipWidth, clipFadeOutCurve)
+                                    ? buildFadeCurvePathD('out', clipFadeOutPx, clipWidth, clipFadeOutControl.u, clipFadeOutControl.v)
                                     : '';
                                   const clipFadeInCurveNode = clipType === 'audio'
-                                    ? getFadeCurveNodePosition('in', clipFadeInPx, clipWidth, clipFadeInCurve)
+                                    ? getFadeCurveHandlePercent('in', clipFadeInPx, clipWidth, clipFadeInControl.u, clipFadeInControl.v)
                                     : null;
                                   const clipFadeOutCurveNode = clipType === 'audio'
-                                    ? getFadeCurveNodePosition('out', clipFadeOutPx, clipWidth, clipFadeOutCurve)
+                                    ? getFadeCurveHandlePercent('out', clipFadeOutPx, clipWidth, clipFadeOutControl.u, clipFadeOutControl.v)
                                     : null;
                                   const clipGainDbLabel = clipType === 'audio'
                                     ? formatClipGainDb(clipGainValue)
@@ -11294,7 +11251,7 @@ export default function StuuShell() {
                                                   left: `${clipFadeInCurveNode.leftPercent}%`,
                                                   top: `${clipFadeInCurveNode.topPercent}%`,
                                                 }}
-                                                title="Fade In curve — drag vertically"
+                                                title="Fade In curve — drag to shape (2D)"
                                                 onPointerDown={(event) => {
                                                   event.stopPropagation();
                                                   beginFadeHandleInteraction('in', 'curve', event, track.track_id, renderedClip);
@@ -11308,7 +11265,7 @@ export default function StuuShell() {
                                                   left: `${clipFadeOutCurveNode.leftPercent}%`,
                                                   top: `${clipFadeOutCurveNode.topPercent}%`,
                                                 }}
-                                                title="Fade Out curve — drag vertically"
+                                                title="Fade Out curve — drag to shape (2D)"
                                                 onPointerDown={(event) => {
                                                   event.stopPropagation();
                                                   beginFadeHandleInteraction('out', 'curve', event, track.track_id, renderedClip);

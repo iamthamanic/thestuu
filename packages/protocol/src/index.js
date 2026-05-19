@@ -31,6 +31,7 @@ export const NATIVE_COMMANDS = Object.freeze({
   CLIP_MOVE: 'clip.move',
   CLIP_RESIZE: 'clip.resize',
   CLIP_DELETE: 'clip.delete',
+  CLIP_SET_FADE: 'clip.setFade',
 
   // Tracks (native layout)
   TRACK_LIST: 'track.list',

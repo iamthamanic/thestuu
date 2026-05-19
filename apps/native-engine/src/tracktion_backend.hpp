@@ -58,9 +58,15 @@ struct ClipImportRequest {
   /** Fade in/out duration in seconds. Applied after insert. */
   double fadeInSeconds = 0.0;
   double fadeOutSeconds = 0.0;
-  /** Fade curve type: 1=linear, 2=convex, 3=concave, 4=sCurve (tracktion AudioFadeCurve::Type). */
+  /** Fade curve type: 1=linear, 2=convex, 3=concave, 4=sCurve (used when cx/cy omitted). */
   int fadeInCurve = 1;
   int fadeOutCurve = 1;
+  bool hasFadeInControl = false;
+  double fadeInCx = 0.52;
+  double fadeInCy = 0.74;
+  bool hasFadeOutControl = false;
+  double fadeOutCx = 0.52;
+  double fadeOutCy = 0.74;
   std::string type;
   /** Start reading the source file from this time in seconds (skip leading silence). If < 0, ignored. */
   double sourceOffsetSeconds = -1.0;
@@ -148,6 +154,27 @@ bool resizeAudioClipBySource(const ClipEditBySourceRequest& request, std::string
 bool resizeAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request, std::string& error);
 bool deleteAudioClipBySource(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error);
 bool deleteAudioClipBySourceOnMessageThread(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error);
+
+/** Set fade in/out on an existing wave clip (seconds + (u,v) control points). */
+struct ClipFadeBySourceRequest {
+  int32_t trackId = 0;
+  std::string sourcePath;
+  double oldStartBars = -1.0;
+  double fadeInSeconds = 0.0;
+  double fadeOutSeconds = 0.0;
+  /** Legacy curve index 1–4 when cx/cy not set. */
+  int fadeInCurve = 1;
+  int fadeOutCurve = 1;
+  bool hasFadeInControl = false;
+  double fadeInCx = 0.52;
+  double fadeInCy = 0.74;
+  bool hasFadeOutControl = false;
+  double fadeOutCx = 0.52;
+  double fadeOutCy = 0.74;
+};
+
+bool setAudioClipFadeBySource(const ClipFadeBySourceRequest& request, std::string& error);
+bool setAudioClipFadeBySourceOnMessageThread(const ClipFadeBySourceRequest& request, std::string& error);
 
 bool editUndo(std::string& error);
 bool editUndoOnMessageThread(std::string& error);

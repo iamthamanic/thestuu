@@ -7,7 +7,12 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import open from 'open';
 import { createDefaultProject, parseProject, serializeProject } from '@thestuu/shared-json';
-import { cleanDevSession, CANONICAL_NATIVE_SOCKET, killListenersOnPort } from './dev-clean.js';
+import {
+  cleanDevSession,
+  CANONICAL_NATIVE_SOCKET,
+  killListenersOnPort,
+  killTheStuuEngineProcesses,
+} from './dev-clean.js';
 import {
   fetchEngineHealth,
   isEngineDawReady,
@@ -442,6 +447,19 @@ async function ensureHomeFiles(stuuHome, requestedProject) {
   return { projectPath, projectsDir, configPath };
 }
 
+function stopManagedChildren(children) {
+  for (const child of children) {
+    if (!child || child.killed) {
+      continue;
+    }
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function attachShutdown(children) {
   let shuttingDown = false;
 
@@ -519,6 +537,7 @@ function spawnDesktopDev(repoRoot, env) {
 }
 
 export async function runStartCommand(options) {
+  const managed = [];
   const commandFile = fileURLToPath(import.meta.url);
   const cliDir = path.resolve(path.dirname(commandFile), '..');
   const repoRoot = path.resolve(cliDir, '..', '..');
@@ -532,12 +551,25 @@ export async function runStartCommand(options) {
     ? path.resolve(options.nativeSocket)
     : CANONICAL_NATIVE_SOCKET;
 
+  try {
   if (options.clean) {
     await cleanDevSession({
       enginePort: options.enginePort,
       dashboardPort: options.port,
       nativeSocket: nativeSocketPath,
     });
+  }
+
+  if (options.clean && !options.reuse) {
+    if (await isPortOpen(options.enginePort, host, 800)) {
+      console.warn(`[thestuu-cli] :${options.enginePort} still in use after clean — forcing stop`);
+      await killListenersOnPort(options.enginePort);
+      await killTheStuuEngineProcesses();
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    if (await isPortOpen(options.port, host, 800)) {
+      await killListenersOnPort(options.port);
+    }
   }
 
   if (options.native !== false) {
@@ -592,10 +624,11 @@ export async function runStartCommand(options) {
         'Stop the conflicting process, run with --clean (default), or use --reuse if it is your engine.',
       );
     }
-    throw new Error(
-      `Engine port ${host}:${options.enginePort} is already in use. ` +
-      'Default dev start runs --clean; use --reuse only if that engine uses the same native socket.',
-    );
+    console.warn(`[thestuu-cli] :${options.enginePort} in use — stopping stale engine and starting fresh`);
+    await killListenersOnPort(options.enginePort);
+    await killTheStuuEngineProcesses();
+    await new Promise((r) => setTimeout(r, 300));
+    engineAlreadyOpen = false;
   }
 
   if (!engineAlreadyOpen) {
@@ -619,6 +652,7 @@ export async function runStartCommand(options) {
         },
         socketPath: nativeSocketPath,
       });
+      managed.push(nativeChild);
 
       await waitForUnixSocket(nativeSocketPath);
     }
@@ -636,6 +670,7 @@ export async function runStartCommand(options) {
       }),
       name: 'engine',
     });
+    managed.push(engineChild);
 
     try {
       await waitForPortOrProcessExit(options.enginePort, host, engineChild);
@@ -679,16 +714,7 @@ export async function runStartCommand(options) {
     }
   }
 
-  const dawReadyPromise = (options.native !== false && engineMode === 'spawned')
-    ? waitForEngineDawReady(
-      options.enginePort,
-      host,
-      nativeSocketPath,
-      options.dawReadyTimeoutMs ?? 120000,
-    )
-    : Promise.resolve(true);
-
-  console.log('[thestuu-cli] starting dashboard (native sync continues in background)…');
+  console.log('[thestuu-cli] starting dashboard (native/Tracktion may still be syncing)…');
 
   const dashboardEnv = {
     ...commonEnv,
@@ -713,11 +739,12 @@ export async function runStartCommand(options) {
     };
     console.log('[thestuu-cli] launching Tauri desktop (dashboard via tauri dev)…');
     desktopChild = spawnDesktopDev(repoRoot, desktopEnv);
+    managed.push(desktopChild);
   } else if (await isPortOpen(options.port, host, 800)) {
     const dashboardOk = await isDashboardServing(options.port, host);
     if (!dashboardOk) {
       console.warn(`[thestuu-cli] port :${options.port} is open but not serving the dashboard — restarting Next.js`);
-      await killListenersOnPort(options.port, host);
+      await killListenersOnPort(options.port);
       const spawnDashboard = () => spawnWorkspaceProcess({
         workspace: '@thestuu/dashboard',
         script: 'dev',
@@ -726,6 +753,7 @@ export async function runStartCommand(options) {
         name: 'dashboard',
       });
       dashboardChild = spawnDashboard();
+      managed.push(dashboardChild);
       await waitForPortOrProcessExit(options.port, host, dashboardChild);
       dashboardMode = 'spawned';
     } else {
@@ -742,6 +770,7 @@ export async function runStartCommand(options) {
     });
 
     dashboardChild = spawnDashboard();
+    managed.push(dashboardChild);
 
     try {
       await waitForPortOrProcessExit(options.port, host, dashboardChild);
@@ -771,6 +800,7 @@ export async function runStartCommand(options) {
         }
 
         dashboardChild = spawnDashboard();
+        managed.push(dashboardChild);
         await waitForPortOrProcessExit(options.port, host, dashboardChild);
       } else {
         throw firstError;
@@ -778,18 +808,7 @@ export async function runStartCommand(options) {
     }
   }
 
-  if (options.native !== false && engineMode === 'spawned') {
-    const dawReady = await dawReadyPromise;
-    if (!dawReady) {
-      throw new Error(
-        `Native/Tracktion did not become ready within timeout (engine :${options.enginePort}, socket ${nativeSocketPath}). ` +
-        'Check LOGS / terminal for native-engine errors.',
-      );
-    }
-    console.log('[thestuu-cli] native/Tracktion ready (DAW online)');
-  }
-
-  attachShutdown([nativeChild, engineChild, dashboardChild, desktopChild]);
+  attachShutdown(managed);
 
   const dashboardUrl = `http://${host}:${options.port}`;
 
@@ -815,7 +834,29 @@ export async function runStartCommand(options) {
     await open(dashboardUrl);
   }
 
+  if (options.native !== false) {
+    void (async () => {
+      const ready = await waitForEngineDawReady(
+        options.enginePort,
+        host,
+        nativeSocketPath,
+        options.dawReadyTimeoutMs ?? 180000,
+      );
+      if (ready) {
+        console.log('[thestuu-cli] native/Tracktion ready (DAW online — check LOGS badge)');
+      } else {
+        console.warn(
+          '[thestuu-cli] Tracktion sync still in progress — UI may show NO AUDIO briefly; see LOGS panel or curl /health',
+        );
+      }
+    })();
+  }
+
   console.log('[thestuu-cli] TheStuu is running. Press Ctrl+C to stop.');
 
   await new Promise(() => {});
+  } catch (error) {
+    stopManagedChildren(managed);
+    throw error;
+  }
 }

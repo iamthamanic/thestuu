@@ -17,6 +17,8 @@ import {
   parseProject,
   serializeProject,
   validateProject,
+  normalizeFadeCurve,
+  resolveFadeControl,
 } from '@thestuu/shared-json';
 import { ENGINE_EVENTS, NATIVE_COMMANDS } from '@thestuu/protocol';
 import { NativeTransportClient } from './native-transport-client.js';
@@ -2513,11 +2515,12 @@ async function restoreNativeVstNodes({ resetEdit = false, skipNativeProjectReimp
   return { restored, failed, errors };
 }
 
-const FADE_CURVES = new Set(['linear', 'convex', 'concave', 'sCurve']);
-function normalizeFadeCurve(v) {
-  const s = String(v ?? 'linear').toLowerCase();
-  if (s === 'scurve') return 'sCurve';
-  return FADE_CURVES.has(s) ? s : 'linear';
+function clampFadeControl01(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return null;
+  }
+  return Math.min(1, Math.max(0, n));
 }
 
 /** Derive leading silence offset in seconds from waveform peaks (so playback starts at first audible sample). */
@@ -2797,6 +2800,8 @@ async function syncPlaylistClipsToNative() {
         fileReadable,
         isWav,
       );
+      const fadeInResolved = resolveFadeControl('in', clip);
+      const fadeOutResolved = resolveFadeControl('out', clip);
       const payload = {
         track_id: trackId,
         source_path: pathToSend,
@@ -2808,6 +2813,10 @@ async function syncPlaylistClipsToNative() {
         fade_out,
         fade_in_curve: fadeInCurve ?? 'linear',
         fade_out_curve: fadeOutCurve ?? 'linear',
+        fade_in_cx: fadeInResolved.u,
+        fade_in_cy: fadeInResolved.v,
+        fade_out_cx: fadeOutResolved.u,
+        fade_out_cy: fadeOutResolved.v,
         type: 'audio',
       };
       if (source_offset_seconds > 0) payload.source_offset_seconds = Number(source_offset_seconds.toFixed(4));
@@ -3725,6 +3734,22 @@ function attachAudioClipSidecarMetadata(clip, meta) {
   if (meta.fade_out_curve) {
     clip.fade_out_curve = meta.fade_out_curve;
   }
+  if (meta.fade_in_cx !== undefined && meta.fade_in_cx !== null) {
+    const v = clampFadeControl01(meta.fade_in_cx);
+    if (v !== null) clip.fade_in_cx = v;
+  }
+  if (meta.fade_in_cy !== undefined && meta.fade_in_cy !== null) {
+    const v = clampFadeControl01(meta.fade_in_cy);
+    if (v !== null) clip.fade_in_cy = v;
+  }
+  if (meta.fade_out_cx !== undefined && meta.fade_out_cx !== null) {
+    const v = clampFadeControl01(meta.fade_out_cx);
+    if (v !== null) clip.fade_out_cx = v;
+  }
+  if (meta.fade_out_cy !== undefined && meta.fade_out_cy !== null) {
+    const v = clampFadeControl01(meta.fade_out_cy);
+    if (v !== null) clip.fade_out_cy = v;
+  }
   if (meta.gain !== undefined) {
     clip.gain = meta.gain;
   }
@@ -4247,10 +4272,56 @@ async function setClipFade(payload = {}) {
   if (payload.fade_out_curve !== undefined || payload.fadeOutCurve !== undefined) {
     clip.fade_out_curve = normalizeFadeCurve(payload.fade_out_curve ?? payload.fadeOutCurve);
   }
-  // Fade curves are JSON sidecar until native clip.setFade is wired; do not full-sync arrangement.
-  if (!nativeClipOpsEnabled) {
+  if (payload.fade_in_cx !== undefined || payload.fadeInCx !== undefined) {
+    const v = clampFadeControl01(payload.fade_in_cx ?? payload.fadeInCx);
+    if (v !== null) clip.fade_in_cx = v;
+  }
+  if (payload.fade_in_cy !== undefined || payload.fadeInCy !== undefined) {
+    const v = clampFadeControl01(payload.fade_in_cy ?? payload.fadeInCy);
+    if (v !== null) clip.fade_in_cy = v;
+  }
+  if (payload.fade_out_cx !== undefined || payload.fadeOutCx !== undefined) {
+    const v = clampFadeControl01(payload.fade_out_cx ?? payload.fadeOutCx);
+    if (v !== null) clip.fade_out_cx = v;
+  }
+  if (payload.fade_out_cy !== undefined || payload.fadeOutCy !== undefined) {
+    const v = clampFadeControl01(payload.fade_out_cy ?? payload.fadeOutCy);
+    if (v !== null) clip.fade_out_cy = v;
+  }
+
+  const fadeInResolved = resolveFadeControl('in', clip);
+  const fadeOutResolved = resolveFadeControl('out', clip);
+  clip.fade_in_curve = fadeInResolved.curve;
+  clip.fade_out_curve = fadeOutResolved.curve;
+  clip.fade_in_cx = fadeInResolved.u;
+  clip.fade_in_cy = fadeInResolved.v;
+  clip.fade_out_cx = fadeOutResolved.u;
+  clip.fade_out_cy = fadeOutResolved.v;
+
+  if (nativeClipOpsEnabled && nativeTransportActive) {
+    const sourcePath = getPlaylistClipSourcePath(clip);
+    if (sourcePath && sourcePath !== LIVE_RECORDING_SOURCE_PATH) {
+      await requestNativeTransport(NATIVE_COMMANDS.CLIP_SET_FADE, {
+        track_id: trackId,
+        source_path: sourcePath,
+        old_start: Number(clip.start) || 0,
+        fade_in: Number(clip.fade_in) || 0,
+        fade_out: Number(clip.fade_out) || 0,
+        fade_in_curve: clip.fade_in_curve,
+        fade_out_curve: clip.fade_out_curve,
+        fade_in_cx: fadeInResolved.u,
+        fade_in_cy: fadeInResolved.v,
+        fade_out_cx: fadeOutResolved.u,
+        fade_out_cy: fadeOutResolved.v,
+      }, { timeoutMs: NATIVE_CLIP_OP_TIMEOUT_MS });
+    } else {
+      assertNativeEngineForDawMutation();
+      throw new Error('Audio clip fade requires source_path for native clip.setFade');
+    }
+  } else if (!nativeClipOpsEnabled) {
     await reconcileNativeClipState({ mergeNativeFirst: false });
   }
+
   return { clipId, trackId };
 }
 

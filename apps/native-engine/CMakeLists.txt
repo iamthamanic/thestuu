@@ -45,11 +45,16 @@ set(TE_ADD_EXAMPLES OFF CACHE BOOL "Do not build Tracktion examples" FORCE)
 add_subdirectory(${STUU_THIRD_PARTY_DIR} ${CMAKE_BINARY_DIR}/tracktion_build)
 message(STATUS "Building with Tracktion backend: ${STUU_THIRD_PARTY_DIR}")
 
-set(SOURCES src/main.cpp src/tracktion_backend_tracktion.cpp)
+set(SOURCES
+  src/main.cpp
+  src/tracktion_backend_tracktion.cpp
+  src/clip_fade_envelope.cpp
+)
 
 add_executable(thestuu-native ${SOURCES})
 
 target_include_directories(thestuu-native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(thestuu-native PRIVATE THESTUU_CUSTOM_CLIP_FADE=1)
 
 target_compile_features(thestuu-native PRIVATE cxx_std_20)
 target_link_libraries(thestuu-native PRIVATE

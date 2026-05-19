@@ -121,11 +121,11 @@ Do **not** treat DevTools console as the canonical place for native-engine, IPC,
 | Goal | Command |
 |------|---------|
 | Full stack (normal) | `npm run dev` |
-| Desktop window | `npm run dev -- --desktop` or `npm run desktop:dev` |
+| Desktop window | `npm run tauri` (alias `desktop:dev`, `dev --desktop`) |
 | Stack without browser | `npm run dev -- --no-browser` |
 | Legacy QA | `npm run dev -- --legacy-daw --no-browser` |
 | Dashboard only (needs engine) | `npm run dev --prefix apps/dashboard` |
-| Desktop shell | `npm run desktop:dev` (reuses or spawns native + Node; dashboard must be up for full UI) |
+| Desktop shell | `npm run tauri` (reuses or spawns native + Node; dashboard must be up for full UI) |
 
 Ports (default): dashboard `3010`, engine `3990`.
 
@@ -171,7 +171,7 @@ npm run qa:legacy-daw
 **Desktop shell** (when touching `apps/desktop`):
 
 ```bash
-npm run desktop:dev   # Cargo build + window; verify Node reuse on :3990 and spawn when port free
+npm run tauri         # Cargo build + window; verify Node reuse on :3990 and spawn when port free
 ```
 
 Performance-sensitive dashboard changes: `docs/performance.md`.

@@ -54,7 +54,7 @@ flowchart TB
 
 ### Audio clip (sidecar / UI)
 
-`gain`, `fade_in`, `fade_out`, `fade_in_curve`, `fade_out_curve`, `waveform_peaks`, `source_duration_seconds`, `trim_start_seconds`, `name`, `color`, `source_name`, `source_format`, `id` (stable id preserved across merge; placement still from native).
+`gain`, `fade_in`, `fade_out`, `fade_in_curve`, `fade_out_curve`, `fade_in_cx`, `fade_in_cy`, `fade_out_cx`, `fade_out_cy`, `waveform_peaks`, `source_duration_seconds`, `trim_start_seconds`, `name`, `color`, `source_name`, `source_format`, `id` (stable id preserved across merge; placement still from native).
 
 ### Track (UI / patterns)
 

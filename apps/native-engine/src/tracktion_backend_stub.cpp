@@ -114,6 +114,14 @@ bool deleteAudioClipBySource(int32_t trackId, const std::string& sourcePath, dou
 bool deleteAudioClipBySourceOnMessageThread(int32_t trackId, const std::string& sourcePath, double oldStartBars, std::string& error) {
   return deleteAudioClipBySource(trackId, sourcePath, oldStartBars, error);
 }
+bool setAudioClipFadeBySource(const ClipFadeBySourceRequest& request, std::string& error) {
+  (void)request;
+  error = "clip.setFade requires STUU_ENABLE_TRACKTION=ON";
+  return false;
+}
+bool setAudioClipFadeBySourceOnMessageThread(const ClipFadeBySourceRequest& request, std::string& error) {
+  return setAudioClipFadeBySource(request, error);
+}
 bool editUndo(std::string& error) {
   error = "edit.undo requires STUU_ENABLE_TRACKTION=ON";
   return false;

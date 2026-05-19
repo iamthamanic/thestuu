@@ -1,5 +1,9 @@
 #include "tracktion_backend.hpp"
 
+#include <tracktion_engine/tracktion_engine.h>
+
+#include "thestuu_clip_fade.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -6250,6 +6254,42 @@ static void beginClipEditTransaction() {
   }
 }
 
+static void applyTheStuuClipFade(
+  tracktion::engine::AudioClipBase& acb,
+  double fadeInSeconds,
+  double fadeOutSeconds,
+  int fadeInCurve,
+  int fadeOutCurve,
+  bool hasFadeInControl,
+  double fadeInCx,
+  double fadeInCy,
+  bool hasFadeOutControl,
+  double fadeOutCx,
+  double fadeOutCy) {
+  thestuu::clipfade::ClipFadeEnvelope env;
+  const double clipLenSec = acb.getPosition().time.getLength().inSeconds();
+  env.fadeInSec = std::max(0.0, fadeInSeconds);
+  env.fadeOutSec = std::max(0.0, fadeOutSeconds);
+  if (clipLenSec > 0.0) {
+    env.fadeInSec = std::min(env.fadeInSec, clipLenSec);
+    env.fadeOutSec = std::min(env.fadeOutSec, clipLenSec);
+  }
+  const int inCurve = (fadeInCurve >= 1 && fadeInCurve <= 4) ? fadeInCurve : 1;
+  const int outCurve = (fadeOutCurve >= 1 && fadeOutCurve <= 4) ? fadeOutCurve : 1;
+  env.fadeIn = hasFadeInControl
+    ? thestuu::clipfade::FadeControl{thestuu::clipfade::clamp01(fadeInCx), thestuu::clipfade::clamp01(fadeInCy)}
+    : thestuu::clipfade::controlFromCurveIndex(inCurve);
+  env.fadeOut = hasFadeOutControl
+    ? thestuu::clipfade::FadeControl{thestuu::clipfade::clamp01(fadeOutCx), thestuu::clipfade::clamp01(fadeOutCy)}
+    : thestuu::clipfade::controlFromCurveIndex(outCurve);
+  thestuu::clipfade::syncTracktionClipFades(acb, env, inCurve, outCurve);
+  if (env.fadeInSec > 0.0 || env.fadeOutSec > 0.0) {
+    thestuu::clipfade::setEnvelopeForClip(acb, env);
+  } else {
+    thestuu::clipfade::clearEnvelopeForClip(acb);
+  }
+}
+
 bool importClipFile(const ClipImportRequest& request, ClipImportResult& result, std::string& error) {
   result = {};
 
@@ -6320,19 +6360,20 @@ bool importClipFile(const ClipImportRequest& request, ClipImportResult& result, 
   // proxy so behaviour is identical and playback works regardless of Tracktion’s needsCachedProxy.
   clip->setUsesProxy(false);
 
-  if (request.fadeInSeconds > 0.0 || request.fadeOutSeconds > 0.0) {
-    if (auto* acb = dynamic_cast<tracktion::engine::AudioClipBase*>(clip.get())) {
-      if (request.fadeInSeconds > 0.0) {
-        acb->setFadeIn(tracktion::core::TimeDuration::fromSeconds(request.fadeInSeconds));
-      }
-      if (request.fadeOutSeconds > 0.0) {
-        acb->setFadeOut(tracktion::core::TimeDuration::fromSeconds(request.fadeOutSeconds));
-      }
-      const int inCurve = (request.fadeInCurve >= 1 && request.fadeInCurve <= 4) ? request.fadeInCurve : 1;
-      const int outCurve = (request.fadeOutCurve >= 1 && request.fadeOutCurve <= 4) ? request.fadeOutCurve : 1;
-      acb->setFadeInType(static_cast<tracktion::engine::AudioFadeCurve::Type>(inCurve));
-      acb->setFadeOutType(static_cast<tracktion::engine::AudioFadeCurve::Type>(outCurve));
-    }
+  if (auto* acb = dynamic_cast<tracktion::engine::AudioClipBase*>(clip.get())) {
+    applyTheStuuClipFade(
+      *acb,
+      request.fadeInSeconds,
+      request.fadeOutSeconds,
+      request.fadeInCurve,
+      request.fadeOutCurve,
+      request.hasFadeInControl,
+      request.fadeInCx,
+      request.fadeInCy,
+      request.hasFadeOutControl,
+      request.fadeOutCx,
+      request.fadeOutCy);
+    transportRebuildGraphOnly();
   }
 
   result.trackId = request.trackId;
@@ -6726,6 +6767,82 @@ bool resizeAudioClipBySource(const ClipEditBySourceRequest& request, std::string
   }
 }
 
+bool setAudioClipFadeBySource(const ClipFadeBySourceRequest& request, std::string& error) {
+  error.clear();
+  if (!isInitialised(error) || !requireEdit(error)) {
+    return false;
+  }
+  if (request.sourcePath.empty()) {
+    error = "source_path is required";
+    return false;
+  }
+  try {
+    auto* track = getAudioTrackByIndex(request.trackId);
+    if (track == nullptr) {
+      error = "track_id out of range";
+      return false;
+    }
+    auto* wave = findWaveClipOnTrack(*track, request.sourcePath, request.oldStartBars);
+    if (wave == nullptr) {
+      error = "clip not found";
+      return false;
+    }
+    auto* acb = dynamic_cast<tracktion::engine::AudioClipBase*>(wave);
+    if (acb == nullptr) {
+      error = "clip is not an audio clip";
+      return false;
+    }
+    beginClipEditTransaction();
+    applyTheStuuClipFade(
+      *acb,
+      request.fadeInSeconds,
+      request.fadeOutSeconds,
+      request.fadeInCurve,
+      request.fadeOutCurve,
+      request.hasFadeInControl,
+      request.fadeInCx,
+      request.fadeInCy,
+      request.hasFadeOutControl,
+      request.fadeOutCx,
+      request.fadeOutCy);
+    transportRebuildGraphOnly();
+    return true;
+  } catch (const std::exception& ex) {
+    error = ex.what();
+    return false;
+  } catch (...) {
+    error = "unknown error during clip.setFade";
+    return false;
+  }
+}
+
+bool setAudioClipFadeBySourceOnMessageThread(const ClipFadeBySourceRequest& request, std::string& error) {
+  error.clear();
+  auto* mm = juce::MessageManager::getInstance();
+  if (mm && mm->isThisTheMessageThread()) {
+    return setAudioClipFadeBySource(request, error);
+  }
+  if (!mm) {
+    error = "JUCE MessageManager not available";
+    return false;
+  }
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> done{false};
+  bool ok = false;
+  mm->callAsync([&]() {
+    ok = setAudioClipFadeBySource(request, error);
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      done = true;
+    }
+    cv.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait_for(lock, std::chrono::seconds(10), [&]() { return done.load(); });
+  return ok;
+}
+
 bool resizeAudioClipBySourceOnMessageThread(const ClipEditBySourceRequest& request, std::string& error) {
   error.clear();
   auto* mm = juce::MessageManager::getInstance();
@@ -6776,8 +6893,12 @@ bool deleteAudioClipBySource(int32_t trackId, const std::string& sourcePath, dou
       error = "clip not found";
       return false;
     }
+    if (auto* acb = dynamic_cast<tracktion::engine::AudioClipBase*>(wave)) {
+      thestuu::clipfade::clearEnvelopeForClip(*acb);
+    }
     beginClipEditTransaction();
     wave->removeFromParent();
+    transportRebuildGraphOnly();
     return true;
   } catch (const std::exception& ex) {
     error = ex.what();

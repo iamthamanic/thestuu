@@ -32,32 +32,77 @@ async function killPids(pids, signal = 'SIGTERM') {
   }
 }
 
-/**
- * @param {number} port
- * @param {string} host
- */
-export async function killListenersOnPort(port, host = '127.0.0.1') {
+async function listListenPidsOnPort(port) {
   if (process.platform === 'win32') {
     return [];
   }
 
-  const killed = [];
-  try {
-    const { stdout } = await execFileAsync('lsof', ['-nP', `-iTCP:${port}@127.0.0.1`, '-sTCP:LISTEN', '-t'], {
-      maxBuffer: 1024 * 1024,
-    });
-    const pids = [...new Set(stdout.split('\n').map((l) => l.trim()).filter((l) => /^[0-9]+$/.test(l)))];
-    if (pids.length) {
-      await killPids(pids, 'SIGTERM');
-      killed.push(...pids);
-      await sleep(400);
-      await killPids(pids, 'SIGKILL');
+  const patterns = [
+    ['-nP', `-iTCP:${port}@127.0.0.1`, '-sTCP:LISTEN', '-t'],
+    ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'],
+    ['-ti', `:${port}`, '-sTCP:LISTEN'],
+  ];
+
+  for (const args of patterns) {
+    try {
+      const { stdout } = await execFileAsync('lsof', args, { maxBuffer: 1024 * 1024 });
+      const pids = [...new Set(stdout.split('\n').map((l) => l.trim()).filter((l) => /^[0-9]+$/.test(l)))];
+      if (pids.length) {
+        return pids;
+      }
+    } catch {
+      // try next pattern
     }
-  } catch {
-    // no listeners
   }
 
-  return killed;
+  return [];
+}
+
+/**
+ * @param {number} port
+ */
+export async function killListenersOnPort(port) {
+  const pids = await listListenPidsOnPort(port);
+  if (!pids.length) {
+    return [];
+  }
+
+  await killPids(pids, 'SIGTERM');
+  await sleep(400);
+  await killPids(pids, 'SIGKILL');
+  return pids;
+}
+
+export async function killTheStuuEngineProcesses() {
+  if (process.platform === 'win32') {
+    return [];
+  }
+
+  const patterns = [
+    ['-f', '[a]pps/engine/src/server.js'],
+    ['-f', '[t]hestuu.*server.js'],
+  ];
+  const killed = [];
+
+  for (const args of patterns) {
+    try {
+      const { stdout } = await execFileAsync('pgrep', args, { maxBuffer: 256 * 1024 });
+      const pids = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (pids.length) {
+        await killPids(pids, 'SIGTERM');
+        killed.push(...pids);
+      }
+    } catch {
+      // none
+    }
+  }
+
+  if (killed.length) {
+    await sleep(300);
+    await killPids(killed, 'SIGKILL');
+  }
+
+  return [...new Set(killed)];
 }
 
 /**
@@ -74,10 +119,13 @@ export async function cleanDevSession(options = {}) {
   console.log('[thestuu-cli] cleaning previous dev session…');
 
   const enginePids = await killListenersOnPort(enginePort);
+  const engineNodePids = await killTheStuuEngineProcesses();
   const dashPids = await killListenersOnPort(dashboardPort);
 
-  if (enginePids.length) {
-    console.log(`[thestuu-cli] stopped engine listener(s) on :${enginePort} (pids: ${enginePids.join(', ')})`);
+  if (enginePids.length || engineNodePids.length) {
+    console.log(
+      `[thestuu-cli] stopped engine on :${enginePort} (pids: ${[...new Set([...enginePids, ...engineNodePids])].join(', ')})`,
+    );
   }
   if (dashPids.length) {
     console.log(`[thestuu-cli] stopped dashboard listener(s) on :${dashboardPort} (pids: ${dashPids.join(', ')})`);
