@@ -2,7 +2,11 @@
 
 Use **one command per session** so Native, Node, and UI share the same Unix socket and ports.
 
-## Browser (default)
+## Browser (default) — not Tauri
+
+`npm run dev` opens **http://127.0.0.1:3010** in the browser. It does **not** build or launch the Tauri `.app`.
+
+For a desktop window use `npm run dev -- --desktop`.
 
 ```bash
 export STUU_NATIVE_VENDOR_DIR="$(pwd)/vendor/tracktion_engine"   # once

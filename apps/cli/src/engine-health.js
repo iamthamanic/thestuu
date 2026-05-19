@@ -91,13 +91,20 @@ export async function isEngineDawReady(port, host, expectedNativeSocket, timeout
   if (statusCode !== 200 || !json?.ok || json?.service !== 'thestuu-engine') {
     return false;
   }
-  if (!json.nativeTransport) {
+  const diag = json.diagnostics && typeof json.diagnostics === 'object'
+    ? json.diagnostics
+    : {};
+  const tracktionUp = Boolean(json.nativeTransport || diag.tracktionReady);
+  if (!tracktionUp) {
+    return false;
+  }
+  if (diag.ipcConnected === false) {
     return false;
   }
   if (!expectedNativeSocket) {
     return true;
   }
-  const diagSocket = json.diagnostics?.nativeSocketPath ?? json.nativeSocketPath ?? null;
+  const diagSocket = diag.nativeSocketPath ?? json.nativeSocketPath ?? null;
   if (!diagSocket) {
     return true;
   }
@@ -111,9 +118,15 @@ export async function isEngineDawReady(port, host, expectedNativeSocket, timeout
  */
 export async function waitForEngineDawReady(port, host, expectedNativeSocket, timeoutMs = 90000) {
   const start = Date.now();
+  let lastLogMs = 0;
   while (Date.now() - start < timeoutMs) {
     if (await isEngineDawReady(port, host, expectedNativeSocket, 2500)) {
       return true;
+    }
+    const elapsed = Date.now() - start;
+    if (elapsed - lastLogMs >= 5000) {
+      console.log('[thestuu-cli] waiting for native/Tracktion on engine /health…');
+      lastLogMs = elapsed;
     }
     await new Promise((r) => setTimeout(r, 500));
   }

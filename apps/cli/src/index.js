@@ -5,7 +5,7 @@ function printHelp() {
 TheStuu CLI
 
 Usage:
-  thestuu dev [options]     Recommended: clean start, full stack (native + engine + UI)
+  thestuu dev [options]     Browser on :3010 (default). Use --desktop for Tauri window.
   thestuu start [options]   Same as dev (alias)
 
 Options:
