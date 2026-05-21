@@ -146,6 +146,35 @@ test('mergeAuthoritativeProjectState keeps JSON clip start when native export re
   assert.equal(audio.fade_in, 0.1);
 });
 
+test('mergeAuthoritativeProjectState keeps pattern clips with pattern_id even when type is audio', () => {
+  const jsonProject = {
+    bpm: 120,
+    playlist: [{
+      track_id: 1,
+      name: 'Track 1',
+      clips: [{
+        id: 'clip_pattern_1',
+        type: 'audio',
+        pattern_id: 'pattern_1',
+        start: 0,
+        length: 4,
+      }],
+    }],
+    mixer: [{ track_id: 1, volume: 0.85, pan: 0, mute: false, solo: false }],
+    patterns: [{ id: 'pattern_1', type: 'drum', length: 16, steps: [] }],
+    nodes: [],
+  };
+  const nativeExport = {
+    tracks: [{ track_id: 1, name: 'Track 1' }],
+    clips: [],
+    mixer: [{ track_id: 1, volume: 0.85, pan: 0, mute: false, solo: false }],
+  };
+  const merged = mergeAuthoritativeProjectState(jsonProject, nativeExport);
+  const patternClip = merged.playlist[0].clips.find((c) => c.id === 'clip_pattern_1');
+  assert.ok(patternClip, 'pattern clip should survive native merge');
+  assert.equal(patternClip.pattern_id, 'pattern_1');
+});
+
 test('mergeAuthoritativeProjectState uses native start when JSON has no match', () => {
   const jsonProject = {
     bpm: 120,

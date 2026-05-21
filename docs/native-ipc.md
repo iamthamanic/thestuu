@@ -80,6 +80,12 @@ Enable Node path: `STUU_NATIVE_CLIP_OPS=1`, `STUU_NATIVE_EDIT_UNDO=1` (see READM
 
 Master bus uses `track_id: 0` where supported.
 
+| `track:preview-note` | native-first | `{ track_id, pitch, velocity?, on: bool }` | `{ trackId, pitch, on }` |
+
+Live MIDI preview for piano-roll keys. Routes through the track’s first instrument plugin (`plugin->isSynth()`). If the track has no instrument, loads `internal:ultrasound` on that track once, then plays guide notes via `AudioTrack::playGuideNote` / `turnOffGuideNotes`. `on: false` turns off all guide notes on the track (pointer release). Does not mutate project JSON. **TODO:** `track_sound` sample preview remains JSON sidecar only.
+
+**Dashboard interim:** when Tracktion is offline, the engine is unreachable, or this command returns `ok: false`, the dashboard plays a short Web Audio triangle blip (`apps/dashboard/lib/track-preview.js` — preview path only, not arrangement). Requires native **tracktionReady** (`state.nativeTransport` / LOGS **Tracktion** row) for native preview; otherwise you should still hear the browser fallback after a user gesture (key click / note place).
+
 ### VST / plugins
 
 | Command | Status | Request | Response |

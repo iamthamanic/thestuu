@@ -195,6 +195,19 @@ bool importProjectSnapshotOnMessageThread(const ProjectExportSnapshot& snapshot,
   return importProjectSnapshot(snapshot, error);
 }
 
+bool previewTrackNote(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error) {
+  (void)trackId;
+  (void)pitch;
+  (void)velocity;
+  (void)noteOn;
+  error = "track:preview-note requires STUU_ENABLE_TRACKTION=ON";
+  return false;
+}
+
+bool previewTrackNoteOnMessageThread(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error) {
+  return previewTrackNote(trackId, pitch, velocity, noteOn, error);
+}
+
 bool getSpectrumAnalyzerSnapshot(SpectrumAnalyzerSnapshot& out) {
   out = {};
   return false;

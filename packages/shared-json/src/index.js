@@ -193,7 +193,7 @@ function normalizeDrumSteps(steps, patternLength) {
   });
 }
 
-function normalizeMidiNotes(notes) {
+export function normalizeMidiNotes(notes) {
   if (!Array.isArray(notes)) {
     return [];
   }
@@ -232,6 +232,15 @@ function normalizePattern(pattern, index = 0) {
       : 'midi';
   const length = Math.max(1, asInteger(safePattern.length, DEFAULT_PATTERN_LENGTH));
   const swing = clamp(asNumber(safePattern.swing, 0), 0, 0.95);
+  const name = isNonEmptyString(safePattern.name) ? safePattern.name.trim().slice(0, 64) : '';
+  const colorRaw = isNonEmptyString(safePattern.color) ? safePattern.color.trim() : '';
+  const colorMatch = /^#?([0-9a-fA-F]{6})$/.exec(colorRaw);
+  const color = colorMatch ? `#${colorMatch[1].toLowerCase()}` : '';
+
+  const meta = {
+    ...(name ? { name } : {}),
+    ...(color ? { color } : {}),
+  };
 
   if (normalizedType === 'drum') {
     return {
@@ -240,6 +249,7 @@ function normalizePattern(pattern, index = 0) {
       length,
       swing: Number(swing.toFixed(3)),
       steps: normalizeDrumSteps(safePattern.steps, length),
+      ...meta,
     };
   }
 
@@ -249,6 +259,7 @@ function normalizePattern(pattern, index = 0) {
     length,
     swing: Number(swing.toFixed(3)),
     notes: normalizeMidiNotes(safePattern.notes),
+    ...meta,
   };
 }
 
@@ -325,12 +336,36 @@ function normalizeClip(clip, trackId, clipIndex) {
   };
 }
 
+function normalizeTrackSound(raw) {
+  if (!isObject(raw)) {
+    return null;
+  }
+  const kindRaw = raw.kind ?? raw.type;
+  const kind = isNonEmptyString(kindRaw) ? kindRaw.trim().toLowerCase() : '';
+  if (kind !== 'sample') {
+    return null;
+  }
+  const sourcePathRaw = raw.source_path ?? raw.sourcePath;
+  const sourcePath = isNonEmptyString(sourcePathRaw) ? sourcePathRaw.trim() : '';
+  const sourceNameRaw = raw.source_name ?? raw.sourceName;
+  const sourceName = isNonEmptyString(sourceNameRaw) ? sourceNameRaw.trim().slice(0, 255) : '';
+  if (!sourcePath) {
+    return null;
+  }
+  return {
+    kind: 'sample',
+    source_path: sourcePath,
+    ...(sourceName ? { source_name: sourceName } : {}),
+  };
+}
+
 function normalizeTrack(track, trackIndex) {
   const safeTrack = isObject(track) ? track : {};
   const trackId = Math.max(1, asInteger(safeTrack.track_id, trackIndex + 1));
   const clips = Array.isArray(safeTrack.clips)
     ? safeTrack.clips.map((clip, clipIndex) => normalizeClip(clip, trackId, clipIndex))
     : [];
+  const trackSound = normalizeTrackSound(safeTrack.track_sound ?? safeTrack.trackSound);
 
   return {
     track_id: trackId,
@@ -338,6 +373,7 @@ function normalizeTrack(track, trackIndex) {
     chain_collapsed: asBoolean(safeTrack.chain_collapsed ?? safeTrack.chainCollapsed, true),
     chain_enabled: asBoolean(safeTrack.chain_enabled ?? safeTrack.chainEnabled, true),
     clips,
+    ...(trackSound ? { track_sound: trackSound } : {}),
   };
 }
 
@@ -1122,3 +1158,24 @@ export {
   applyFadeCurveT,
   getFadeEnvelopeAtX,
 } from './fade-curve.js';
+
+export {
+  getClipPatternId,
+  patternLoopBars,
+  collectPatternClipInstances,
+  isPlayheadInsideClip,
+  clipLocalPatternBar,
+  scanPatternNoteOnEvents,
+  schedulePatternNoteOns,
+  pianoRollPlayheadBar,
+} from './pattern-playback.js';
+
+export {
+  PATTERN_GRID_STEP,
+  floorPatternBarIndex,
+  clipOffsetBars,
+  patternBarAtPlayhead,
+  resolvePatternBarAtPlayhead,
+  noteOverlapsPatternBar,
+  expandPatternNotesForClipLength,
+} from './pattern-timeline-map.js';

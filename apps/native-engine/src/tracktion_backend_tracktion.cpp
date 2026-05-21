@@ -7084,6 +7084,62 @@ bool runOnMessageThread(Fn&& fn, std::string& error) {
   return ok;
 }
 
+tracktion::engine::Plugin* findFirstInstrumentOnTrack(tracktion::engine::AudioTrack& track) {
+  for (int32_t i = 0; i < track.pluginList.size(); ++i) {
+    auto* plugin = track.pluginList[i];
+    if (plugin != nullptr && plugin->isSynth()) {
+      return plugin;
+    }
+  }
+  return nullptr;
+}
+
+bool ensureTrackHasInstrument(tracktion::engine::AudioTrack& track, int32_t trackId, std::string& error) {
+  if (findFirstInstrumentOnTrack(track) != nullptr) {
+    error.clear();
+    return true;
+  }
+  LoadPluginResult loadResult;
+  if (!loadPlugin(kUltrasoundUid, trackId, loadResult, error)) {
+    return false;
+  }
+  error.clear();
+  return true;
+}
+
+bool previewTrackNoteImpl(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error) {
+  error.clear();
+  if (!gState || !gState->engine) {
+    error = "backend not initialised";
+    return false;
+  }
+  if (!requireEdit(error)) {
+    return false;
+  }
+
+  auto* track = getAudioTrackByIndex(trackId);
+  if (track == nullptr) {
+    error = "track_id out of range";
+    return false;
+  }
+
+  if (!ensureTrackHasInstrument(*track, trackId, error)) {
+    return false;
+  }
+
+  const int clampedPitch = juce::jlimit(0, 127, pitch);
+  const int clampedVelocity = juce::jlimit(1, 127, velocity);
+  tracktion::engine::MidiChannel midiChannel(1);
+
+  if (noteOn) {
+    track->playGuideNote(clampedPitch, midiChannel, clampedVelocity, true, true, false);
+  } else {
+    track->turnOffGuideNotes();
+  }
+
+  return true;
+}
+
 void readTrackMixerState(tracktion::engine::AudioTrack& track, int32_t trackId, TrackMixerState& out) {
   out.trackId = trackId;
   out.mute = track.isMuted(false);
@@ -7096,6 +7152,17 @@ void readTrackMixerState(tracktion::engine::AudioTrack& track, int32_t trackId, 
 }
 
 }  // namespace
+
+bool previewTrackNote(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error) {
+  return previewTrackNoteOnMessageThread(trackId, pitch, velocity, noteOn, error);
+}
+
+bool previewTrackNoteOnMessageThread(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error) {
+  return runOnMessageThread(
+    [&]() { return previewTrackNoteImpl(trackId, pitch, velocity, noteOn, error); },
+    error
+  );
+}
 
 bool listAudioTracks(std::vector<TrackLayoutEntry>& out, std::string& error) {
   out.clear();

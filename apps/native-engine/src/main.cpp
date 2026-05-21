@@ -1798,6 +1798,31 @@ MsgValue handleRequest(const MsgValue::Object& request, TransportCore& transport
     );
   }
 
+  if (cmd == "track:preview-note") {
+    if (payload == nullptr) {
+      return makeErrorResponse(id, "track:preview-note requires payload");
+    }
+    const int32_t trackId = parseMixerCommandTrackId(*payload);
+    if (trackId <= 0) {
+      return makeErrorResponse(id, "track:preview-note requires track_id > 0");
+    }
+    const int pitch = static_cast<int>(asInt(getField(*payload, "pitch"), 60));
+    const int velocity = static_cast<int>(asInt(
+      getField(*payload, "velocity"),
+      asInt(getField(*payload, "vel"), 100)
+    ));
+    const bool noteOn = asBool(getField(*payload, "on"), true);
+    std::string error;
+    if (!thestuu::native::previewTrackNote(trackId, pitch, velocity, noteOn, error)) {
+      return makeErrorResponse(id, error);
+    }
+    return makeResponse(id, MsgValue::Object{
+      {"trackId", MsgValue(trackId)},
+      {"pitch", MsgValue(pitch)},
+      {"on", MsgValue(noteOn)},
+    });
+  }
+
   if (cmd == "track:set-mute") {
     if (payload == nullptr) {
       return makeErrorResponse(id, "track:set-mute requires payload");

@@ -11,6 +11,7 @@ Stand: 2026-02-21
 
 - Erlaubte Basis: Schwarz, Weiss und neutrale Graustufen.
 - Keine bunten Primarakzente als Standard-UI-Farbe.
+- **Ausnahme Piano Roll (Modal):** flache lila MIDI-Notes (`#a855f7`) — funktionale Akzentfarbe fuer Noten, nicht App-Chrome.
 - Akzentfarbe fuer Interaktion: Weiss/helles Grau (`#fff` bis ca. `#d6d6da`).
 - Hintergruende: dunkle Flaechen mit subtilen Verlaeufen statt flacher Vollfarbe.
 - Statusfarben nur, wenn fachlich notwendig (z. B. Error-Warnung). Sonst neutral.

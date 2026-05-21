@@ -8,6 +8,22 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function getClipPatternId(clip) {
+  if (!isObject(clip)) {
+    return null;
+  }
+  if (typeof clip.pattern_id === 'string' && clip.pattern_id.trim()) {
+    return clip.pattern_id.trim();
+  }
+  if (typeof clip.patternId === 'string' && clip.patternId.trim()) {
+    return clip.patternId.trim();
+  }
+  if (typeof clip.pattern === 'string' && clip.pattern.trim()) {
+    return clip.pattern.trim();
+  }
+  return null;
+}
+
 /**
  * @param {object} jsonProject - parsed .stu project (patterns, view, names)
  * @param {object} nativeExport - project.export response from native-engine
@@ -110,7 +126,12 @@ export function mergeAuthoritativeProjectState(jsonProject, nativeExport) {
 
   for (const track of playlist) {
     const audioClips = clipsByTrack.get(Number(track.track_id)) || [];
-    const patternClips = (Array.isArray(track.clips) ? track.clips : []).filter((c) => String(c?.type || '').toLowerCase() !== 'audio');
+    const patternClips = (Array.isArray(track.clips) ? track.clips : []).filter((c) => {
+      if (getClipPatternId(c)) {
+        return true;
+      }
+      return String(c?.type || '').toLowerCase() !== 'audio';
+    });
     track.clips = [...patternClips, ...audioClips];
   }
 

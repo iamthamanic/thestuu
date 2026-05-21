@@ -49,6 +49,8 @@ export const NATIVE_COMMANDS = Object.freeze({
   TRACK_SET_VOLUME: 'track:set-volume',
   TRACK_SET_PAN: 'track:set-pan',
   TRACK_SET_RECORD_ARM: 'track:set-record-arm',
+  /** Live MIDI preview for piano-roll keys (routes to track instrument or internal:ultrasound). */
+  TRACK_PREVIEW_NOTE: 'track:preview-note',
 
   // VST / plugins
   VST_SCAN: 'vst:scan',
@@ -177,6 +179,8 @@ export const SOCKET_COMMANDS = Object.freeze({
   TRACK_SET_CHAIN_COLLAPSED: 'track:set-chain-collapsed',
   TRACK_SET_CHAIN_ENABLED: 'track:set-chain-enabled',
   TRACK_IMPORT_FILE: 'track:import-file',
+  /** Piano-roll key preview (forwards to native `track:preview-note`; no project mutation). */
+  TRACK_PREVIEW_NOTE: 'track:preview-note',
 
   // Clips
   CLIP_CREATE: 'clip:create',

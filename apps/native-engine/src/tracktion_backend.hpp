@@ -121,6 +121,14 @@ bool setTrackPan(int32_t trackId, double pan, std::string& error);
 /** Set track record arm (trackId 1-based). When armed, track uses default wave input for recording. */
 bool setTrackRecordArm(int32_t trackId, bool armed, std::string& error);
 
+/**
+ * Live MIDI preview for piano-roll keys on a track (1-based track id).
+ * Routes to the track’s first instrument, or loads internal:ultrasound when none is present.
+ * noteOn=true plays a guide note (voice-steal on the track); noteOn=false clears guide notes.
+ */
+bool previewTrackNote(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error);
+bool previewTrackNoteOnMessageThread(int32_t trackId, int pitch, int velocity, bool noteOn, std::string& error);
+
 /** Removes all audio (wave) clips from all audio tracks. Edit and VSTs are unchanged. Must run on message thread or use clearAllAudioClipsOnMessageThread from other threads. */
 bool clearAllAudioClips(std::string& error);
 /** Same as clearAllAudioClips but runs on the JUCE message thread. */

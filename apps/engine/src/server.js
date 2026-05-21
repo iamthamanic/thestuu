@@ -18,9 +18,10 @@ import {
   serializeProject,
   validateProject,
   normalizeFadeCurve,
+  normalizeMidiNotes,
   resolveFadeControl,
 } from '@thestuu/shared-json';
-import { ENGINE_EVENTS, NATIVE_COMMANDS } from '@thestuu/protocol';
+import { ENGINE_EVENTS, NATIVE_COMMANDS, SOCKET_COMMANDS } from '@thestuu/protocol';
 import { NativeTransportClient } from './native-transport-client.js';
 import {
   buildNativeImportFromProject,
@@ -1907,6 +1908,11 @@ function getPatternId(value) {
   return null;
 }
 
+/** JSON sidecar pattern clips (no native arrangement) — identified by pattern_id. */
+function isPatternSidecarClip(clip) {
+  return Boolean(getPatternId(clip));
+}
+
 function createTransportSnapshot(timestamp = Date.now()) {
   const bpm = normalizeTransportBpm(state.project.bpm);
   const beatsPerMillisecond = bpm / 60000;
@@ -3162,8 +3168,16 @@ function sanitizePatternInput(payload) {
   const providedType = isNonEmptyString(source.type) ? source.type.trim().toLowerCase() : null;
   const type = providedType === 'midi' ? 'midi' : providedType === 'drum' ? 'drum' : 'drum';
   const id = isNonEmptyString(source.id) ? source.id.trim() : makeId('pattern');
-  const length = clamp(assertPositiveInteger(source.length ?? DEFAULT_PATTERN_LENGTH, 'pattern.length'), 1, 128);
+  const length = clamp(assertPositiveInteger(source.length ?? DEFAULT_PATTERN_LENGTH, 'pattern.length'), 1, 512);
   const swing = clamp(Number(source.swing ?? 0), 0, 0.95);
+  const name = isNonEmptyString(source.name) ? source.name.trim().slice(0, 64) : '';
+  const colorRaw = isNonEmptyString(source.color) ? source.color.trim() : '';
+  const colorMatch = /^#?([0-9a-fA-F]{6})$/.exec(colorRaw);
+  const color = colorMatch ? `#${colorMatch[1].toLowerCase()}` : '';
+  const meta = {
+    ...(name ? { name } : {}),
+    ...(color ? { color } : {}),
+  };
 
   if (type === 'drum') {
     const steps = Array.isArray(source.steps) ? source.steps : [];
@@ -3202,6 +3216,7 @@ function sanitizePatternInput(payload) {
       length,
       swing: Number(swing.toFixed(3)),
       steps: normalizedSteps,
+      ...meta,
     };
   }
 
@@ -3232,6 +3247,7 @@ function sanitizePatternInput(payload) {
     length,
     swing: Number(swing.toFixed(3)),
     notes: normalizedNotes,
+    ...meta,
   };
 }
 
@@ -3295,7 +3311,7 @@ function updatePatternMeta(payload = {}) {
   }
 
   if (payload.length !== undefined) {
-    const nextLength = clamp(assertPositiveInteger(payload.length, 'length'), 1, 128);
+    const nextLength = clamp(assertPositiveInteger(payload.length, 'length'), 1, 512);
     pattern.length = nextLength;
     if (pattern.type === 'drum') {
       pattern.steps = (pattern.steps || []).filter((step) => step.index < nextLength);
@@ -3310,7 +3326,83 @@ function updatePatternMeta(payload = {}) {
     pattern.swing = Number(clamp(swing, 0, 0.95).toFixed(3));
   }
 
+  if (payload.name !== undefined) {
+    pattern.name = isNonEmptyString(payload.name) ? payload.name.trim().slice(0, 64) : '';
+  }
+
+  if (payload.color !== undefined) {
+    const colorRaw = isNonEmptyString(payload.color) ? payload.color.trim() : '';
+    const colorMatch = /^#?([0-9a-fA-F]{6})$/.exec(colorRaw);
+    pattern.color = colorMatch ? `#${colorMatch[1].toLowerCase()}` : '';
+  }
+
   return { pattern };
+}
+
+function setPatternNotes(payload = {}) {
+  const patternId = assertPatternId(payload);
+  const pattern = getPattern(patternId);
+  if (!pattern) {
+    throw new Error(`pattern "${patternId}" not found`);
+  }
+  if (!Array.isArray(payload.notes)) {
+    throw new Error('notes must be an array');
+  }
+
+  if (pattern.type === 'drum') {
+    pattern.type = 'midi';
+    delete pattern.steps;
+  }
+
+  pattern.notes = normalizeMidiNotes(payload.notes);
+  const maxEndBars = pattern.notes.reduce(
+    (maxEnd, note) => Math.max(maxEnd, (Number(note.start) || 0) + (Number(note.length) || 0)),
+    0,
+  );
+  if (maxEndBars > 0) {
+    const stepsNeeded = Math.max(1, Math.ceil(maxEndBars * 16));
+    pattern.length = Math.max(Number(pattern.length) || 16, Math.min(512, stepsNeeded));
+  }
+
+  return { patternId, noteCount: pattern.notes.length, pattern };
+}
+
+function setTrackSound(payload = {}) {
+  const trackId = assertTrackId(payload);
+  const track = getTrack(trackId);
+  if (!track) {
+    throw new Error(`track "${trackId}" not found`);
+  }
+
+  if (payload.clear === true || payload.kind === null || payload.kind === '') {
+    delete track.track_sound;
+    delete track.trackSound;
+    return { trackId, track_sound: null };
+  }
+
+  const kindRaw = payload.kind ?? payload.type ?? 'sample';
+  const kind = isNonEmptyString(kindRaw) ? kindRaw.trim().toLowerCase() : 'sample';
+  if (kind !== 'sample') {
+    throw new Error('track sound kind must be "sample"');
+  }
+
+  const sourcePathRaw = payload.source_path ?? payload.sourcePath;
+  const sourcePath = isNonEmptyString(sourcePathRaw) ? sourcePathRaw.trim() : '';
+  if (!sourcePath) {
+    throw new Error('source_path is required for track sound');
+  }
+
+  const sourceNameRaw = payload.source_name ?? payload.sourceName;
+  const sourceName = isNonEmptyString(sourceNameRaw) ? sourceNameRaw.trim().slice(0, 255) : '';
+
+  track.track_sound = {
+    kind: 'sample',
+    source_path: sourcePath,
+    ...(sourceName ? { source_name: sourceName } : {}),
+  };
+  delete track.trackSound;
+
+  return { trackId, track_sound: track.track_sound };
 }
 
 function createPattern(payload = {}) {
@@ -3797,7 +3889,7 @@ async function reconcilePlaylistAudioClipsFromNative() {
     }
     const remaining = [];
     for (const clip of track.clips) {
-      if (normalizeClipType(clip?.type) !== 'audio') {
+      if (isPatternSidecarClip(clip) || normalizeImportedClipType(clip?.type) !== 'audio') {
         remaining.push(clip);
         continue;
       }
@@ -4045,6 +4137,50 @@ async function moveClip(payload = {}) {
     throw new Error(`track "${sourceTrackId}" not found`);
   }
 
+  if (isPatternSidecarClip(clip)) {
+    const q = resolveClipQuantizeStep(payload);
+    const nextStartRaw = Number(payload.start);
+    if (!Number.isFinite(nextStartRaw)) {
+      throw new Error('start must be numeric');
+    }
+    const nextStart = Math.max(0, roundToGrid(nextStartRaw, q));
+    const destinationTrackIdRaw = payload.toTrackId ?? payload.to_track_id;
+    const destinationTrackId = destinationTrackIdRaw !== undefined
+      ? assertPositiveInteger(destinationTrackIdRaw, 'toTrackId')
+      : sourceTrackId;
+    if (destinationTrackId !== sourceTrackId) {
+      const destinationTrack = getTrack(destinationTrackId);
+      if (!destinationTrack) {
+        throw new Error(`track "${destinationTrackId}" not found`);
+      }
+      sourceTrack.clips.splice(index, 1);
+      destinationTrack.clips = Array.isArray(destinationTrack.clips) ? destinationTrack.clips : [];
+      destinationTrack.clips.push({
+        ...clip,
+        start: nextStart,
+      });
+      sortClips(destinationTrack);
+      pushStructuredEngineLog({
+        level: 'info',
+        category: 'clip',
+        event: 'move',
+        text: `[clip] pattern clip "${clipId}" → track ${destinationTrackId} @ ${nextStart} bars`,
+        metadata: { clipId, trackId: destinationTrackId, start: nextStart, pattern: true },
+      });
+      return { clipId, trackId: destinationTrackId };
+    }
+    clip.start = nextStart;
+    sortClips(sourceTrack);
+    pushStructuredEngineLog({
+      level: 'info',
+      category: 'clip',
+      event: 'move',
+      text: `[clip] pattern clip "${clipId}" → start ${nextStart} bars (track ${sourceTrackId})`,
+      metadata: { clipId, trackId: sourceTrackId, start: nextStart, pattern: true },
+    });
+    return { clipId, trackId: sourceTrackId };
+  }
+
   const nextStartRaw = Number(payload.start);
   if (!Number.isFinite(nextStartRaw)) {
     throw new Error('start must be numeric');
@@ -4128,6 +4264,19 @@ async function resizeClip(payload = {}) {
   const { clip } = located;
 
   const computed = computeResizeClipValues(clip, payload);
+
+  if (isPatternSidecarClip(clip)) {
+    const { q } = computed;
+    clip.start = computed.nextStart;
+    clip.length = Math.max(q, computed.nextLength);
+    sortClips(track);
+    return {
+      clipId,
+      trackId,
+      start: Number(clip.start) || 0,
+      length: Number(clip.length) || q,
+    };
+  }
 
   if (isNativeFirstAudioClip(clip)) {
     assertNativeEngineForDawMutation();
@@ -4375,13 +4524,38 @@ function setClipProperties(payload = {}) {
 
 async function deleteClip(payload = {}) {
   const clipId = assertClipId(payload);
-  const located = findClipInProject(clipId);
+  let located = findClipInProject(clipId);
+  const hasTrackHint = Object.prototype.hasOwnProperty.call(payload, 'trackId')
+    || Object.prototype.hasOwnProperty.call(payload, 'track_id');
+  if (hasTrackHint) {
+    const hintedTrackId = assertTrackId(payload);
+    const hintedTrack = getTrack(hintedTrackId);
+    if (!hintedTrack) {
+      throw new Error(`track "${hintedTrackId}" not found`);
+    }
+    const onHintedTrack = findClip(hintedTrack, clipId);
+    if (onHintedTrack.clip) {
+      located = { track: hintedTrack, trackId: hintedTrackId, ...onHintedTrack };
+    } else if (!located.clip) {
+      throw new Error(`clip "${clipId}" not found on track ${hintedTrackId}`);
+    }
+  }
   if (!located.clip) {
     throw new Error(`clip "${clipId}" not found`);
   }
   const trackId = located.trackId;
   const track = located.track;
   const { clip } = located;
+
+  if (isPatternSidecarClip(clip)) {
+    const currentLength = track.clips.length;
+    track.clips = track.clips.filter((entry) => String(entry.id).trim() !== clipId);
+    if (track.clips.length === currentLength) {
+      throw new Error(`clip "${clipId}" not found on track ${trackId}`);
+    }
+    sortClips(track);
+    return { clipId, trackId };
+  }
 
   if (nativeClipOpsEnabled && nativeTransportActive && normalizeClipType(clip?.type) === 'audio') {
     const sourcePath = getPlaylistClipSourcePath(clip);
@@ -5795,6 +5969,39 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on(SOCKET_COMMANDS.TRACK_PREVIEW_NOTE, async (payload = {}, callback = () => {}) => {
+    try {
+      if (!nativeTracktionActive) {
+        respond(callback, { ok: false, error: 'native tracktion offline' });
+        return;
+      }
+      const trackIdRaw = Number(payload.track_id ?? payload.trackId);
+      if (!Number.isInteger(trackIdRaw) || trackIdRaw <= 0) {
+        respond(callback, { ok: false, error: 'track_id required' });
+        return;
+      }
+      const pitchRaw = Number(payload.pitch);
+      const pitch = Number.isFinite(pitchRaw) ? Math.round(pitchRaw) : 60;
+      const velocityRaw = Number(payload.velocity ?? payload.vel);
+      const velocity = Number.isFinite(velocityRaw)
+        ? Math.max(1, Math.min(127, Math.round(velocityRaw)))
+        : 100;
+      const noteOn = payload.on !== false && payload.on !== 0 && payload.on !== '0';
+      await requestNativeTransport(NATIVE_COMMANDS.TRACK_PREVIEW_NOTE, {
+        track_id: trackIdRaw,
+        pitch,
+        velocity,
+        on: noteOn,
+      }, { timeoutMs: 400 });
+      respond(callback, { ok: true, trackId: trackIdRaw, pitch, on: noteOn });
+    } catch (error) {
+      respond(callback, {
+        ok: false,
+        error: error instanceof Error ? error.message : 'track:preview-note failed',
+      });
+    }
+  });
+
   socket.on('track:set-record-arm', async (payload = {}, callback = () => {}) => {
     const trackId = resolveMixerSocketTrackId(payload);
     if (!Number.isInteger(trackId) || trackId < 0) {
@@ -5881,9 +6088,6 @@ io.on('connection', (socket) => {
 
   socket.on('track:insert', async (payload = {}, callback = () => {}) => {
     try {
-      if (nativeTrackOpsEnabled) {
-        assertLegacyJsonArrangementAllowed('track:insert');
-      }
       ensureProjectArrays();
       const highestTrackId = state.project.playlist.reduce((maxId, track) => {
         const trackId = Number(track?.track_id);
@@ -5901,17 +6105,30 @@ io.on('connection', (socket) => {
       sortProjectTrackCollections();
       normalizeAllVstPluginIndexes();
 
-      if (nativeTrackOpsEnabled && nativeTransportActive) {
-        await syncNativeTrackLayoutFromPlaylist();
-      } else {
-        await safeRestoreNativeNodesAfterTrackLayoutChange();
+      let nativeSync = false;
+      let syncWarning = '';
+      try {
+        if (nativeTrackOpsEnabled && nativeTransportActive) {
+          await syncNativeTrackLayoutFromPlaylist();
+          nativeSync = true;
+        } else {
+          await safeRestoreNativeNodesAfterTrackLayoutChange();
+        }
+      } catch (syncError) {
+        syncWarning = syncError instanceof Error ? syncError.message : 'native sync failed';
+        try {
+          await safeRestoreNativeNodesAfterTrackLayoutChange();
+        } catch {
+          /* JSON playlist already updated; UI still gets emitState below */
+        }
       }
 
       emitState();
       respond(callback, {
         ok: true,
         trackId: insertAtTrackId,
-        nativeTrackOps: nativeTrackOpsEnabled && nativeTransportActive,
+        nativeTrackOps: nativeSync,
+        ...(syncWarning ? { warning: syncWarning } : {}),
       });
     } catch (error) {
       respond(callback, { ok: false, error: error instanceof Error ? error.message : 'track:insert failed' });
@@ -6027,9 +6244,6 @@ io.on('connection', (socket) => {
 
   socket.on('track:duplicate', async (payload = {}, callback = () => {}) => {
     try {
-      if (nativeTrackOpsEnabled) {
-        assertLegacyJsonArrangementAllowed('track:duplicate');
-      }
       ensureProjectArrays();
       const sourceTrackId = Number(payload.trackId ?? payload.track_id);
       if (!Number.isInteger(sourceTrackId) || sourceTrackId <= 0) {
@@ -7184,7 +7398,9 @@ io.on('connection', (socket) => {
   bindMutation(socket, 'pattern:create', createPattern);
   bindMutation(socket, 'pattern:update-step', updatePatternStep);
   bindMutation(socket, 'pattern:update', updatePatternMeta);
+  bindMutation(socket, 'pattern:set-notes', setPatternNotes);
   bindMutation(socket, 'pattern:delete', deletePattern);
+  bindMutation(socket, 'track:set-sound', setTrackSound);
 
   bindMutation(socket, 'clip:create', createClip);
   bindMutation(socket, 'clip:import-file', importClipFile);

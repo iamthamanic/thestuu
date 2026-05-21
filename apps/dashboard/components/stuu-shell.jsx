@@ -26,6 +26,7 @@ import {
   ExternalLink,
   Filter,
   Gauge,
+  Grid3x3,
   LayoutGrid,
   Mic,
   Minus,
@@ -69,6 +70,30 @@ import MixStripChain from './MixStripChain';
 import SongStructureAddMenu from './SongStructureAddMenu';
 import SongStructureLane from './SongStructureLane';
 import ConnectionStatusLogs from './connection-status-logs.jsx';
+import PatternClipPreview from './pattern-clip-preview.jsx';
+import PatternEditorPanel from './pattern-editor-panel.jsx';
+import PatternSoundChooserModal from './pattern-sound-chooser-modal.jsx';
+import PianoRollModal from './piano-roll-modal.jsx';
+import { usePatternPlayback } from '../hooks/use-pattern-playback.js';
+import { resolvePatternBarAtPlayhead } from '@thestuu/shared-json';
+import { ExtractStemsIcon, FitToTempoIcon } from './clip-tool-icons.jsx';
+import {
+  CLIP_QUICK_TOOL_ACTIONS,
+  getClipQuickToolMenuItems,
+} from '../lib/clip-quick-tools.js';
+import { parseMidiFileToPatternNotes } from '../lib/midi-import.js';
+import { syncPianoRollClipBarPulses } from '../lib/playlist-bar-pulse.js';
+import {
+  createPlacementPreviewEmitter,
+  createThrottledPreviewEmitter,
+  isNativeAudioPreviewReady,
+  playBrowserPreviewNote,
+  primeBrowserPreviewAudio,
+  resolvePianoRollPreviewTrackId,
+  resolvePreviewMode,
+  TRACK_PREVIEW_BROWSER_KEY_MS,
+  TRACK_PREVIEW_BROWSER_PLACEMENT_MS,
+} from '../lib/track-preview.js';
 import { LIVE_LOG_LIMIT as LIVE_ENGINE_LOG_LIMIT, normalizeStructuredLogEntry } from '../lib/live-logs.js';
 import { mapEngineDiagnostics } from '../lib/engine-diagnostics.js';
 import SongStructureNodeModal from './SongStructureNodeModal';
@@ -91,48 +116,15 @@ import {
   getFadeEnvelopeAtX,
   resolveFadeControl,
 } from '@thestuu/shared-json';
-
-function ExtractStemsIcon({ size = 24, strokeWidth = 2, ...props }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={strokeWidth}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      {...props}
-    >
-      <circle cx="12" cy="4.5" r="2.25" />
-      <path d="M3.75 12.25H20.25V16.25L14.75 20V22L9.25 23.25V20L3.75 16.25Z" />
-    </svg>
-  );
-}
-
-function FitToTempoIcon({ size = 24, strokeWidth = 2, ...props }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={strokeWidth}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      {...props}
-    >
-      <path d="M3 12H9" />
-      <path d="M6.75 9.5L9.25 12L6.75 14.5" />
-      <circle cx="16" cy="12" r="5.25" />
-      <path d="M16 9.25V12H18.5" />
-    </svg>
-  );
-}
+import {
+  DEFAULT_SNAP_MODE,
+  GRID_STEP,
+  SLICE_FREE_STEP,
+  SNAP_MODE_OPTIONS,
+  normalizeSnapMode,
+  resolveGridLineDensity,
+  resolveSnapStep,
+} from '../lib/daw-snap-mode.js';
 
 const TABS = ['Edit', 'Mix'];
 const DAW_MENU_ITEMS = ['FILE', 'VIEW', 'HELP', 'SETTINGS'];
@@ -147,9 +139,7 @@ const VIEW_EXTEND_TRIGGER_RATIO = 0.9;
 const PLAYHEAD_EXTEND_MARGIN_BARS = 4;
 const PLAYHEAD_SCRUB_EDGE_PX = 24;
 const PLAYHEAD_SCRUB_SCROLL_PX = 24;
-const GRID_STEP = 1 / 16;
 const BEATS_PER_BAR = 4;
-const SLICE_FREE_STEP = 1 / 256;
 const MIN_VOLUME_DB = -80;
 const MAX_VOLUME_DB = Number((20 * Math.log10(1.2)).toFixed(1));
 const MIN_VISIBLE_TRACKS = 1;
@@ -182,6 +172,8 @@ const TRACK_ADD_MENU_ITEMS = [
   { id: 'import', label: 'Import' },
   { id: 'pattern', label: 'Pattern' },
 ];
+const PATTERN_COLOR_PALETTE = ['#e8e8ec', '#c4b5fd', '#93c5fd', '#86efac', '#fcd34d', '#fb923c', '#f472b6'];
+const PATTERN_STEPS_PER_BAR = 16;
 // Must match engine SUPPORTED_AUDIO_EXTENSIONS (wav, flac, mp3, ogg, aac, aiff, aif) – same sync/playback for all.
 const IMPORTABLE_AUDIO_EXTENSIONS = new Set(['wav', 'flac', 'mp3', 'ogg', 'aac', 'aiff', 'aif']);
 const IMPORTABLE_MIDI_EXTENSIONS = new Set(['mid', 'midi']);
@@ -194,12 +186,6 @@ const TRACK_CONTEXT_MENU_ITEMS = [
   { id: 'duplicate', label: 'Duplizieren' },
   { id: 'delete', label: 'Entfernen' },
 ];
-const CLIP_QUICK_TOOL_MENU_ITEMS = [
-  { id: 'extract_stems', label: 'Extract Stems', icon: ExtractStemsIcon },
-  { id: 'fit_to_tempo', label: 'Fit to Tempo', icon: FitToTempoIcon },
-  { id: 'rename_and_color', label: 'Rename and Color', icon: PaintBucket },
-  { id: 'analyze_bpm_key', label: 'Analyze BPM & Key', icon: Gauge },
-];
 const CLIP_RENAME_COLOR_SWATCHES = [
   { id: 'default', label: 'Default', color: '' },
   { id: 'sky', label: 'Sky', color: '#60a5fa' },
@@ -211,16 +197,6 @@ const CLIP_RENAME_COLOR_SWATCHES = [
   { id: 'lime', label: 'Lime', color: '#a3e635' },
   { id: 'orange', label: 'Orange', color: '#fb923c' },
   { id: 'red', label: 'Red', color: '#f87171' },
-];
-const DEFAULT_SNAP_MODE = 'free';
-const SNAP_MODE_OPTIONS = [
-  { id: 'free', label: 'Free' },
-  { id: 'auto', label: 'Auto' },
-  { id: 'line', label: 'Line' },
-  { id: 'cell', label: 'Cell' },
-  { id: 'half_beat', label: '1/2 Beat' },
-  { id: 'beat', label: 'Beat' },
-  { id: 'bar', label: 'Bar' },
 ];
 const DEFAULT_TIME_SIGNATURE = { numerator: 4, denominator: 4 };
 const EDIT_TOOL_OPTIONS = [
@@ -1054,6 +1030,90 @@ function buildClipMoveDraft({
   };
 }
 
+/** Visual-only clip move: translate3d from draft without React position commits. */
+function applyClipMoveDragTransform(el, draft, interaction, barWidthPx, arrangementTracks, rowHeightPx) {
+  if (!el || !draft || !interaction) {
+    return;
+  }
+  const width = Number(barWidthPx);
+  if (!Number.isFinite(width) || width <= 0) {
+    return;
+  }
+  const deltaPx = (Number(draft.start) - Number(interaction.start)) * width;
+  const srcIdx = arrangementTracks.findIndex((t) => Number(t?.track_id) === Number(interaction.trackId));
+  const destIdx = arrangementTracks.findIndex((t) => Number(t?.track_id) === Number(draft.trackId));
+  const deltaY = (destIdx - srcIdx) * rowHeightPx;
+  el.style.transform = `translate3d(${Number(deltaPx.toFixed(3))}px, ${deltaY}px, 0)`;
+  el.style.zIndex = '30';
+}
+
+function clearClipMoveDragTransform(el) {
+  if (!el) {
+    return;
+  }
+  el.style.transform = '';
+  el.style.zIndex = '';
+}
+
+/** Apply clip move to in-memory project playlist (pattern/sidecar clips; optimistic UI until engine:state). */
+function applyLocalClipMoveInProject(project, sourceTrackId, clipId, draft) {
+  if (!isObject(project) || !draft) {
+    return project;
+  }
+  const srcId = Number(sourceTrackId);
+  const destId = Number(draft.trackId);
+  const clipIdStr = String(clipId ?? '').trim();
+  if (!Number.isInteger(srcId) || srcId < 1 || !Number.isInteger(destId) || destId < 1 || !clipIdStr) {
+    return project;
+  }
+  const playlist = Array.isArray(project.playlist) ? project.playlist : [];
+  let movedClip = null;
+  const stripped = playlist.map((track) => {
+    const tid = Number(track?.track_id);
+    if (tid !== srcId) {
+      return track;
+    }
+    const clips = Array.isArray(track.clips) ? track.clips : [];
+    const idx = clips.findIndex((c) => String(c?.id) === clipIdStr);
+    if (idx < 0) {
+      return track;
+    }
+    movedClip = { ...clips[idx] };
+    if (destId === srcId) {
+      return track;
+    }
+    return {
+      ...track,
+      clips: clips.filter((_, i) => i !== idx),
+    };
+  });
+  if (!movedClip) {
+    return project;
+  }
+  const nextClip = {
+    ...movedClip,
+    start: draft.start,
+    length: Number.isFinite(Number(draft.length)) && Number(draft.length) > 0
+      ? Number(draft.length)
+      : movedClip.length,
+  };
+  const nextPlaylist = stripped.map((track) => {
+    const tid = Number(track?.track_id);
+    if (tid !== destId) {
+      return track;
+    }
+    const clips = Array.isArray(track.clips) ? [...track.clips] : [];
+    if (destId === srcId) {
+      return {
+        ...track,
+        clips: clips.map((c) => (String(c?.id) === clipIdStr ? nextClip : c)),
+      };
+    }
+    return { ...track, clips: [...clips, nextClip] };
+  });
+  return { ...project, playlist: nextPlaylist };
+}
+
 /** Bars <-> time (project start 0:00). BPM = quarter notes/min. time_signature: { numerator, denominator } (e.g. 4/4, 6/8). */
 function barsToSeconds(bars, bpm, timeSignature = DEFAULT_TIME_SIGNATURE) {
   if (!Number.isFinite(bars) || !Number.isFinite(bpm) || bpm <= 0) return 0;
@@ -1410,6 +1470,66 @@ function normalizeClipType(value) {
     return normalized;
   }
   return null;
+}
+
+function resolveTimelineClipKind(clip) {
+  const clipType = normalizeClipType(clip?.type);
+  if (clipType === 'audio') {
+    return 'audio';
+  }
+  if (getPatternId(clip)) {
+    return 'pattern';
+  }
+  if (clipType === 'midi') {
+    return 'midi';
+  }
+  return clipType;
+}
+
+function getPatternDisplayName(pattern, index) {
+  if (isNonEmptyString(pattern?.name)) {
+    return pattern.name.trim();
+  }
+  return `Pattern ${index + 1}`;
+}
+
+function getNextPatternColor(patterns = []) {
+  const used = new Set(
+    patterns
+      .map((entry) => (typeof entry?.color === 'string' ? entry.color.trim().toLowerCase() : ''))
+      .filter(Boolean),
+  );
+  for (const color of PATTERN_COLOR_PALETTE) {
+    if (!used.has(color.toLowerCase())) {
+      return color;
+    }
+  }
+  return PATTERN_COLOR_PALETTE[patterns.length % PATTERN_COLOR_PALETTE.length];
+}
+
+function getNextPatternName(patterns = []) {
+  return `Pattern ${patterns.length + 1}`;
+}
+
+function patternLengthToBars(pattern) {
+  const steps = Math.max(1, Number(pattern?.length) || PATTERN_STEPS_PER_BAR);
+  return Math.max(1, steps / PATTERN_STEPS_PER_BAR);
+}
+
+function getPatternClipDisplayLabel(clip, patterns = []) {
+  const patternId = getPatternId(clip);
+  if (!patternId) {
+    return getClipDisplayLabel(clip);
+  }
+  if (isNonEmptyString(clip?.name)) {
+    return clip.name.trim();
+  }
+  const patternIndex = patterns.findIndex((entry) => entry.id === patternId);
+  const pattern = patternIndex >= 0 ? patterns[patternIndex] : null;
+  if (pattern) {
+    return getPatternDisplayName(pattern, patternIndex);
+  }
+  return 'Pattern';
 }
 
 function getImportedClipLabel(clip) {
@@ -1792,25 +1912,6 @@ function getWaveformPolygonPoints(peaks, gainMultiplier = 1) {
   return [...topPoints, ...bottomPoints.reverse()].join(' ');
 }
 
-function getStepVelocityMap(pattern) {
-  const map = new Map();
-  if (!pattern || !Array.isArray(pattern.steps)) {
-    return map;
-  }
-
-  for (const step of pattern.steps) {
-    const lane = typeof step.lane === 'string' ? step.lane : null;
-    const index = Number(step.index);
-    const velocity = Number(step.velocity);
-    if (!lane || !Number.isInteger(index) || !Number.isFinite(velocity)) {
-      continue;
-    }
-    map.set(`${lane}:${index}`, velocity);
-  }
-
-  return map;
-}
-
 function normalizePluginParameters(parameters) {
   if (!Array.isArray(parameters)) {
     return [];
@@ -2144,108 +2245,6 @@ function normalizePlaylistShowTrackNodes(value) {
   return true;
 }
 
-function normalizeSnapMode(value) {
-  const resolved = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  if (SNAP_MODE_OPTIONS.some((option) => option.id === resolved)) {
-    return resolved;
-  }
-  return DEFAULT_SNAP_MODE;
-}
-
-function resolveAutoSnapStep(barWidth) {
-  if (!Number.isFinite(barWidth)) {
-    return 1 / 4;
-  }
-  if (barWidth >= 170) {
-    return 1 / 16;
-  }
-  if (barWidth >= 110) {
-    return 1 / 8;
-  }
-  if (barWidth >= 72) {
-    return 1 / 4;
-  }
-  if (barWidth >= 48) {
-    return 1 / 2;
-  }
-  return 1;
-}
-
-function resolveGridLineDensity(barWidth) {
-  if (!Number.isFinite(barWidth)) {
-    return {
-      microDivisions: 4,
-      microAlpha: 0.05,
-      beatAlpha: 0.11,
-    };
-  }
-  if (barWidth >= 200) {
-    return {
-      microDivisions: 32,
-      microAlpha: 0.06,
-      beatAlpha: 0.13,
-    };
-  }
-  if (barWidth >= 110) {
-    return {
-      microDivisions: 16,
-      microAlpha: 0.08,
-      beatAlpha: 0.13,
-    };
-  }
-  if (barWidth >= 72) {
-    return {
-      microDivisions: 8,
-      microAlpha: 0.07,
-      beatAlpha: 0.12,
-    };
-  }
-  if (barWidth >= 48) {
-    return {
-      microDivisions: 4,
-      microAlpha: 0.05,
-      beatAlpha: 0.10,
-    };
-  }
-  return {
-    microDivisions: 4,
-    microAlpha: 0.04,
-    beatAlpha: 0.08,
-  };
-}
-
-function resolveSnapStep(snapMode, barWidth, gridLineDensity) {
-  const mode = normalizeSnapMode(snapMode);
-  if (mode === 'free') {
-    return SLICE_FREE_STEP;
-  }
-  if (mode === 'line') {
-    const microDivisions = Number(gridLineDensity?.microDivisions);
-    const microAlpha = Number(gridLineDensity?.microAlpha);
-    const beatAlpha = Number(gridLineDensity?.beatAlpha);
-    if (Number.isFinite(microDivisions) && microDivisions > 0 && microAlpha > 0) {
-      return 1 / microDivisions;
-    }
-    if (beatAlpha > 0) {
-      return 1 / 4;
-    }
-    return 1;
-  }
-  if (mode === 'cell') {
-    return GRID_STEP;
-  }
-  if (mode === 'half_beat') {
-    return 1 / 8;
-  }
-  if (mode === 'beat') {
-    return 1 / 4;
-  }
-  if (mode === 'bar') {
-    return 1;
-  }
-  return resolveAutoSnapStep(barWidth);
-}
-
 function isEditableTarget(target) {
   if (!(target instanceof Element)) {
     return false;
@@ -2477,6 +2476,10 @@ export default function StuuShell() {
   const socketRef = useRef(null);
   const clipDraftsRef = useRef({});
   const importFileInputRef = useRef(null);
+  const patternMidiImportRef = useRef(null);
+  const patternSoundFileInputRef = useRef(null);
+  const patternMidiImportTargetRef = useRef(/** @type {{ patternId: string } | null} */ (null));
+  const patternSoundTrackIdRef = useRef(null);
   const importTargetTrackIdRef = useRef(null);
   const importTrackRenamePromptResolverRef = useRef(null);
   const trackNameInputRef = useRef(null);
@@ -2558,6 +2561,20 @@ export default function StuuShell() {
   const [recoveryStatus, setRecoveryStatus] = useState(null);
   const [connectionLogs, setConnectionLogs] = useState([]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [patternEditorDockOpen, setPatternEditorDockOpen] = useState(true);
+  const [patternSoundChooserOpen, setPatternSoundChooserOpen] = useState(false);
+  const [pianoRollTarget, setPianoRollTarget] = useState(/** @type {{
+    patternId: string,
+    trackId: number | null,
+    clipId: string | null,
+    clipStartBars: number,
+    clipLengthBars: number,
+    patternLoopBars: number,
+  } | null} */ (null));
+  const [patternNotesDraft, setPatternNotesDraft] = useState(/** @type {{ patternId: string, notes: object[] } | null} */ (null));
+  const patternNotesDebounceRef = useRef(/** @type {ReturnType<typeof setTimeout> | null} */ (null));
+  const pianoPreviewEmitRef = useRef(/** @type {((payload: { pitch: number, on: boolean }) => void) | null} */ (null));
+  const pianoPlacementPreviewRef = useRef(/** @type {((pitch: number) => void) | null} */ (null));
   const [settingsTab, setSettingsTab] = useState('AUDIO');
   const [settingsVstPluginTab, setSettingsVstPluginTab] = useState('effects');
   const [settingsVstSearch, setSettingsVstSearch] = useState('');
@@ -2589,6 +2606,7 @@ export default function StuuShell() {
   const [isBpmInputFocused, setIsBpmInputFocused] = useState(false);
   const [activeTab, setActiveTab] = useState('Edit');
   const [state, setState] = useState(FALLBACK_STATE);
+  const engineProjectRef = useRef(state?.project ?? FALLBACK_STATE.project);
   const recordCountInEnabledPreference = typeof state?.appPreferences?.record_count_in_enabled === 'boolean'
     ? state.appPreferences.record_count_in_enabled
     : FALLBACK_STATE.appPreferences.record_count_in_enabled;
@@ -2619,11 +2637,19 @@ export default function StuuShell() {
   const [inspectorEqAnalyzerFrozen, setInspectorEqAnalyzerFrozen] = useState(false);
   const [activePatternId, setActivePatternId] = useState(null);
   const [clipDrafts, setClipDrafts] = useState({});
+  const [clipMovePreview, setClipMovePreview] = useState(/** @type {ReturnType<typeof buildClipMoveDraft> | null} */ (null));
   const [clipDisplayOverrides, setClipDisplayOverrides] = useState({});
   const [clipInteraction, setClipInteraction] = useState(null);
   const [fadeHandleInteraction, setFadeHandleInteraction] = useState(/** @type {{ mode: 'length'|'curve'; which: 'in'|'out'; trackId: number; clipId: string; fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; clipLengthSeconds: number } | null} */ (null));
   const fadeHandleDraftRef = useRef(/** @type {{ fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; fadeInCx: number; fadeInCy: number; fadeOutCx: number; fadeOutCy: number } | null} */ (null));
   const fadeDraftRafRef = useRef(null);
+  const clipDragElRef = useRef(/** @type {HTMLElement | null} */ (null));
+  const clipMoveDraftRef = useRef(/** @type {ReturnType<typeof buildClipMoveDraft> | null} */ (null));
+  const clipMovePreviewSigRef = useRef('');
+  const clipMoveRafRef = useRef(null);
+  const clipResizeDraftRafRef = useRef(null);
+  const clipResizePendingRef = useRef(/** @type {{ clipId: string; draft: object } | null} */ (null));
+  const clipDragTargetTrackRef = useRef(/** @type {number | null} */ (null));
   const fadeHandleStartRef = useRef(/** @type {{ originX: number; originY: number; originFadeIn: number; originFadeOut: number; regionRect: DOMRect; clipWidthPx: number; fadeInPx: number; fadeOutPx: number } | null} */ (null));
   const fadeNativePushRef = useRef({ signature: '', at: 0 });
   const [fadeDraftByKey, setFadeDraftByKey] = useState(/** @type {{ [clipKey: string]: { fadeIn: number; fadeOut: number; fadeInCurve: string; fadeOutCurve: string; fadeInCx: number; fadeInCy: number; fadeOutCx: number; fadeOutCy: number } } } */ ({}));
@@ -2856,11 +2882,19 @@ export default function StuuShell() {
           recording,
           beatsPerBar: safeBeatsPerBar,
         };
-        setTransport((current) => ({
-          ...current,
-          ...merged,
-        }));
       }
+      setTransport((current) => ({
+        ...current,
+        playing,
+        recording,
+        bpm: safeBpm,
+        positionBars,
+        positionBeats,
+        bar: Number.isFinite(Number(merged.bar)) ? Number(merged.bar) : current.bar,
+        beat: Number.isFinite(Number(merged.beat)) ? Number(merged.beat) : current.beat,
+        step: Number.isFinite(Number(merged.step)) ? Number(merged.step) : current.step,
+        timestamp,
+      }));
     }
   }, []);
 
@@ -2887,6 +2921,12 @@ export default function StuuShell() {
         clearFloatingWindowInteraction();
       }
     };
+  }, []);
+
+  useEffect(() => () => {
+    if (patternNotesDebounceRef.current) {
+      clearTimeout(patternNotesDebounceRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -3436,10 +3476,23 @@ export default function StuuShell() {
     }));
   }, [flowNodes]);
 
+  useEffect(() => {
+    engineProjectRef.current = state?.project ?? FALLBACK_STATE.project;
+  }, [state?.project]);
+
   const playlist = state?.project?.playlist ?? FALLBACK_STATE.project.playlist;
   const mixer = state?.project?.mixer ?? FALLBACK_STATE.project.mixer;
   const masterMix = useMemo(() => normalizeMasterMix(state?.project?.master_mix), [state?.project?.master_mix]);
   const patterns = state?.project?.patterns ?? FALLBACK_STATE.project.patterns;
+  const patternsById = useMemo(() => {
+    const map = new Map();
+    for (const pattern of patterns) {
+      if (pattern?.id) {
+        map.set(pattern.id, pattern);
+      }
+    }
+    return map;
+  }, [patterns]);
   const playlistTrackMap = useMemo(() => {
     const map = new Map();
     for (const track of playlist) {
@@ -3535,17 +3588,12 @@ export default function StuuShell() {
     }
   }, [openTrackMenuId, arrangementTrackMap]);
 
-  const drumPatterns = useMemo(() => patterns.filter((pattern) => pattern.type === 'drum'), [patterns]);
   const resolvedActivePatternId = useMemo(() => {
-    if (drumPatterns.length === 0) {
+    if (!activePatternId || !patterns.some((pattern) => pattern.id === activePatternId)) {
       return null;
     }
-    if (activePatternId && drumPatterns.some((pattern) => pattern.id === activePatternId)) {
-      return activePatternId;
-    }
-    return drumPatterns[0].id;
-  }, [drumPatterns, activePatternId]);
-
+    return activePatternId;
+  }, [patterns, activePatternId]);
   const maxClipEnd = useMemo(() => {
     return arrangementTracks.reduce((maxEnd, track) => {
       const clips = Array.isArray(track.clips) ? track.clips : [];
@@ -3564,7 +3612,8 @@ export default function StuuShell() {
     Math.ceil((arrangementViewportWidth || 0) / barWidth) + 1,
   );
   const timelineBars = clamp(Math.max(dataEndBars, viewBars, minimumViewportBars), MIN_VISIBLE_BARS, MAX_TIMELINE_BARS);
-  const timelineWidth = timelineBars * barWidth;
+  const layoutBarWidthPx = Math.round(barWidth);
+  const timelineWidth = timelineBars * layoutBarWidthPx;
   const gridLineDensity = useMemo(() => resolveGridLineDensity(barWidth), [barWidth]);
   const timeSignature = useMemo(
     () => ({
@@ -3730,6 +3779,21 @@ export default function StuuShell() {
     }
     return Math.max(0, computeInterpolatedPlayheadBars(Date.now()));
   }, [computeInterpolatedPlayheadBars]);
+
+  const seekTransportToBars = useCallback((bars) => {
+    const nextBars = Math.max(0, Number(bars) || 0);
+    if (socketRef.current) {
+      socketRef.current.emit('transport:seek', { positionBars: nextBars });
+    }
+    const beatsPerBar = Number(timeSignature.numerator) || 4;
+    transportSnapshotRef.current = {
+      ...transportSnapshotRef.current,
+      positionBeats: nextBars * beatsPerBar,
+    };
+    metronomeClockRef.current.anchorBeats = nextBars * beatsPerBar;
+    metronomeClockRef.current.anchorMs = Date.now();
+  }, [timeSignature.numerator]);
+
   const metronomeNumerator = Number(timeSignature.numerator) || 4;
   const metronomeDenominator = Number(timeSignature.denominator) || 4;
   const ensureMetronomeAudioContext = useCallback(() => {
@@ -3944,13 +4008,12 @@ export default function StuuShell() {
   }, [state, transport]);
 
   const inspectorPattern = useMemo(() => {
-    if (inspector.type !== 'pattern' && inspector.type !== 'pattern-step') {
+    if (inspector.type !== 'pattern') {
       return null;
     }
     const patternId = inspector.patternId || resolvedActivePatternId;
     return patterns.find((pattern) => pattern.id === patternId) || null;
   }, [inspector, patterns, resolvedActivePatternId]);
-  const inspectorStepVelocityMap = useMemo(() => getStepVelocityMap(inspectorPattern), [inspectorPattern]);
 
   const inspectorTrack = useMemo(() => {
     if (inspector.type !== 'track' && inspector.type !== 'clip') {
@@ -3969,11 +4032,88 @@ export default function StuuShell() {
     if (inspector.type === 'track' || inspector.type === 'clip') {
       return inspector.trackId ?? null;
     }
-    if ((inspector.type === 'pattern' || inspector.type === 'pattern-step') && inspector.trackId) {
+    if (inspector.type === 'pattern' && inspector.trackId) {
       return inspector.trackId;
     }
     return null;
   }, [inspector]);
+  const patternEditorTrackId = useMemo(() => {
+    if (inspector.type === 'pattern' && Number.isInteger(Number(inspector.trackId)) && Number(inspector.trackId) > 0) {
+      return Number(inspector.trackId);
+    }
+    if (resolvedActivePatternId && Number.isInteger(Number(selectedTrackId)) && Number(selectedTrackId) > 0) {
+      return Number(selectedTrackId);
+    }
+    return null;
+  }, [inspector.type, inspector.trackId, resolvedActivePatternId, selectedTrackId]);
+  const getPatternForUi = useCallback((patternId) => {
+    if (!patternId) {
+      return null;
+    }
+    const base = patternsById.get(patternId);
+    if (!base) {
+      return null;
+    }
+    if (patternNotesDraft?.patternId === patternId) {
+      return { ...base, notes: patternNotesDraft.notes };
+    }
+    return base;
+  }, [patternsById, patternNotesDraft]);
+
+  const activePatternForEditor = useMemo(
+    () => getPatternForUi(resolvedActivePatternId),
+    [resolvedActivePatternId, getPatternForUi],
+  );
+
+  const pianoRollPattern = useMemo(
+    () => getPatternForUi(pianoRollTarget?.patternId),
+    [pianoRollTarget?.patternId, getPatternForUi],
+  );
+
+  const pianoRollNotes = useMemo(() => {
+    if (!pianoRollTarget?.patternId) {
+      return [];
+    }
+    if (patternNotesDraft?.patternId === pianoRollTarget.patternId) {
+      return patternNotesDraft.notes;
+    }
+    const pattern = patternsById.get(pianoRollTarget.patternId);
+    return Array.isArray(pattern?.notes) ? pattern.notes : [];
+  }, [pianoRollTarget, patternNotesDraft, patternsById]);
+
+  const getTransportSnapshot = useCallback(
+    () => transportSnapshotRef.current,
+    [],
+  );
+
+  usePatternPlayback({
+    enabled: activeTab === 'Edit' && connection === 'online',
+    getTransportSnapshot,
+    playlist,
+    patternsById,
+    patternNotesDraft,
+  });
+
+  const pianoRollPlayheadBars = useMemo(() => {
+    if (!pianoRollTarget || !pianoRollPattern) {
+      return null;
+    }
+    const dragBars = playheadDragBars;
+    const positionBars = dragBars != null && Number.isFinite(Number(dragBars))
+      ? Number(dragBars)
+      : (Number(transportSnapshotRef.current?.positionBars)
+        ?? Number(transport?.positionBars)
+        ?? 0);
+    const clipStart = Number(pianoRollTarget.clipStartBars) || 0;
+    const clipLength = Number(pianoRollTarget.clipLengthBars) || 1;
+    return resolvePatternBarAtPlayhead({
+      playlistBar: positionBars,
+      clipStartBars: clipStart,
+      clipLengthBars: clipLength,
+      patternLoopBars: buildPatternLoopBars(pianoRollPattern),
+    });
+  }, [pianoRollTarget, pianoRollPattern, transport?.positionBars, transport?.playing, playheadDragBars]);
+
   const existingTrackIds = useMemo(() => {
     return arrangementTracks.filter((track) => track.exists).map((track) => track.track_id);
   }, [arrangementTracks]);
@@ -4415,11 +4555,19 @@ export default function StuuShell() {
     });
   }, [appendSystemMessage]);
 
-  const emitMutation = useCallback((eventName, payload, onSuccess) => {
+  const emitMutation = useCallback((eventName, payload, onSuccess, onFailure) => {
+    const socket = socketRef.current;
+    if (!socket || connection !== 'online') {
+      appendSystemMessage(`Engine nicht verbunden — ${eventName} nicht gesendet.`);
+      if (onFailure) {
+        onFailure({ ok: false, error: 'offline' });
+      }
+      return;
+    }
     if (eventName === 'clip:resize' || eventName === 'clip:import-file' || eventName === 'clip:move') {
       console.log('[MUTATION_SEND]', eventName, payload);
     }
-    socketRef.current?.emit(eventName, payload, (result) => {
+    socket.emit(eventName, payload, (result) => {
       if (eventName === 'clip:resize' || eventName === 'clip:import-file' || eventName === 'clip:move') {
         console.log('[MUTATION_RESULT]', eventName, result);
       }
@@ -4429,9 +4577,53 @@ export default function StuuShell() {
         }
         return;
       }
+      if (onFailure) {
+        onFailure(result);
+      }
       appendSystemMessage(`Fehler (${eventName}): ${result?.error || 'Unbekannter Fehler'}`);
     });
-  }, [appendSystemMessage]);
+  }, [appendSystemMessage, connection]);
+
+  const deleteTimelineClip = useCallback((trackId, clipId, options = {}) => {
+    const resolvedTrackId = Number(trackId);
+    const resolvedClipId = String(clipId ?? '').trim();
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !resolvedClipId) {
+      return;
+    }
+    const deletedClipKey = getClipSelectionKey(resolvedTrackId, resolvedClipId);
+    emitMutation(
+      'clip:delete',
+      { trackId: resolvedTrackId, clipId: resolvedClipId },
+      () => {
+        setClipQuickToolMenu(null);
+        setSelectedClipKeys((previous) => previous.filter((key) => key !== deletedClipKey));
+        setClipDisplayOverrides((previous) => {
+          if (!previous[deletedClipKey]) {
+            return previous;
+          }
+          const next = { ...previous };
+          delete next[deletedClipKey];
+          return next;
+        });
+        setClipDrafts((previous) => {
+          if (!previous[resolvedClipId]) {
+            return previous;
+          }
+          const next = { ...previous };
+          delete next[resolvedClipId];
+          return next;
+        });
+        if (
+          options.clearInspector !== false
+          && inspector.type !== 'project'
+          && Number(inspector.trackId) === resolvedTrackId
+          && String(inspector.clipId) === resolvedClipId
+        ) {
+          setInspector({ type: 'track', trackId: resolvedTrackId });
+        }
+      },
+    );
+  }, [emitMutation, inspector.clipId, inspector.trackId, inspector.type]);
 
   const songStructure = useMemo(() => {
     const raw = state?.project?.song_structure;
@@ -5357,6 +5549,18 @@ export default function StuuShell() {
     setPlayheadDragBars(null);
   }, []);
 
+  const seekPianoRollLocalBars = useCallback((localBars, { shiftKey = false } = {}) => {
+    if (!pianoRollTarget || !Number.isFinite(localBars)) {
+      return;
+    }
+    const clipStart = Number(pianoRollTarget.clipStartBars) || 0;
+    const snapped = shiftKey ? snapToGrid(localBars, snapStep) : localBars;
+    const nextBars = Number(clamp(clipStart + snapped, 0, MAX_TIMELINE_BARS).toFixed(6));
+    playheadDragBarsRef.current = nextBars;
+    setPlayheadDragBars(nextBars);
+    scheduleTransportSeek(nextBars);
+  }, [pianoRollTarget, snapStep, scheduleTransportSeek]);
+
   useEffect(() => {
     if (viewBars < minimumViewportBars) {
       setViewBars(minimumViewportBars);
@@ -5456,6 +5660,8 @@ export default function StuuShell() {
         }
         scrollRefRetries = 0;
         applyPlayheadToScrollEl(scrollElement);
+        const pulseBars = getCurrentTransportBars();
+        syncPianoRollClipBarPulses(pulseBars);
       }
       if (activeTab === 'Edit' || activeTab === 'Mix') {
         applyMixOverviewPlayhead();
@@ -5470,7 +5676,7 @@ export default function StuuShell() {
         playheadAnimationFrameRef.current = null;
       }
     };
-  }, [activeTab, state?.playing, applyPlayheadToScrollEl, applyMixOverviewPlayhead]);
+  }, [activeTab, state?.playing, applyPlayheadToScrollEl, applyMixOverviewPlayhead, getCurrentTransportBars]);
 
   useEffect(() => {
     const selectedProjectFile = typeof state?.selectedProjectFile === 'string'
@@ -5658,8 +5864,10 @@ export default function StuuShell() {
     const clipKey = isNonEmptyString(clip?.id) ? getClipSelectionKey(trackId, clip.id) : null;
     const displayOverride = clipKey ? clipDisplayOverrides[clipKey] : null;
     const baseClip = displayOverride ? { ...clip, ...displayOverride } : clip;
-    const draft = clipDrafts[clip.id];
-    if (!draft || draft.trackId !== trackId) {
+    const draft = clipDrafts[String(clip?.id ?? '')];
+    const skipMoveDraft = clipInteraction?.mode === 'move'
+      && String(clipInteraction.clipId) === String(clip?.id ?? '');
+    if (!draft || skipMoveDraft || Number(draft.trackId) !== Number(trackId)) {
       return baseClip;
     }
     return {
@@ -5667,7 +5875,7 @@ export default function StuuShell() {
       start: draft.start,
       length: draft.length,
     };
-  }, [clipDrafts, clipDisplayOverrides]);
+  }, [clipDrafts, clipDisplayOverrides, clipInteraction]);
 
   const getClipEntriesForTools = useCallback(() => {
     const entries = [];
@@ -6943,6 +7151,7 @@ export default function StuuShell() {
     }
     if (windowId === 'importTrackRename') {
       resolveImportTrackRenamePrompt({ apply: false, trackName: '' });
+      return;
     }
   }
 
@@ -7063,29 +7272,13 @@ export default function StuuShell() {
     if (!Number.isInteger(resolvedTrackId) || resolvedTrackId < 0) {
       return;
     }
-    const socket = socketRef.current;
-    if (!socket) {
-      return;
-    }
-
-    let receivedAck = false;
-    const timeoutId = window.setTimeout(() => {
-      if (receivedAck) {
-        return;
-      }
-      appendSystemMessage('Track-Einfuegen wurde nicht bestaetigt. Bitte Engine-Prozess neu starten.');
-    }, 900);
-
-    socket.emit('track:insert', { afterTrackId: resolvedTrackId }, (result) => {
-      receivedAck = true;
-      window.clearTimeout(timeoutId);
-      if (!result?.ok) {
-        appendSystemMessage(`Fehler (track:insert): ${result?.error || 'Unbekannter Fehler'}`);
-        return;
-      }
+    emitMutation('track:insert', { afterTrackId: resolvedTrackId }, (result) => {
       const nextTrackId = Number(result?.trackId);
       if (Number.isInteger(nextTrackId) && nextTrackId > 0) {
         setInspector({ type: 'track', trackId: nextTrackId });
+      }
+      if (result?.warning) {
+        appendSystemMessage(`Track eingefuegt (Native-Sync: ${result.warning})`);
       }
     });
   }
@@ -7765,23 +7958,364 @@ export default function StuuShell() {
     }, 280);
   }
 
-  function createDrumPattern(onCreated) {
+  function getTrackSoundLabel(trackId) {
+    const tid = Number(trackId);
+    if (!Number.isInteger(tid) || tid <= 0) {
+      return '';
+    }
+    const track = playlistTrackMap.get(tid);
+    const sample = track?.track_sound ?? track?.trackSound;
+    if (sample?.kind === 'sample') {
+      const name = sample.source_name ?? sample.sourceName;
+      if (isNonEmptyString(name)) {
+        return name.trim();
+      }
+      const path = sample.source_path ?? sample.sourcePath;
+      if (isNonEmptyString(path)) {
+        return path.split(/[/\\]/).pop() || path;
+      }
+    }
+    const instrument = vstNodes.find((node) => Number(node?.track_id ?? node?.trackId) === tid);
+    if (instrument) {
+      return instrument.name || instrument.plugin || 'Generator';
+    }
+    return '';
+  }
+
+  function applyTrackSampleSound(trackId, sourcePath, sourceName) {
+    const resolvedTrackId = Number(trackId);
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0 || !isNonEmptyString(sourcePath)) {
+      return;
+    }
+    emitMutation('track:set-sound', {
+      trackId: resolvedTrackId,
+      kind: 'sample',
+      source_path: sourcePath.trim(),
+      ...(isNonEmptyString(sourceName) ? { source_name: sourceName.trim() } : {}),
+    }, () => {
+      appendSystemMessage(`Sample auf Track ${resolvedTrackId} gesetzt.`);
+    });
+  }
+
+  function buildPatternLoopBars(pattern) {
+    return patternLengthToBars(pattern);
+  }
+
+  const emitTrackPreviewNote = useCallback((trackId, { pitch, on, place }, onAck) => {
+    const tid = Number(trackId);
+    const pitchValue = Number(pitch);
+    const roundedPitch = Number.isFinite(pitchValue) ? Math.round(pitchValue) : 60;
+    const noteOn = Boolean(on);
+    const browserDurationMs = place
+      ? TRACK_PREVIEW_BROWSER_PLACEMENT_MS
+      : TRACK_PREVIEW_BROWSER_KEY_MS;
+    const logPreview = (path, extra = {}) => {
+      if (process.env.NODE_ENV !== 'development') {
+        return;
+      }
+      console.log('[piano-preview]', {
+        trackId: Number.isInteger(tid) && tid > 0 ? tid : null,
+        pitch: roundedPitch,
+        on: noteOn,
+        path,
+        audioDeviceReady: Boolean(engineDiagnostics?.audioDeviceReady),
+        ...extra,
+      });
+    };
+    const playBrowserLayer = () => {
+      if (noteOn) {
+        primeBrowserPreviewAudio();
+        playBrowserPreviewNote(roundedPitch, { on: true, velocity: 100, durationMs: browserDurationMs });
+        return;
+      }
+      playBrowserPreviewNote(roundedPitch, { on: false });
+    };
+    const finishAck = (result) => {
+      if (typeof onAck === 'function') {
+        onAck(result);
+      }
+    };
+
+    playBrowserLayer();
+    logPreview('browser');
+
+    const socket = socketRef.current;
+    const canNativePreview = Boolean(
+      socket
+      && connection === 'online'
+      && Number.isInteger(tid)
+      && tid > 0
+      && state?.nativeTransport === true
+      && isNativeAudioPreviewReady(engineDiagnostics),
+    );
+    if (!canNativePreview) {
+      const reason = !socket || connection !== 'online'
+        ? 'engine offline'
+        : (!Number.isInteger(tid) || tid <= 0)
+          ? 'track_id missing'
+          : (state?.nativeTransport !== true)
+            ? 'native transport offline'
+            : 'audio device not ready';
+      logPreview('browser-only', { reason });
+      finishAck({ ok: true, fallback: true, reason });
+      return;
+    }
+
+    socket.emit('track:preview-note', {
+      track_id: tid,
+      pitch: roundedPitch,
+      velocity: 100,
+      on: noteOn,
+    }, (result) => {
+      if (!result || result.ok === false) {
+        logPreview('browser+native-failed', { error: result?.error || 'native error' });
+        finishAck({ ok: true, fallback: true, reason: result?.error || 'native error' });
+        return;
+      }
+      logPreview('browser+native');
+      finishAck(result);
+    });
+  }, [connection, engineDiagnostics, state?.nativeTransport]);
+
+  const handlePianoRollPreviewNote = useCallback(({ pitch, on, place }) => {
+    const trackId = resolvePianoRollPreviewTrackId(
+      pianoRollTarget,
+      [...playlistTrackMap.values()],
+      selectedTrackId,
+    );
+    if (trackId != null) {
+      resolvePreviewMode(trackId, {
+        vstNodes,
+        playlistTracks: [...playlistTrackMap.values()],
+      });
+    }
+    const emitPreview = (payload, ack) => emitTrackPreviewNote(trackId ?? 0, {
+      ...payload,
+      place: Boolean(payload?.place),
+    }, ack);
+    if (place) {
+      if (!pianoPlacementPreviewRef.current) {
+        pianoPlacementPreviewRef.current = createPlacementPreviewEmitter(emitPreview);
+      }
+      pianoPlacementPreviewRef.current(pitch);
+      return;
+    }
+    if (!pianoPreviewEmitRef.current) {
+      pianoPreviewEmitRef.current = createThrottledPreviewEmitter((payload) => emitPreview(payload));
+    }
+    pianoPreviewEmitRef.current({ pitch, on });
+  }, [pianoRollTarget, selectedTrackId, vstNodes, playlistTrackMap, emitTrackPreviewNote]);
+
+  useEffect(() => {
+    pianoPreviewEmitRef.current = null;
+    pianoPlacementPreviewRef.current = null;
+  }, [pianoRollTarget?.trackId]);
+
+  function closePianoRoll() {
+    pianoPreviewEmitRef.current = null;
+    pianoPlacementPreviewRef.current = null;
+    if (patternNotesDebounceRef.current) {
+      clearTimeout(patternNotesDebounceRef.current);
+      patternNotesDebounceRef.current = null;
+    }
+    const draft = patternNotesDraft;
+    const target = pianoRollTarget;
+    if (draft?.patternId && target?.patternId === draft.patternId) {
+      emitMutation('pattern:set-notes', { patternId: draft.patternId, notes: draft.notes });
+    }
+    setPatternNotesDraft(null);
+    setPianoRollTarget(null);
+  }
+
+  function onPatternNotesChange(notes) {
+    const patternId = pianoRollTarget?.patternId || resolvedActivePatternId;
+    if (!patternId) {
+      return;
+    }
+    setPatternNotesDraft({ patternId, notes });
+    if (patternNotesDebounceRef.current) {
+      clearTimeout(patternNotesDebounceRef.current);
+    }
+    patternNotesDebounceRef.current = setTimeout(() => {
+      patternNotesDebounceRef.current = null;
+      emitMutation('pattern:set-notes', { patternId, notes });
+    }, 300);
+  }
+
+  function openPianoRollForPattern(patternId, options = {}) {
+    if (!patternId || !patternsById.has(patternId)) {
+      return;
+    }
+    const pattern = patternsById.get(patternId);
+    const loopBars = buildPatternLoopBars(pattern);
+    const clipLength = options.clipLengthBars != null ? Number(options.clipLengthBars) : null;
+    const resolvedBars = clipLength != null
+      ? Math.max(loopBars, Math.round(clipLength) || loopBars)
+      : loopBars;
+    const notes = Array.isArray(pattern?.notes)
+      ? pattern.notes.map((note) => ({ ...note }))
+      : [];
+    setPatternNotesDraft({ patternId, notes });
+    setActivePatternId(patternId);
+    setPatternEditorDockOpen(true);
+    const resolvedTrackId = resolvePianoRollPreviewTrackId(
+      { patternId, trackId: options.trackId },
+      [...playlistTrackMap.values()],
+      selectedTrackId,
+    );
+    setPianoRollTarget({
+      patternId,
+      trackId: resolvedTrackId,
+      clipId: options.clipId != null ? String(options.clipId) : null,
+      clipStartBars: Number(options.clipStartBars) || 0,
+      clipLengthBars: resolvedBars,
+      patternLoopBars: loopBars,
+    });
+  }
+
+  function openPatternSoundChooser(trackId) {
+    const resolvedTrackId = Number(trackId);
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0) {
+      return;
+    }
+    patternSoundTrackIdRef.current = resolvedTrackId;
+    setPatternSoundChooserOpen(true);
+  }
+
+  async function handlePatternSoundDrop(event, trackId) {
+    event.preventDefault();
+    event.stopPropagation();
+    const resolvedTrackId = Number(trackId);
+    if (!Number.isInteger(resolvedTrackId) || resolvedTrackId <= 0) {
+      return;
+    }
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) {
+      return;
+    }
+    const imported = resolveImportedFile(file);
+    if (!imported || imported.type !== 'audio') {
+      appendSystemMessage('Nur Audio-Dateien koennen als Sound auf das Pattern gezogen werden.');
+      return;
+    }
+    try {
+      const uploadResult = await uploadFileToEngine(file);
+      const path = uploadResult?.path;
+      if (!path) {
+        appendSystemMessage('Upload fehlgeschlagen.');
+        return;
+      }
+      applyTrackSampleSound(resolvedTrackId, path, imported.sourceName || file.name);
+    } catch (error) {
+      appendSystemMessage(`Sound-Import fehlgeschlagen: ${error instanceof Error ? error.message : 'unknown'}`);
+    }
+  }
+
+  function handlePatternSoundFileInputChange(event) {
+    const trackId = Number(patternSoundTrackIdRef.current);
+    patternSoundTrackIdRef.current = null;
+    setPatternSoundChooserOpen(false);
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !Number.isInteger(trackId) || trackId <= 0) {
+      return;
+    }
+    const imported = resolveImportedFile(file);
+    if (!imported || imported.type !== 'audio') {
+      appendSystemMessage('Nur Audio-Dateien werden als lokaler Sound unterstuetzt.');
+      return;
+    }
+    void (async () => {
+      try {
+        const uploadResult = await uploadFileToEngine(file);
+        if (!uploadResult?.path) {
+          appendSystemMessage('Upload fehlgeschlagen.');
+          return;
+        }
+        applyTrackSampleSound(trackId, uploadResult.path, imported.sourceName || file.name);
+      } catch (error) {
+        appendSystemMessage(`Sound-Import fehlgeschlagen: ${error instanceof Error ? error.message : 'unknown'}`);
+      }
+    })();
+  }
+
+  function triggerImportMidiForPattern(patternId) {
+    if (!isNonEmptyString(patternId)) {
+      return;
+    }
+    patternMidiImportTargetRef.current = { patternId: patternId.trim() };
+    patternMidiImportRef.current?.click();
+  }
+
+  async function handlePatternMidiImportChange(event) {
+    const target = patternMidiImportTargetRef.current;
+    patternMidiImportTargetRef.current = null;
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!target?.patternId || !file) {
+      return;
+    }
+    const patternId = target.patternId;
+    const pattern = patternsById.get(patternId);
+    const existingCount = Array.isArray(pattern?.notes) ? pattern.notes.length : 0;
+    try {
+      const buffer = await readFileAsArrayBuffer(file);
+      if (!buffer) {
+        appendSystemMessage('MIDI-Datei konnte nicht gelesen werden.');
+        return;
+      }
+      const bpm = Number(state?.project?.bpm) || 128;
+      const notes = await parseMidiFileToPatternNotes(buffer, { bpm, timeSignature });
+      if (notes.length === 0) {
+        appendSystemMessage('Keine Noten in der MIDI-Datei gefunden.');
+        return;
+      }
+      if (existingCount > 0) {
+        const ok = window.confirm('Bestehende Pattern-Noten ersetzen?');
+        if (!ok) {
+          return;
+        }
+      }
+      emitMutation('pattern:set-notes', { patternId, notes }, () => {
+        appendSystemMessage(`${notes.length} Noten in Pattern importiert.`);
+        setActivePatternId(patternId);
+        setPatternEditorDockOpen(true);
+        setPatternNotesDraft((previous) => {
+          if (previous?.patternId === patternId || pianoRollTarget?.patternId === patternId) {
+            return { patternId, notes: notes.map((note) => ({ ...note })) };
+          }
+          return previous;
+        });
+      });
+    } catch (error) {
+      appendSystemMessage(`MIDI-Import fehlgeschlagen: ${error instanceof Error ? error.message : 'unknown'}`);
+    }
+  }
+
+  function createMidiPattern(onCreated, trackIdForInspector = null) {
     emitMutation(
       'pattern:create',
       {
-        type: 'drum',
+        type: 'midi',
+        name: getNextPatternName(patterns),
+        color: getNextPatternColor(patterns),
         length: 16,
         swing: 0,
-        steps: [
-          { lane: 'Kick', index: 0, velocity: 1 },
-          { lane: 'Snare', index: 4, velocity: 0.9 },
-        ],
+        notes: [],
       },
       (result) => {
         const nextPatternId = result?.pattern?.id;
         if (nextPatternId) {
           setActivePatternId(nextPatternId);
-          setInspector({ type: 'pattern', patternId: nextPatternId });
+          const resolvedTrackId = Number(trackIdForInspector);
+          setInspector({
+            type: 'pattern',
+            patternId: nextPatternId,
+            ...(Number.isInteger(resolvedTrackId) && resolvedTrackId > 0
+              ? { trackId: resolvedTrackId }
+              : {}),
+          });
+          setPatternEditorDockOpen(true);
           if (typeof onCreated === 'function') {
             onCreated(nextPatternId);
           }
@@ -7792,11 +8326,6 @@ export default function StuuShell() {
 
   function updatePatternMeta(patternId, patch) {
     emitMutation('pattern:update', { patternId, ...patch });
-  }
-
-  function setPatternStepVelocity(patternId, lane, index, velocity) {
-    emitMutation('pattern:update-step', { patternId, lane, index, velocity });
-    setInspector({ type: 'pattern-step', patternId, lane, index });
   }
 
   function createClip(trackId, options = {}) {
@@ -7823,15 +8352,15 @@ export default function StuuShell() {
     });
   }
 
-  function createPatternAndClipOnTrackOne() {
+  function createPatternAndClipOnTrack(trackId) {
     const clipStart = snapToGrid(Math.max(0, getCurrentTransportBars()), snapStep);
-    createDrumPattern((patternId) => {
-      createClip(1, {
+    createMidiPattern((patternId) => {
+      createClip(trackId, {
         patternId,
         start: clipStart,
         length: 8,
       });
-    });
+    }, trackId);
   }
 
   async function importFilesToTrack(trackId, fileList, options = {}) {
@@ -8101,13 +8630,7 @@ export default function StuuShell() {
     setClipQuickToolMenu(null);
     setOpenTrackPluginPicker(null);
     if (actionId === 'pattern') {
-      if (trackId === 1) {
-        createPatternAndClipOnTrackOne();
-        return;
-      }
-      createClip(trackId, {
-        start: snapToGrid(Math.max(0, getCurrentTransportBars()), snapStep),
-      });
+      createPatternAndClipOnTrack(trackId);
       return;
     }
 
@@ -8141,6 +8664,8 @@ export default function StuuShell() {
     trackId,
     clipId,
     clipType,
+    clipKind,
+    patternId,
     clipLabel,
     clipName,
     clipColor,
@@ -8173,6 +8698,8 @@ export default function StuuShell() {
         trackId: resolvedTrackId,
         clipId: resolvedClipId,
         clipType: typeof clipType === 'string' ? clipType : 'unknown',
+        clipKind: typeof clipKind === 'string' ? clipKind : (typeof clipType === 'string' ? clipType : 'unknown'),
+        patternId: isNonEmptyString(patternId) ? patternId.trim() : '',
         clipLabel: typeof clipLabel === 'string' ? clipLabel : '',
         clipName: typeof clipName === 'string' ? clipName : '',
         clipColor: normalizeClipCustomColor(clipColor) || '',
@@ -8205,6 +8732,24 @@ export default function StuuShell() {
 
     if (actionId === 'fit_to_tempo') {
       appendSystemMessage(`Fit to Tempo fuer ${clipDescriptor} ist noch nicht implementiert.`);
+      return;
+    }
+
+    if (actionId === CLIP_QUICK_TOOL_ACTIONS.IMPORT_MIDI) {
+      const patternId = isNonEmptyString(menu.patternId)
+        ? menu.patternId.trim()
+        : (() => {
+          const track = playlistTrackMap.get(resolvedTrackId);
+          const clip = Array.isArray(track?.clips)
+            ? track.clips.find((entry) => String(entry.id).trim() === resolvedClipId)
+            : null;
+          return getPatternId(clip) || '';
+        })();
+      if (!patternId) {
+        appendSystemMessage('Import MIDI ist nur fuer Pattern-Clips verfuegbar.');
+        return;
+      }
+      triggerImportMidiForPattern(patternId);
       return;
     }
 
@@ -8303,13 +8848,17 @@ export default function StuuShell() {
     const patternId = getPatternId(clip);
     if (patternId) {
       setInspector({ type: 'pattern', patternId, trackId, clipId: clip.id });
-      if (drumPatterns.some((pattern) => pattern.id === patternId)) {
-        setActivePatternId(patternId);
-      }
+      setActivePatternId(patternId);
+      setPatternEditorDockOpen(true);
     } else {
       setInspector({ type: 'clip', trackId, clipId: clip.id });
     }
     if (mode === 'move') {
+      clipDragElRef.current = event.currentTarget?.closest?.('.timeline-clip') ?? null;
+      clipMoveDraftRef.current = null;
+      clipMovePreviewSigRef.current = '';
+      clipDragTargetTrackRef.current = null;
+      setClipMovePreview(null);
       setClipInteraction({
         mode: 'move',
         trackId,
@@ -8423,7 +8972,9 @@ export default function StuuShell() {
       beginFadeHandleInteraction(which, 'length', event, trackId, clip);
       return;
     }
-    if (event.target.closest('.clip-corner-tools, .clip-corner-button')) {
+    if (event.target.closest(
+      '.clip-corner-tools, .clip-corner-button, .pattern-clip-body-icon-btn, .pattern-clip-body-add-sound, .pattern-clip-resize-edge',
+    )) {
       return;
     }
     const clipType = (clip?.type || clip?.clip_type || '').toString().toLowerCase();
@@ -8705,98 +9256,256 @@ export default function StuuShell() {
       return;
     }
 
+    function scheduleResizeDraftCommit(clipId, draft) {
+      clipResizePendingRef.current = { clipId: String(clipId), draft };
+      if (clipResizeDraftRafRef.current !== null) {
+        return;
+      }
+      clipResizeDraftRafRef.current = window.requestAnimationFrame(() => {
+        clipResizeDraftRafRef.current = null;
+        const pending = clipResizePendingRef.current;
+        if (!pending) {
+          return;
+        }
+        setClipDrafts((previous) => ({
+          ...previous,
+          [pending.clipId]: pending.draft,
+        }));
+      });
+    }
+
     function handlePointerMove(event) {
-      const deltaBars = snapToGrid((event.clientX - clipInteraction.originX) / barWidthRef.current, snapStep);
-      setClipDrafts((previous) => {
-        const next = { ...previous };
-        if (clipInteraction.mode === 'move') {
-          const draft = buildClipMoveDraft({
-            event,
-            originX: clipInteraction.originX,
-            originTrackId: clipInteraction.trackId,
-            clipStartBars: clipInteraction.start,
-            clipLengthBars: clipInteraction.length,
-            barWidthPx: barWidthRef.current,
-            snapStep,
+      if (clipInteraction.mode === 'move') {
+        const draft = buildClipMoveDraft({
+          event,
+          originX: clipInteraction.originX,
+          originTrackId: clipInteraction.trackId,
+          clipStartBars: clipInteraction.start,
+          clipLengthBars: clipInteraction.length,
+          barWidthPx: barWidthRef.current,
+          snapStep,
+          arrangementTracks,
+          getGridPointerContext,
+        });
+        if (!draft) {
+          return;
+        }
+        clipMoveDraftRef.current = draft;
+        if (clipMoveRafRef.current !== null) {
+          return;
+        }
+        clipMoveRafRef.current = window.requestAnimationFrame(() => {
+          clipMoveRafRef.current = null;
+          const liveDraft = clipMoveDraftRef.current;
+          if (!liveDraft) {
+            return;
+          }
+          const rowHeightPx = showTrackNodesRef.current ? 150 : 104;
+          applyClipMoveDragTransform(
+            clipDragElRef.current,
+            liveDraft,
+            clipInteraction,
+            barWidthRef.current,
             arrangementTracks,
-            getGridPointerContext,
-          });
-          if (draft) {
-            next[clipInteraction.clipId] = draft;
+            rowHeightPx,
+          );
+          const previewSig = `${liveDraft.trackId}:${liveDraft.start}`;
+          if (previewSig !== clipMovePreviewSigRef.current) {
+            clipMovePreviewSigRef.current = previewSig;
+            setClipMovePreview(liveDraft);
           }
-        } else if (clipInteraction.mode === 'resize-left') {
-          const bpm = Number(clipInteraction.bpm) || 128;
-          let nextStart = snapToGrid(clipInteraction.start + deltaBars, snapStep);
-          let nextLength = snapToGrid(clipInteraction.length - deltaBars, snapStep);
-          let nextTrim = clipInteraction.trimStart + barsToSeconds(deltaBars, bpm, timeSignature);
-          nextStart = Math.max(0, nextStart);
-          nextLength = Math.max(snapStep, nextLength);
-          nextTrim = Math.max(0, nextTrim);
-          const sourceDur = clipInteraction.sourceDurationSeconds;
-          if (sourceDur != null && Number.isFinite(sourceDur)) {
-            let lenSec = (Math.max(snapStep, nextLength) * BEATS_PER_BAR * 60) / bpm;
-            const maxTrim = Math.max(0, sourceDur - lenSec);
-            if (nextTrim > maxTrim) {
-              nextTrim = maxTrim;
-            }
-            lenSec = (Math.max(snapStep, nextLength) * BEATS_PER_BAR * 60) / bpm;
-            if (nextTrim + lenSec > sourceDur + 1e-6) {
-              const minLenSec = (snapStep * BEATS_PER_BAR * 60) / bpm;
-              const targetLenSec = Math.max(minLenSec, sourceDur - nextTrim);
-              const targetLenBars = (targetLenSec * bpm) / (60 * BEATS_PER_BAR);
-              nextLength = Math.max(snapStep, snapToGrid(targetLenBars, snapStep));
-            }
+          const destTrackId = Number(liveDraft?.trackId);
+          if (Number.isInteger(destTrackId) && destTrackId > 0 && clipDragTargetTrackRef.current !== destTrackId) {
+            clipDragTargetTrackRef.current = destTrackId;
+            setDropTargetTrackId(destTrackId);
           }
-          next[clipInteraction.clipId] = {
-            trackId: clipInteraction.trackId,
-            start: nextStart,
-            length: nextLength,
-            trimStart: nextTrim,
-          };
+        });
+        return;
+      }
+
+      const deltaBars = snapToGrid((event.clientX - clipInteraction.originX) / barWidthRef.current, snapStep);
+      const clipId = String(clipInteraction.clipId ?? '');
+      if (clipInteraction.mode === 'resize-left') {
+        const bpm = Number(clipInteraction.bpm) || 128;
+        let nextStart = snapToGrid(clipInteraction.start + deltaBars, snapStep);
+        let nextLength = snapToGrid(clipInteraction.length - deltaBars, snapStep);
+        let nextTrim = clipInteraction.trimStart + barsToSeconds(deltaBars, bpm, timeSignature);
+        nextStart = Math.max(0, nextStart);
+        nextLength = Math.max(snapStep, nextLength);
+        nextTrim = Math.max(0, nextTrim);
+        const sourceDur = clipInteraction.sourceDurationSeconds;
+        if (sourceDur != null && Number.isFinite(sourceDur)) {
+          let lenSec = (Math.max(snapStep, nextLength) * BEATS_PER_BAR * 60) / bpm;
+          const maxTrim = Math.max(0, sourceDur - lenSec);
+          if (nextTrim > maxTrim) {
+            nextTrim = maxTrim;
+          }
+          lenSec = (Math.max(snapStep, nextLength) * BEATS_PER_BAR * 60) / bpm;
+          if (nextTrim + lenSec > sourceDur + 1e-6) {
+            const minLenSec = (snapStep * BEATS_PER_BAR * 60) / bpm;
+            const targetLenSec = Math.max(minLenSec, sourceDur - nextTrim);
+            const targetLenBars = (targetLenSec * bpm) / (60 * BEATS_PER_BAR);
+            nextLength = Math.max(snapStep, snapToGrid(targetLenBars, snapStep));
+          }
+        }
+        scheduleResizeDraftCommit(clipId, {
+          trackId: clipInteraction.trackId,
+          start: nextStart,
+          length: nextLength,
+          trimStart: nextTrim,
+        });
+      } else {
+        scheduleResizeDraftCommit(clipId, {
+          trackId: clipInteraction.trackId,
+          start: clipInteraction.start,
+          length: Math.max(snapStep, snapToGrid(clipInteraction.length + deltaBars, snapStep)),
+        });
+      }
+    }
+
+    function clearClipMoveOptimisticOverride(destTrackId, clipId) {
+      const key = getClipSelectionKey(destTrackId, clipId);
+      setClipDisplayOverrides((previous) => {
+        const entry = previous[key];
+        if (!entry || (!Object.prototype.hasOwnProperty.call(entry, 'start') && !Object.prototype.hasOwnProperty.call(entry, 'length'))) {
+          return previous;
+        }
+        const next = { ...previous };
+        const nextEntry = { ...next[key] };
+        delete nextEntry.start;
+        delete nextEntry.length;
+        if (Object.keys(nextEntry).length === 0) {
+          delete next[key];
         } else {
-          next[clipInteraction.clipId] = {
-            trackId: clipInteraction.trackId,
-            start: clipInteraction.start,
-            length: Math.max(snapStep, snapToGrid(clipInteraction.length + deltaBars, snapStep)),
-          };
+          next[key] = nextEntry;
         }
         return next;
       });
     }
 
-    function handlePointerUp() {
-      const draft = clipDraftsRef.current[clipInteraction.clipId];
-      if (draft) {
-        if (clipInteraction.mode === 'move') {
-          const payload = {
-            trackId: clipInteraction.trackId,
-            clipId: clipInteraction.clipId,
-            start: draft.start,
-          };
-          if (Number(draft.trackId) !== Number(clipInteraction.trackId)) {
-            payload.toTrackId = draft.trackId;
+    function clearClipMoveDragVisuals() {
+      if (clipMoveRafRef.current !== null) {
+        window.cancelAnimationFrame(clipMoveRafRef.current);
+        clipMoveRafRef.current = null;
+      }
+      clearClipMoveDragTransform(clipDragElRef.current);
+      clipDragElRef.current = null;
+      clipMoveDraftRef.current = null;
+      clipMovePreviewSigRef.current = '';
+      setClipMovePreview(null);
+      setDropTargetTrackId(null);
+      clipDragTargetTrackRef.current = null;
+    }
+
+    function applyClipMoveOptimisticOverride(destTrackId, sourceTrackId, clipId, draft) {
+      const destKey = getClipSelectionKey(destTrackId, clipId);
+      const sourceKey = getClipSelectionKey(sourceTrackId, clipId);
+      setClipDisplayOverrides((previous) => {
+        const next = { ...previous };
+        if (destKey !== sourceKey && next[sourceKey]) {
+          const sourceEntry = { ...next[sourceKey] };
+          delete sourceEntry.start;
+          delete sourceEntry.length;
+          if (Object.keys(sourceEntry).length === 0) {
+            delete next[sourceKey];
+          } else {
+            next[sourceKey] = sourceEntry;
           }
-          emitMutation('clip:move', payload);
-        } else if (clipInteraction.mode === 'resize-left') {
+        }
+        next[destKey] = {
+          ...(next[destKey] || {}),
+          start: draft.start,
+        };
+        return next;
+      });
+    }
+
+    function handlePointerUp() {
+      const clipId = String(clipInteraction.clipId ?? '');
+      if (clipInteraction.mode === 'move') {
+        const draft = clipMoveDraftRef.current;
+        const dragEl = clipDragElRef.current;
+        if (clipMoveRafRef.current !== null) {
+          window.cancelAnimationFrame(clipMoveRafRef.current);
+          clipMoveRafRef.current = null;
+        }
+        clipMoveDraftRef.current = null;
+        clipMovePreviewSigRef.current = '';
+        setClipMovePreview(null);
+        setDropTargetTrackId(null);
+        clipDragTargetTrackRef.current = null;
+        if (draft) {
+          const destTrackId = Number(draft.trackId);
+          const sourceTrackId = Number(clipInteraction.trackId);
+          applyClipMoveOptimisticOverride(destTrackId, sourceTrackId, clipId, draft);
+          const payload = {
+            trackId: sourceTrackId,
+            clipId,
+            start: draft.start,
+            grid_step: snapStep,
+          };
+          if (destTrackId !== sourceTrackId) {
+            payload.toTrackId = destTrackId;
+          }
+          const playlistRevert = JSON.parse(JSON.stringify(
+            Array.isArray(engineProjectRef.current?.playlist)
+              ? engineProjectRef.current.playlist
+              : [],
+          ));
+          setState((prev) => {
+            const project = prev?.project ?? FALLBACK_STATE.project;
+            return {
+              ...prev,
+              project: applyLocalClipMoveInProject(project, sourceTrackId, clipId, draft),
+            };
+          });
+          emitMutation('clip:move', payload, () => {
+            clearClipMoveOptimisticOverride(destTrackId, clipId);
+          }, () => {
+            setState((prev) => ({
+              ...prev,
+              project: {
+                ...(prev?.project ?? FALLBACK_STATE.project),
+                playlist: playlistRevert,
+              },
+            }));
+            clearClipMoveOptimisticOverride(destTrackId, clipId);
+          });
+        }
+        setClipInteraction(null);
+        window.requestAnimationFrame(() => {
+          clearClipMoveDragTransform(dragEl);
+          if (clipDragElRef.current === dragEl) {
+            clipDragElRef.current = null;
+          }
+        });
+        return;
+      }
+
+      const draft = clipDraftsRef.current[clipId];
+      if (draft) {
+        if (clipInteraction.mode === 'resize-left') {
           emitMutation('clip:resize', {
             trackId: clipInteraction.trackId,
             clipId: clipInteraction.clipId,
             length: draft.length,
             start: draft.start,
             trim_start_seconds: draft.trimStart,
+            grid_step: snapStep,
           });
         } else {
           emitMutation('clip:resize', {
             trackId: clipInteraction.trackId,
             clipId: clipInteraction.clipId,
             length: draft.length,
+            grid_step: snapStep,
           });
         }
       }
 
       setClipDrafts((previous) => {
         const next = { ...previous };
-        delete next[clipInteraction.clipId];
+        delete next[clipId];
         return next;
       });
       setClipInteraction(null);
@@ -9117,10 +9826,10 @@ export default function StuuShell() {
             {inspector.type === 'track' && `Track #${inspector.trackId}`}
             {inspector.type === 'clip' && `Clip ${inspector.clipId}`}
             {inspector.type === 'node' && `Node ${inspector.nodeId}`}
-            {(inspector.type === 'pattern' || inspector.type === 'pattern-step') && `Pattern ${inspectorPattern?.id || ''}`}
+            {inspector.type === 'pattern' && `Pattern ${inspectorPattern?.id || ''}`}
           </p>
 
-          {(inspector.type === 'pattern' || inspector.type === 'pattern-step') && inspectorPattern ? (
+          {inspector.type === 'pattern' && inspectorPattern ? (
             <div className="inspector-form">
               <label>
                 Pattern
@@ -9140,16 +9849,21 @@ export default function StuuShell() {
               </label>
 
               <label>
-                Laenge
+                Pattern-Laenge
                 <select
-                  value={inspectorPattern.length}
+                  value={patternLengthToBars(inspectorPattern) * PATTERN_STEPS_PER_BAR}
                   onChange={(event) => updatePatternMeta(inspectorPattern.id, { length: Number(event.target.value) })}
                 >
-                  {[8, 16, 32, 64].map((value) => (
-                    <option key={`length_${value}`} value={value}>
-                      {value}
-                    </option>
-                  ))}
+                  {[16, 32, 64, 128, 256, 512].map((steps) => {
+                    const bars = steps / PATTERN_STEPS_PER_BAR;
+                    return (
+                      <option key={`length_${steps}`} value={steps}>
+                        {bars}
+                        {' '}
+                        {bars === 1 ? 'Bar' : 'Bars'}
+                      </option>
+                    );
+                  })}
                 </select>
               </label>
 
@@ -9165,33 +9879,11 @@ export default function StuuShell() {
                 />
               </label>
 
-              {inspector.type === 'pattern-step' ? (
-                <div className="inspector-step-block">
-                  <p>
-                    Step {(inspector.index || 0) + 1} · {inspector.lane}
-                  </p>
-                  <div className="step-velocity-buttons">
-                    <button
-                      className={(inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) === 0 ? 'active' : ''}
-                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 0)}
-                    >
-                      Off
-                    </button>
-                    <button
-                      className={Math.abs((inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) - 0.55) < 0.05 ? 'active' : ''}
-                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 0.55)}
-                    >
-                      Soft
-                    </button>
-                    <button
-                      className={Math.abs((inspectorStepVelocityMap.get(`${inspector.lane}:${inspector.index}`) || 0) - 1) < 0.05 ? 'active' : ''}
-                      onClick={() => setPatternStepVelocity(inspectorPattern.id, inspector.lane, inspector.index, 1)}
-                    >
-                      Accent
-                    </button>
-                  </div>
-                </div>
-              ) : null}
+              <p className="muted inspector-pattern-hint">
+                {Array.isArray(inspectorPattern.notes) ? `${inspectorPattern.notes.length} notes` : '0 notes'}
+                {' · '}
+                Clip Tools → Import MIDI
+              </p>
             </div>
           ) : null}
 
@@ -9469,6 +10161,72 @@ export default function StuuShell() {
         className="import-file-input-hidden"
         onChange={handleTrackImportInputChange}
       />
+      <input
+        ref={patternMidiImportRef}
+        type="file"
+        accept=".mid,.midi"
+        className="import-file-input-hidden"
+        onChange={handlePatternMidiImportChange}
+      />
+      <input
+        ref={patternSoundFileInputRef}
+        type="file"
+        accept=".wav,.flac,.mp3,.ogg,.aac,.aiff,.aif"
+        className="import-file-input-hidden"
+        onChange={handlePatternSoundFileInputChange}
+      />
+      <PianoRollModal
+        open={Boolean(pianoRollTarget && pianoRollPattern)}
+        pattern={pianoRollPattern}
+        notes={pianoRollNotes}
+        clipLengthBars={pianoRollTarget?.clipLengthBars ?? 4}
+        patternLoopBars={pianoRollPattern ? buildPatternLoopBars(pianoRollPattern) : 1}
+        playlistViewBars={viewBars}
+        playheadBars={pianoRollPlayheadBars}
+        onSeekBars={seekPianoRollLocalBars}
+        onSeekEnd={clearMixOverviewPlayheadDrag}
+        soundLabel={pianoRollTarget?.trackId ? getTrackSoundLabel(pianoRollTarget.trackId) : ''}
+        snapMode={snapMode}
+        onSnapModeChange={setSnapMode}
+        trackId={pianoRollTarget?.trackId ?? null}
+        onPreviewNote={handlePianoRollPreviewNote}
+        onClose={closePianoRoll}
+        onNotesChange={onPatternNotesChange}
+        onPatternLengthChange={(lengthSteps) => {
+          const patternId = pianoRollTarget?.patternId;
+          if (patternId) {
+            updatePatternMeta(patternId, { length: lengthSteps });
+          }
+        }}
+      />
+      <PatternSoundChooserModal
+        open={patternSoundChooserOpen}
+        generators={availableGeneratorPlugins}
+        onClose={() => {
+          setPatternSoundChooserOpen(false);
+          patternSoundTrackIdRef.current = null;
+        }}
+        onPickLocalFile={() => {
+          patternSoundFileInputRef.current?.click();
+        }}
+        onPickGenerator={(pluginUid) => {
+          const trackId = Number(patternSoundTrackIdRef.current);
+          if (!Number.isInteger(trackId) || trackId <= 0) {
+            return;
+          }
+          setPatternSoundChooserOpen(false);
+          addVst({
+            trackId,
+            pluginUid,
+            slotKind: 'instrument',
+            onSuccess: () => {
+              patternSoundTrackIdRef.current = null;
+              appendSystemMessage(`Generator auf Track ${trackId} geladen.`);
+            },
+          });
+        }}
+        pluginLoadPending={pluginLoadPending}
+      />
       <div className={`stuu-grid ${activeTab === 'Edit' ? 'edit-focus' : ''}`}>
         <main className={`panel panel-main ${activeTab === 'Edit' ? 'edit-focus' : ''}`}>
           {showDawTopShell ? (
@@ -9559,6 +10317,18 @@ export default function StuuShell() {
                     >
                       <Redo2 size={14} aria-hidden="true" />
                     </button>
+                    {activeTab === 'Edit' ? (
+                      <button
+                        type="button"
+                        className={`daw-history-btn ${patternEditorDockOpen ? 'active' : ''}`}
+                        onClick={() => setPatternEditorDockOpen((open) => !open)}
+                        title="Pattern Editor"
+                        aria-label="Pattern Editor"
+                        aria-pressed={patternEditorDockOpen}
+                      >
+                        <Grid3x3 size={14} aria-hidden="true" />
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -9823,10 +10593,11 @@ export default function StuuShell() {
                         document.body,
                       )
                     : null}
+                  <div className={`edit-workspace ${patternEditorDockOpen && resolvedActivePatternId ? 'has-pattern-editor-dock' : ''}`}>
                   <div
                     className={`arrangement-layout edit-tool-${editTool}`}
                     style={{
-                      '--bar-width': `${barWidth}px`,
+                      '--bar-width': `${layoutBarWidthPx}px`,
                       '--track-row-height': `${showTrackNodes ? 150 : 104}px`,
                       '--grid-micro-divisions': String(gridLineDensity.microDivisions),
                       '--grid-micro-alpha': String(gridLineDensity.microAlpha),
@@ -10564,7 +11335,7 @@ export default function StuuShell() {
                             top: `${clipQuickToolMenu.y}px`,
                           }}
                         >
-                          {CLIP_QUICK_TOOL_MENU_ITEMS.map((item) => (
+                          {getClipQuickToolMenuItems(clipQuickToolMenu.clipKind).map((item) => (
                             (() => {
                               const ItemIcon = item.icon;
                               return (
@@ -10830,11 +11601,23 @@ export default function StuuShell() {
                               </div>
                             ))}
                           </div>
-                          <div className="timeline-ruler-bar-row">
+                          <div
+                            className="timeline-ruler-bar-row playlist-bar-grid-h"
+                            style={{ width: `${timelineWidth}px` }}
+                            aria-hidden="true"
+                          >
                             {Array.from({ length: timelineBars }, (_, index) => (
-                              <div key={`bar_${index + 1}`} className="timeline-ruler-cell">
+                              <span
+                                key={`bar_${index + 1}`}
+                                data-bar-index={index}
+                                className="timeline-ruler-tick"
+                                style={{
+                                  left: `${index * layoutBarWidthPx}px`,
+                                  width: `${layoutBarWidthPx}px`,
+                                }}
+                              >
                                 {index + 1}
-                              </div>
+                              </span>
                             ))}
                           </div>
                           <div className="timeline-playhead" />
@@ -10905,7 +11688,7 @@ export default function StuuShell() {
                             const clipsRaw = Array.isArray(track.clips) ? track.clips : [];
                             const moveDraft =
                               clipInteraction?.mode === 'move' && clipInteraction?.clipId
-                                ? clipDrafts?.[clipInteraction.clipId]
+                                ? clipMovePreview
                                 : null;
                             const crossMoveActive =
                               Boolean(moveDraft)
@@ -10935,7 +11718,7 @@ export default function StuuShell() {
                             return (
                               <div
                                 key={`lane_${track.track_id}`}
-                                className={`arrangement-grid-row ${isSelected ? 'active' : ''} ${isHovered ? 'hovered' : ''} ${track.mix?.mute ? 'track-muted' : ''} ${track.mix?.solo ? 'track-soloed' : ''} ${showTrackNodes ? 'track-chain-expanded' : 'track-chain-collapsed'} ${dropTargetTrackId === track.track_id ? 'drop-target' : ''}`}
+                                className={`arrangement-grid-row playlist-bar-grid-h ${isSelected ? 'active' : ''} ${isHovered ? 'hovered' : ''} ${track.mix?.mute ? 'track-muted' : ''} ${track.mix?.solo ? 'track-soloed' : ''} ${showTrackNodes ? 'track-chain-expanded' : 'track-chain-collapsed'} ${dropTargetTrackId === track.track_id ? 'drop-target' : ''}`}
                                 onMouseEnter={() => setHoveredTrackId(track.track_id)}
                                 onMouseLeave={() => setHoveredTrackId((current) => (current === track.track_id ? null : current))}
                                 onDragOver={(event) => handleTrackFileDragOver(event, track.track_id)}
@@ -10965,8 +11748,12 @@ export default function StuuShell() {
                                   return clipsInView.map((clip) => {
                                   const renderedClip = getRenderedClip(track.track_id, clip);
                                   const patternId = getPatternId(renderedClip);
-                                  const clipLabel = getClipDisplayLabel(renderedClip);
-                                  const clipType = normalizeClipType(renderedClip?.type);
+                                  const clipKind = resolveTimelineClipKind(renderedClip);
+                                  const clipLabel = clipKind === 'pattern'
+                                    ? getPatternClipDisplayLabel(renderedClip, patterns)
+                                    : getClipDisplayLabel(renderedClip);
+                                  const clipType = clipKind;
+                                  const patternForClip = patternId ? getPatternForUi(patternId) : null;
                                   const clipStart = Number(renderedClip.start) || 0;
                                   const clipLength = Number(renderedClip.length) || 1;
                                   const clipLeft = clipStart * barWidth;
@@ -11010,7 +11797,8 @@ export default function StuuShell() {
                                   const slipPreviewPx = Number((slipPreviewBars * barWidth).toFixed(3));
                                   const showSlipBadge = Math.abs(slipPreviewBars) >= 0.02;
                                   const slipLabel = `${slipPreviewBars >= 0 ? '+' : ''}${slipPreviewBars.toFixed(2)}`;
-                                  const clipCustomColor = normalizeClipCustomColor(renderedClip?.color);
+                                  const clipCustomColor = normalizeClipCustomColor(renderedClip?.color)
+                                    || normalizeClipCustomColor(patternForClip?.color);
                                   const clipAccentRgb = hexToRgbChannels(clipCustomColor);
                                   const clipAnalyzedBpmValue = Number(renderedClip?.bpm);
                                   const clipAnalyzedBpm = Number.isFinite(clipAnalyzedBpmValue) && clipAnalyzedBpmValue > 0
@@ -11084,10 +11872,12 @@ export default function StuuShell() {
                                     : '';
                                   const audioMissingFile = clipType === 'audio' && !(renderedClip?.source_path || renderedClip?.sourcePath);
 
+                                  const isClipDragging = clipInteraction?.mode === 'move'
+                                    && String(clipInteraction.clipId) === String(clip.id);
                                   return (
                                     <div
                                       key={clip.id}
-                                      className={`timeline-clip ${clipType ? `clip-type-${clipType}` : ''} ${audioMissingFile ? 'clip-missing-file' : ''} ${isClipSelected ? 'clip-selected' : ''} ${isClipMuted ? 'clip-muted' : ''} ${isGainDragging ? 'clip-gain-dragging' : ''} ${clipAccentRgb ? 'has-custom-color' : ''}`}
+                                      className={`timeline-clip ${clipType ? `clip-type-${clipType}` : ''} ${audioMissingFile ? 'clip-missing-file' : ''} ${isClipSelected ? 'clip-selected' : ''} ${isClipMuted ? 'clip-muted' : ''} ${isGainDragging ? 'clip-gain-dragging' : ''} ${isClipDragging ? 'timeline-clip--dragging' : ''} ${clipAccentRgb ? 'has-custom-color' : ''}`}
                                       style={{
                                         left: `${clipLeft}px`,
                                         width: `${clipWidth}px`,
@@ -11106,13 +11896,13 @@ export default function StuuShell() {
                                         setInspector({ type: 'clip', trackId: track.track_id, clipId: clip.id });
                                         if (patternId) {
                                           setInspector({ type: 'pattern', patternId, trackId: track.track_id, clipId: clip.id });
-                                          if (drumPatterns.some((pattern) => pattern.id === patternId)) {
-                                            setActivePatternId(patternId);
-                                          }
+                                          setActivePatternId(patternId);
+                                          setPatternEditorDockOpen(true);
                                         }
                                       }}
                                       onPointerDown={(event) => handleClipPointerDown(event, track.track_id, renderedClip)}
                                     >
+                                      {clipType !== 'pattern' ? (
                                       <div
                                         className="clip-corner-tools"
                                         data-clip-quick-tool-menu-root="true"
@@ -11126,7 +11916,27 @@ export default function StuuShell() {
                                           onClick={(event) => {
                                             event.stopPropagation();
                                             setClipQuickToolMenu(null);
-                                            emitMutation('clip:delete', { trackId: track.track_id, clipId: String(clip.id) });
+                                            const deletedClipKey = getClipSelectionKey(track.track_id, clip.id);
+                                            emitMutation(
+                                              'clip:delete',
+                                              { trackId: track.track_id, clipId: String(clip.id) },
+                                              () => {
+                                                setSelectedClipKeys((previous) => (
+                                                  previous.filter((key) => key !== deletedClipKey)
+                                                ));
+                                                setClipDisplayOverrides((previous) => {
+                                                  if (!previous[deletedClipKey]) {
+                                                    return previous;
+                                                  }
+                                                  const next = { ...previous };
+                                                  delete next[deletedClipKey];
+                                                  return next;
+                                                });
+                                                if (inspector.clipId === clip.id && inspector.trackId === track.track_id) {
+                                                  setInspector({ type: 'track', trackId: track.track_id });
+                                                }
+                                              },
+                                            );
                                           }}
                                           aria-label="Clip entfernen"
                                           title="Clip entfernen"
@@ -11142,6 +11952,8 @@ export default function StuuShell() {
                                               trackId: track.track_id,
                                               clipId: clip.id,
                                               clipType,
+                                              clipKind: clipType,
+                                              patternId: patternId || '',
                                               clipLabel,
                                               clipName: typeof renderedClip?.name === 'string' ? renderedClip.name : '',
                                               clipColor: clipCustomColor || '',
@@ -11159,6 +11971,7 @@ export default function StuuShell() {
                                           <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />
                                         </button>
                                       </div>
+                                      ) : null}
                                       {clipType === 'audio' ? (
                                         <>
                                           <div className="timeline-clip-label-bar">
@@ -11294,6 +12107,66 @@ export default function StuuShell() {
                                             {clipGainDbLabel}
                                           </span>
                                         </>
+                                      ) : clipType === 'pattern' ? (
+                                        <div className="timeline-clip-pattern-wrap">
+                                          <div
+                                            className="pattern-clip-resize-edge pattern-clip-resize-edge-left"
+                                            title="Clip-Laenge links anpassen"
+                                            onPointerDown={(event) => {
+                                              handleClipResizePointerDown(event, track.track_id, renderedClip, 'start');
+                                            }}
+                                          />
+                                          <PatternClipPreview
+                                            pattern={patternForClip}
+                                            trackId={track.track_id}
+                                            soundLabel={getTrackSoundLabel(track.track_id)}
+                                            clipLengthBars={clipLength}
+                                            clipStartBars={Number(renderedClip?.start) || 0}
+                                            timelineBarWidthPx={layoutBarWidthPx}
+                                            clipToolsMenuActive={Boolean(
+                                              clipQuickToolMenu
+                                              && clipQuickToolMenu.trackId === track.track_id
+                                              && String(clipQuickToolMenu.clipId) === String(clip.id)
+                                            )}
+                                            onOpenSoundChooser={() => openPatternSoundChooser(track.track_id)}
+                                            onSoundDrop={(event) => handlePatternSoundDrop(event, track.track_id)}
+                                            onOpenPianoRoll={() => {
+                                              if (patternId) {
+                                                openPianoRollForPattern(patternId, {
+                                                  trackId: track.track_id,
+                                                  clipId: clip.id,
+                                                  clipStartBars: Number(renderedClip?.start) || 0,
+                                                  clipLengthBars: clipLength,
+                                                });
+                                              }
+                                            }}
+                                            onDeleteClip={() => {
+                                              deleteTimelineClip(
+                                                track.track_id,
+                                                renderedClip?.id ?? clip.id,
+                                              );
+                                            }}
+                                            onOpenClipTools={(event) => {
+                                              openClipQuickToolMenu(event, {
+                                                trackId: track.track_id,
+                                                clipId: clip.id,
+                                                clipType,
+                                                clipKind: clipType,
+                                                patternId: patternId || '',
+                                                clipLabel,
+                                                clipName: typeof renderedClip?.name === 'string' ? renderedClip.name : '',
+                                                clipColor: clipCustomColor || '',
+                                              });
+                                            }}
+                                          />
+                                          <div
+                                            className="pattern-clip-resize-edge pattern-clip-resize-edge-right"
+                                            title="Clip-Laenge rechts anpassen"
+                                            onPointerDown={(event) => {
+                                              handleClipResizePointerDown(event, track.track_id, renderedClip, 'end');
+                                            }}
+                                          />
+                                        </div>
                                       ) : (
                                         <>
                                           {audioMissingFile ? (
@@ -11335,6 +12208,70 @@ export default function StuuShell() {
                       </div>
                     </section>
                   </div>
+                  </div>
+                  {patternEditorDockOpen && resolvedActivePatternId ? (
+                    <section className="pattern-editor-dock" aria-label="Pattern Editor">
+                      <header className="pattern-editor-dock-head">
+                        <h2>Pattern</h2>
+                        <button
+                          type="button"
+                          className="pattern-editor-dock-head-btn"
+                          onClick={() => setPatternEditorDockOpen(false)}
+                          title="Schliessen"
+                          aria-label="Pattern Editor schliessen"
+                        >
+                          <X size={14} strokeWidth={2} aria-hidden="true" />
+                        </button>
+                      </header>
+                      <PatternEditorPanel
+                        pattern={activePatternForEditor}
+                        trackId={patternEditorTrackId}
+                        soundLabel={getTrackSoundLabel(patternEditorTrackId)}
+                        onOpenSoundChooser={() => openPatternSoundChooser(patternEditorTrackId)}
+                        onSoundDrop={(event) => handlePatternSoundDrop(event, patternEditorTrackId)}
+                        onOpenPianoRoll={() => {
+                          if (!resolvedActivePatternId) {
+                            return;
+                          }
+                          let clipStartBars = 0;
+                          let clipLengthBars = null;
+                          let clipId = null;
+                          const dockTrackId = patternEditorTrackId;
+                          if (inspector.type === 'pattern' && inspector.clipId && inspector.trackId) {
+                            const trackRow = playlistTrackMap.get(inspector.trackId);
+                            const linkedClip = (trackRow?.clips || []).find(
+                              (entry) => String(entry.id) === String(inspector.clipId),
+                            );
+                            if (linkedClip) {
+                              clipId = linkedClip.id;
+                              clipStartBars = Number(linkedClip.start) || 0;
+                              clipLengthBars = Number(linkedClip.length) || 1;
+                            }
+                          }
+                          openPianoRollForPattern(resolvedActivePatternId, {
+                            trackId: dockTrackId,
+                            clipId,
+                            clipStartBars,
+                            clipLengthBars,
+                          });
+                        }}
+                        onDeletePattern={() => {
+                          if (!resolvedActivePatternId) {
+                            return;
+                          }
+                          emitMutation('pattern:delete', { patternId: resolvedActivePatternId }, () => {
+                            if (pianoRollTarget?.patternId === resolvedActivePatternId) {
+                              closePianoRoll();
+                            } else {
+                              setPatternNotesDraft(null);
+                            }
+                            setActivePatternId(null);
+                            setInspector({ type: 'project' });
+                          });
+                        }}
+                      />
+                    </section>
+                  ) : null}
                   </div>
                   {trackChainModalTrack && !isFloatingWindowMinimized('trackChain') ? (
                     <div
